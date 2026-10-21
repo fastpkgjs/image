@@ -1,0 +1,11 @@
+target/
+node_modules/
+packages/image/*.node
+packages/image/native.d.ts
+fixtures/large.jpg
+fixtures/tmp-*
+bench/results.json
+tools/nasm.zip
+tools/nasm-*/
+.DS_Store
+package-lock.json

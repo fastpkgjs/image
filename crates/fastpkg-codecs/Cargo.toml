@@ -1,0 +1,32 @@
+[package]
+name = "fastpkg-codecs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+jxl-encode = ["dep:gamut-core", "dep:gamut-jxl"]
+
+[dependencies]
+avif-decode.workspace = true
+base64 = "0.22"
+color_quant = "2.0"
+crc32fast.workspace = true
+exif.workspace = true
+flate2.workspace = true
+gamut-core = { workspace = true, optional = true }
+gamut-jxl = { workspace = true, optional = true }
+fastpkg-core = { path = "../fastpkg-core" }
+image.workspace = true
+imagesize.workspace = true
+jpeg-decoder.workspace = true
+jpeg-encoder.workspace = true
+jxl-oxide = { workspace = true, features = ["image", "rayon", "moxcms"] }
+mozjpeg.workspace = true
+oxideav-webp.workspace = true
+png.workspace = true
+qoi.workspace = true
+rayon.workspace = true
+resvg.workspace = true
+serde_json.workspace = true

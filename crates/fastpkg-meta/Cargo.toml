@@ -1,0 +1,11 @@
+[package]
+name = "fastpkg-meta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exif.workspace = true
+fastpkg-core = { path = "../fastpkg-core" }
+serde.workspace = true
+serde_json.workspace = true

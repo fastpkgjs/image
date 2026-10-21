@@ -1,0 +1,13 @@
+[package]
+name = "fastpkg-ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.22"
+fast_image_resize.workspace = true
+fastpkg-core = { path = "../fastpkg-core" }
+fastpkg-codecs = { path = "../fastpkg-codecs" }
+image.workspace = true
+rayon.workspace = true
