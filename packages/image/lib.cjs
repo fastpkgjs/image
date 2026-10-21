@@ -6,8 +6,24 @@ const { Duplex, Readable, PassThrough } = require('node:stream');
 const { EventEmitter } = require('node:events');
 const zlib = require('node:zlib');
 
+const PLATFORM_PACKAGES = {
+  'win32-x64': '@fastpkg/image-win32-x64',
+  'darwin-x64': '@fastpkg/image-darwin-x64',
+  'darwin-arm64': '@fastpkg/image-darwin-arm64',
+  'linux-x64': '@fastpkg/image-linux-x64-gnu',
+  'linux-arm64': '@fastpkg/image-linux-arm64-gnu',
+};
+
 function loadNative() {
   const dir = __dirname;
+  const platformPackage = PLATFORM_PACKAGES[`${process.platform}-${process.arch}`];
+  if (platformPackage) {
+    try {
+      return require(platformPackage);
+    } catch (error) {
+      if (process.env.FASTPKG_DEBUG) console.error(`[@fastpkg/image] failed to load ${platformPackage}`, error);
+    }
+  }
   const candidates = fs
     .readdirSync(dir)
     .filter((name) => name.startsWith('image') && name.endsWith('.node'));

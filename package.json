@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "Fast Rust image processing for Node.js, sharp-compatible, no libvips",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fastpkg/image.git"
+  },
   "type": "module",
   "main": "./packages/image/index.cjs",
   "module": "./packages/image/index.js",

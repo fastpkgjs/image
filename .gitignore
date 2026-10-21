@@ -8,4 +8,5 @@ bench/results.json
 tools/nasm.zip
 tools/nasm-*/
 .DS_Store
-package-lock.json
+dist/
+artifacts/

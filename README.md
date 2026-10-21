@@ -36,6 +36,12 @@ The addon is loaded by `packages/image/lib.cjs`. The generated JS binding is dis
 
 The external 16-bit PNG fixtures can be regenerated with `python scripts/make_png16_fixtures.py`.
 
+## Releases
+
+Push a tag such as `v0.1.0` to run `.github/workflows/release.yml`. The workflow builds native addons for Windows x64, macOS x64/arm64, and Linux x64/arm64 glibc, publishes them as `@fastpkg/image-*` platform packages, publishes `@fastpkg/image`, and creates a GitHub release with the `.node` binaries attached.
+
+The publish job requires an `NPM_TOKEN` repository secret with access to the `@fastpkg` scope. `@fastpkg/image` declares the platform packages as `optionalDependencies`, and the loader resolves the matching one at runtime.
+
 ## Usage
 
 ```js
