@@ -16,6 +16,13 @@ $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
 if (-not (Test-Path $vcvars)) {
     throw "vcvars64.bat not found at $vcvars"
 }
+$link = Get-ChildItem (Join-Path $vsPath 'VC\Tools\MSVC') -Recurse -Filter link.exe |
+    Where-Object { $_.FullName -match 'Hostx64\\x64\\link.exe$' } |
+    Select-Object -First 1 -ExpandProperty FullName
+if (-not $link) {
+    throw 'MSVC link.exe not found.'
+}
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $link
 $nasm = Join-Path $root 'tools\nasm-2.16.03'
 if (-not (Test-Path (Join-Path $nasm 'nasm.exe'))) {
     $tools = Join-Path $root 'tools'

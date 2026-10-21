@@ -5,6 +5,12 @@ import path from 'node:path';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const debug = process.env.FASTPKG_DEBUG === '1' || process.argv.includes('--debug');
 
+if (process.platform === 'linux') {
+  process.env.RUSTFLAGS = [process.env.RUSTFLAGS, '-C link-arg=-Wl,-Bsymbolic']
+    .filter(Boolean)
+    .join(' ');
+}
+
 if (process.platform === 'win32') {
   const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(root, 'scripts', 'build.ps1')];
   if (debug) args.push('-Debug');
@@ -27,3 +33,4 @@ const napiArgs = [
 ];
 const result = spawnSync('npx', napiArgs, { cwd: root, stdio: 'inherit' });
 process.exit(result.status ?? 1);
+

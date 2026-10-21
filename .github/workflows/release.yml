@@ -51,6 +51,16 @@ jobs:
       - name: Configure MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+      - name: Pin MSVC linker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $link = Get-ChildItem (Join-Path $vsPath 'VC\Tools\MSVC') -Recurse -Filter link.exe |
+            Where-Object { $_.FullName -match 'Hostx64\\x64\\link.exe$' } |
+            Select-Object -First 1 -ExpandProperty FullName
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$link" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Install NASM (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -68,6 +78,8 @@ jobs:
       - run: npm ci
       - name: Build native addon (Linux arm64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
+        env:
+          RUSTFLAGS: -C link-arg=-Wl,-Bsymbolic
         run: >
           npx napi build
           --platform
@@ -80,6 +92,8 @@ jobs:
           --output-dir artifacts
       - name: Build native addon
         if: matrix.target != 'aarch64-unknown-linux-gnu'
+        env:
+          RUSTFLAGS: ${{ runner.os == 'Linux' && '-C link-arg=-Wl,-Bsymbolic' || '' }}
         run: >
           npx napi build
           --platform
@@ -133,5 +147,7 @@ jobs:
             gh release create "$GITHUB_REF_NAME" artifacts/*.node \
               --title "$GITHUB_REF_NAME" --generate-notes
           fi
+
+
 
 
