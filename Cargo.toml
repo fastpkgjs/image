@@ -13,7 +13,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/fastpkg/image"
+repository = "https://github.com/fastpkgjs/image"
 rust-version = "1.99"
 
 [workspace.dependencies]
