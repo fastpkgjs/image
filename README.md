@@ -183,14 +183,14 @@ Current results (median ms, `sharp@0.35.5`, concurrency 1, Windows x64, i5-12450
 
 | Scenario | Fastpkg | sharp | Ratio |
 |---|---:|---:|---:|
-| metadata 800x600 | 0.09 | 0.93 | 10.63x faster |
-| metadata 4000x3000 | 0.14 | 1.23 | 8.62x faster |
-| resize 1200 + JPEG q85 | 17.95 | 26.43 | 1.47x faster |
-| resize 1200 + PNG | 18.17 | 28.97 | 1.59x faster |
-| resize 1200 + WebP lossless | 21.07 | 578.11 | 27.44x faster |
-| blur + sharpen + JPEG | 50.81 | 79.32 | 1.56x faster |
-| stats 4000x3000 | 105.89 | 475.03 | 4.49x faster |
-| 8 concurrent resizes | 8.40 | 44.83 | 5.34x faster |
+| metadata 800x600 | 0.12 | 1.84 | 15.90x faster |
+| metadata 4000x3000 | 0.19 | 1.81 | 9.63x faster |
+| resize 1200 + JPEG q85 | 21.89 | 34.55 | 1.58x faster |
+| resize 1200 + PNG | 23.88 | 44.16 | 1.85x faster |
+| resize 1200 + WebP lossless | 25.28 | 451.67 | 17.86x faster |
+| blur + sharpen + JPEG | 36.45 | 54.88 | 1.51x faster |
+| stats 4000x3000 | 148.74 | 313.25 | 2.11x faster |
+| 8 concurrent resizes | 5.40 | 40.60 | 7.52x faster |
 
 These are end-to-end Node timings, not codec microbenchmarks. Fastpkg now uses MozJPEG for JPEG decode/encode and DCT-scaled decode, while keeping libvips out of the pipeline. The remaining caveat is that this is a single laptop benchmark run, not a controlled release benchmark.
 

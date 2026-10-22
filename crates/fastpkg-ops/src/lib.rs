@@ -308,15 +308,18 @@ fn resize(
         without_reduction,
     );
     if fit == Fit::Cover && width.is_some() && height.is_some() {
-        let target_w = width.unwrap();
-        let target_h = height.unwrap();
-        let scale =
-            (target_w as f64 / image.width as f64).max(target_h as f64 / image.height as f64);
-        let intermediate_w = (image.width as f64 * scale).round().max(1.0) as u32;
-        let intermediate_h = (image.height as f64 * scale).round().max(1.0) as u32;
         let source_has_alpha = image.has_alpha;
-        let mut resized = resize_raw(image, intermediate_w, intermediate_h, kernel)?;
-        resized = crop_position(resized, target_w, target_h, position)?;
+        let centering = (
+            alignment_fraction(horizontal(position)),
+            alignment_fraction(vertical(position)),
+        );
+        let mut resized = resize_raw_opts(
+            image,
+            width.unwrap(),
+            height.unwrap(),
+            kernel,
+            Some(centering),
+        )?;
         resized.has_alpha = source_has_alpha || resized.has_transparency();
         return Ok(resized);
     }
@@ -348,9 +351,19 @@ fn resize(
     Ok(out)
 }
 
-fn resize_raw(mut image: Image, width: u32, height: u32, kernel: Kernel) -> Result<Image> {
+fn resize_raw(image: Image, width: u32, height: u32, kernel: Kernel) -> Result<Image> {
+    resize_raw_opts(image, width, height, kernel, None)
+}
+
+fn resize_raw_opts(
+    mut image: Image,
+    width: u32,
+    height: u32,
+    kernel: Kernel,
+    centering: Option<(f64, f64)>,
+) -> Result<Image> {
     if image.has_wide() {
-        return resize_raw_wide(image, width, height, kernel);
+        return resize_raw_wide(image, width, height, kernel, centering);
     }
     let src = FirImage::from_vec_u8(
         image.width,
@@ -360,18 +373,10 @@ fn resize_raw(mut image: Image, width: u32, height: u32, kernel: Kernel) -> Resu
     )
     .map_err(|e| FastpkgError::Operation(e.to_string()))?;
     let mut dst = FirImage::new(width, height, PixelType::U8x4);
-    let algorithm = match kernel {
-        Kernel::Nearest => ResizeAlg::Nearest,
-        Kernel::Linear | Kernel::Bilinear => ResizeAlg::Convolution(FirFilter::Bilinear),
-        Kernel::Cubic => ResizeAlg::Convolution(FirFilter::CatmullRom),
-        Kernel::Mitchell => ResizeAlg::Convolution(FirFilter::Mitchell),
-        Kernel::Lanczos2 => ResizeAlg::Convolution(FirFilter::Lanczos3),
-        Kernel::Lanczos3 => ResizeAlg::Convolution(FirFilter::Lanczos3),
-        Kernel::Mks2013 | Kernel::Mks2021 => ResizeAlg::Convolution(FirFilter::Lanczos3),
-    };
-    let options = ResizeOptions::new()
-        .resize_alg(algorithm)
-        .use_alpha(image.has_alpha);
+    let mut options = resize_options(kernel, image.has_alpha);
+    if let Some(centering) = centering {
+        options = options.fit_into_destination(Some(centering));
+    }
     Resizer::new()
         .resize(&src, &mut dst, Some(&options))
         .map_err(|e| FastpkgError::Operation(e.to_string()))?;
@@ -381,7 +386,13 @@ fn resize_raw(mut image: Image, width: u32, height: u32, kernel: Kernel) -> Resu
     Ok(out)
 }
 
-fn resize_raw_wide(mut image: Image, width: u32, height: u32, kernel: Kernel) -> Result<Image> {
+fn resize_raw_wide(
+    mut image: Image,
+    width: u32,
+    height: u32,
+    kernel: Kernel,
+    centering: Option<(f64, f64)>,
+) -> Result<Image> {
     let wide = image.to_rgba16();
     let pixels = wide
         .chunks_exact(4)
@@ -390,6 +401,19 @@ fn resize_raw_wide(mut image: Image, width: u32, height: u32, kernel: Kernel) ->
     let src = TypedImage::from_pixels(image.width, image.height, pixels)
         .map_err(|e| FastpkgError::Operation(e.to_string()))?;
     let mut dst = TypedImage::<U16x4>::new(width, height);
+    let mut options = resize_options(kernel, image.has_alpha);
+    if let Some(centering) = centering {
+        options = options.fit_into_destination(Some(centering));
+    }
+    Resizer::new()
+        .resize_typed(&src, &mut dst, Some(&options))
+        .map_err(|e| FastpkgError::Operation(e.to_string()))?;
+    let out = dst.pixels().iter().flat_map(|px| px.0).collect::<Vec<_>>();
+    image.set_wide_rgba(width, height, out)?;
+    Ok(image)
+}
+
+fn resize_options(kernel: Kernel, has_alpha: bool) -> ResizeOptions {
     let algorithm = match kernel {
         Kernel::Nearest => ResizeAlg::Nearest,
         Kernel::Linear | Kernel::Bilinear => ResizeAlg::Convolution(FirFilter::Bilinear),
@@ -399,29 +423,17 @@ fn resize_raw_wide(mut image: Image, width: u32, height: u32, kernel: Kernel) ->
         Kernel::Lanczos3 => ResizeAlg::Convolution(FirFilter::Lanczos3),
         Kernel::Mks2013 | Kernel::Mks2021 => ResizeAlg::Convolution(FirFilter::Lanczos3),
     };
-    let options = ResizeOptions::new()
+    ResizeOptions::new()
         .resize_alg(algorithm)
-        .use_alpha(image.has_alpha);
-    Resizer::new()
-        .resize_typed(&src, &mut dst, Some(&options))
-        .map_err(|e| FastpkgError::Operation(e.to_string()))?;
-    let out = dst.pixels().iter().flat_map(|px| px.0).collect::<Vec<_>>();
-    image.set_wide_rgba(width, height, out)?;
-    Ok(image)
+        .use_alpha(has_alpha)
 }
 
-fn crop_position(image: Image, width: u32, height: u32, position: &str) -> Result<Image> {
-    let x = match horizontal(position) {
-        Align::Start => 0,
-        Align::Center => (image.width.saturating_sub(width)) / 2,
-        Align::End => image.width.saturating_sub(width),
-    };
-    let y = match vertical(position) {
-        Align::Start => 0,
-        Align::Center => (image.height.saturating_sub(height)) / 2,
-        Align::End => image.height.saturating_sub(height),
-    };
-    extract(image, x, y, width, height)
+fn alignment_fraction(align: Align) -> f64 {
+    match align {
+        Align::Start => 0.0,
+        Align::Center => 0.5,
+        Align::End => 1.0,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1035,7 +1047,12 @@ fn sharpen(
     simple: bool,
 ) -> Result<Image> {
     let sigma = sigma.clamp(0.1, 10.0);
-    let blurred = blur(image.clone(), if simple { 1.0 } else { sigma })?;
+    let blurred = blur_pixels(
+        &image.data,
+        image.width as usize,
+        image.height as usize,
+        if simple { 1.0 } else { sigma },
+    );
     let x1 = if simple { f64::MAX } else { x1.max(0.0) };
     let m1 = if simple { 0.5 } else { m1.max(0.0) };
     let m2 = if simple { 0.5 } else { m2.max(0.0) };
@@ -1044,7 +1061,7 @@ fn sharpen(
     let mut out = image;
     out.data
         .par_chunks_exact_mut(4)
-        .zip(blurred.data.par_chunks_exact(4))
+        .zip(blurred.par_chunks_exact(4))
         .for_each(|(dst, blur_px)| {
             let original_lum = luminance(dst[0], dst[1], dst[2]) as f64;
             let blurred_lum = luminance(blur_px[0], blur_px[1], blur_px[2]) as f64;
@@ -1060,50 +1077,181 @@ fn sharpen(
 }
 
 fn blur(image: Image, sigma: f64) -> Result<Image> {
-    let sigma = sigma.max(0.1);
-    let radius = (sigma * 3.0).ceil() as i32;
-    let mut kernel = Vec::with_capacity((radius * 2 + 1) as usize);
-    let mut sum = 0.0;
-    for i in -radius..=radius {
-        let v = (-(i * i) as f64 / (2.0 * sigma * sigma)).exp();
-        kernel.push(v);
-        sum += v;
-    }
-    for v in &mut kernel {
-        *v /= sum;
-    }
-    let mut tmp = vec![0u8; image.data.len()];
-    let w = image.width as usize;
-    let h = image.height as usize;
-    tmp.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
-        for x in 0..w {
-            for c in 0..4 {
-                let mut acc = 0.0;
-                for (k, weight) in kernel.iter().enumerate() {
-                    let sx = (x as i32 + k as i32 - radius).clamp(0, w as i32 - 1) as usize;
-                    acc += image.data[(y * w + sx) * 4 + c] as f64 * weight;
-                }
-                row[x * 4 + c] = acc.clamp(0.0, 255.0) as u8;
-            }
-        }
-    });
-    let mut out = vec![0u8; image.data.len()];
-    out.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
-        for x in 0..w {
-            for c in 0..4 {
-                let mut acc = 0.0;
-                for (k, weight) in kernel.iter().enumerate() {
-                    let sy = (y as i32 + k as i32 - radius).clamp(0, h as i32 - 1) as usize;
-                    acc += tmp[(sy * w + x) * 4 + c] as f64 * weight;
-                }
-                row[x * 4 + c] = acc.clamp(0.0, 255.0) as u8;
-            }
-        }
-    });
+    let out = blur_pixels(
+        &image.data,
+        image.width as usize,
+        image.height as usize,
+        sigma,
+    );
     let mut out_image = Image::from_rgba(image.width, image.height, out)?;
     out_image.format = image.format;
     out_image.has_alpha = image.has_alpha;
     Ok(out_image)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+fn blur_pixels_sse41(data: &[u8], width: usize, height: usize, sigma: f64) -> Vec<u8> {
+    use std::arch::x86_64::*;
+    let sigma = sigma.max(0.1) as f32;
+    let radius = (sigma * 3.0).ceil() as i32;
+    let mut kernel = Vec::with_capacity((radius * 2 + 1) as usize);
+    let mut sum = 0.0f32;
+    for i in -radius..=radius {
+        let value = (-(i * i) as f32 / (2.0 * sigma * sigma)).exp();
+        kernel.push(value);
+        sum += value;
+    }
+    for value in &mut kernel {
+        *value /= sum;
+    }
+
+    let mut horizontal = vec![0.0f32; data.len()];
+    horizontal
+        .par_chunks_mut(width * 4)
+        .enumerate()
+        .for_each(|(y, row)| unsafe {
+            for x in 0..width {
+                let mut acc = _mm_setzero_ps();
+                let start = x as i32 - radius;
+                let end = x as i32 + radius;
+                if start >= 0 && end < width as i32 {
+                    for (k, weight) in kernel.iter().enumerate() {
+                        let source = (y * width + (x as i32 + k as i32 - radius) as usize) * 4;
+                        let packed =
+                            std::ptr::read_unaligned(data.as_ptr().add(source) as *const i32);
+                        let values = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128(packed)));
+                        acc = _mm_add_ps(acc, _mm_mul_ps(values, _mm_set1_ps(*weight)));
+                    }
+                } else {
+                    for (k, weight) in kernel.iter().enumerate() {
+                        let sx = (x as i32 + k as i32 - radius).clamp(0, width as i32 - 1) as usize;
+                        let source = (y * width + sx) * 4;
+                        let packed =
+                            std::ptr::read_unaligned(data.as_ptr().add(source) as *const i32);
+                        let values = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128(packed)));
+                        acc = _mm_add_ps(acc, _mm_mul_ps(values, _mm_set1_ps(*weight)));
+                    }
+                }
+                _mm_storeu_ps(row.as_mut_ptr().add(x * 4), acc);
+            }
+        });
+
+    let mut out = vec![0u8; data.len()];
+    out.par_chunks_mut(width * 4)
+        .enumerate()
+        .for_each(|(y, row)| unsafe {
+            for x in 0..width {
+                let mut acc = _mm_setzero_ps();
+                let start = y as i32 - radius;
+                let end = y as i32 + radius;
+                if start >= 0 && end < height as i32 {
+                    for (k, weight) in kernel.iter().enumerate() {
+                        let source = ((y as i32 + k as i32 - radius) as usize * width + x) * 4;
+                        let values = _mm_loadu_ps(horizontal.as_ptr().add(source));
+                        acc = _mm_add_ps(acc, _mm_mul_ps(values, _mm_set1_ps(*weight)));
+                    }
+                } else {
+                    for (k, weight) in kernel.iter().enumerate() {
+                        let sy =
+                            (y as i32 + k as i32 - radius).clamp(0, height as i32 - 1) as usize;
+                        let source = (sy * width + x) * 4;
+                        let values = _mm_loadu_ps(horizontal.as_ptr().add(source));
+                        acc = _mm_add_ps(acc, _mm_mul_ps(values, _mm_set1_ps(*weight)));
+                    }
+                }
+                let mut values = [0.0f32; 4];
+                _mm_storeu_ps(values.as_mut_ptr(), acc);
+                for c in 0..4 {
+                    row[x * 4 + c] = values[c].clamp(0.0, 255.0).round() as u8;
+                }
+            }
+        });
+    out
+}
+
+fn blur_pixels(data: &[u8], width: usize, height: usize, sigma: f64) -> Vec<u8> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        return unsafe { blur_pixels_sse41(data, width, height, sigma) };
+    }
+    let sigma = sigma.max(0.1);
+    let radius = (sigma * 3.0).ceil() as i32;
+    let mut kernel = Vec::with_capacity((radius * 2 + 1) as usize);
+    let mut sum = 0.0f32;
+    for i in -radius..=radius {
+        let value = (-(i * i) as f32 / (2.0 * sigma as f32 * sigma as f32)).exp();
+        kernel.push(value);
+        sum += value;
+    }
+    for value in &mut kernel {
+        *value /= sum;
+    }
+
+    let mut horizontal = vec![0.0f32; data.len()];
+    horizontal
+        .par_chunks_mut(width * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let base = y * width * 4;
+            for x in 0..width {
+                let mut acc = [0.0f32; 4];
+                let start = x as i32 - radius;
+                let end = x as i32 + radius;
+                if start >= 0 && end < width as i32 {
+                    for (k, weight) in kernel.iter().enumerate() {
+                        let source = base + (x as i32 + k as i32 - radius) as usize * 4;
+                        for c in 0..4 {
+                            acc[c] += data[source + c] as f32 * weight;
+                        }
+                    }
+                } else {
+                    for (k, weight) in kernel.iter().enumerate() {
+                        let sx = (x as i32 + k as i32 - radius).clamp(0, width as i32 - 1) as usize;
+                        let source = base + sx * 4;
+                        for c in 0..4 {
+                            acc[c] += data[source + c] as f32 * weight;
+                        }
+                    }
+                }
+                row[x * 4..x * 4 + 4].copy_from_slice(&acc);
+            }
+        });
+
+    let mut out = vec![0u8; data.len()];
+    out.par_chunks_mut(width * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..width {
+                let mut acc = [0.0f32; 4];
+                let start = y as i32 - radius;
+                let end = y as i32 + radius;
+                if start >= 0 && end < height as i32 {
+                    for (k, weight) in kernel.iter().enumerate() {
+                        let source = ((y as i32 + k as i32 - radius) as usize * width + x) * 4;
+                        for c in 0..4 {
+                            acc[c] += horizontal[source + c] * weight;
+                        }
+                    }
+                } else {
+                    for (k, weight) in kernel.iter().enumerate() {
+                        let sy =
+                            (y as i32 + k as i32 - radius).clamp(0, height as i32 - 1) as usize;
+                        let source = (sy * width + x) * 4;
+                        for c in 0..4 {
+                            acc[c] += horizontal[source + c] * weight;
+                        }
+                    }
+                }
+                for c in 0..4 {
+                    row[x * 4 + c] = acc[c].clamp(0.0, 255.0).round() as u8;
+                }
+            }
+        });
+    out
 }
 
 fn median(image: Image, size: u32) -> Result<Image> {
@@ -1114,25 +1262,30 @@ fn median(image: Image, size: u32) -> Result<Image> {
     let radius = (size / 2) as i32;
     let w = image.width as i32;
     let h = image.height as i32;
+    let window = (size * size) as usize;
     let mut out = image.data.clone();
     out.par_chunks_exact_mut(4)
         .enumerate()
-        .for_each(|(idx, px)| {
-            let x = (idx as i32) % w;
-            let y = (idx as i32) / w;
-            for c in 0..4 {
-                let mut values = Vec::with_capacity((size * size) as usize);
-                for dy in -radius..=radius {
-                    for dx in -radius..=radius {
-                        let sx = (x + dx).clamp(0, w - 1) as usize;
-                        let sy = (y + dy).clamp(0, h - 1) as usize;
-                        values.push(image.data[(sy * w as usize + sx) * 4 + c]);
+        .map_init(
+            || Vec::with_capacity(window),
+            |values, (idx, px)| {
+                let x = (idx as i32) % w;
+                let y = (idx as i32) / w;
+                for c in 0..4 {
+                    values.clear();
+                    for dy in -radius..=radius {
+                        for dx in -radius..=radius {
+                            let sx = (x + dx).clamp(0, w - 1) as usize;
+                            let sy = (y + dy).clamp(0, h - 1) as usize;
+                            values.push(image.data[(sy * w as usize + sx) * 4 + c]);
+                        }
                     }
+                    values.sort_unstable();
+                    px[c] = values[values.len() / 2];
                 }
-                values.sort_unstable();
-                px[c] = values[values.len() / 2];
-            }
-        });
+            },
+        )
+        .for_each(|_| {});
     let mut out_image = Image::from_rgba(image.width, image.height, out)?;
     out_image.format = image.format;
     out_image.has_alpha = image.has_alpha;
@@ -1141,25 +1294,40 @@ fn median(image: Image, size: u32) -> Result<Image> {
 
 fn morphology(image: Image, width: u32, dilate: bool) -> Result<Image> {
     let radius = width.max(1) as i32;
-    let w = image.width as i32;
-    let h = image.height as i32;
-    let mut out = image.data.clone();
-    out.par_chunks_exact_mut(4)
+    let w = image.width as usize;
+    let h = image.height as usize;
+    let mut horizontal = vec![0u8; image.data.len()];
+    horizontal
+        .par_chunks_exact_mut(w * 4)
         .enumerate()
-        .for_each(|(idx, px)| {
-            let x = (idx as i32) % w;
-            let y = (idx as i32) / w;
-            for c in 0..3 {
-                let mut value = if dilate { 0u8 } else { 255u8 };
-                for dy in -radius..=radius {
+        .for_each(|(y, row)| {
+            for x in 0..w {
+                for c in 0..3 {
+                    let mut value = if dilate { 0u8 } else { 255u8 };
                     for dx in -radius..=radius {
-                        let sx = (x + dx).clamp(0, w - 1) as usize;
-                        let sy = (y + dy).clamp(0, h - 1) as usize;
-                        let v = image.data[(sy * w as usize + sx) * 4 + c];
+                        let sx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
+                        let v = image.data[(y * w + sx) * 4 + c];
                         value = if dilate { value.max(v) } else { value.min(v) };
                     }
+                    row[x * 4 + c] = value;
                 }
-                px[c] = value;
+                row[x * 4 + 3] = image.data[(y * w + x) * 4 + 3];
+            }
+        });
+    let mut out = horizontal.clone();
+    out.par_chunks_exact_mut(w * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..w {
+                for c in 0..3 {
+                    let mut value = if dilate { 0u8 } else { 255u8 };
+                    for dy in -radius..=radius {
+                        let sy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
+                        let v = horizontal[(sy * w + x) * 4 + c];
+                        value = if dilate { value.max(v) } else { value.min(v) };
+                    }
+                    row[x * 4 + c] = value;
+                }
             }
         });
     let mut out_image = Image::from_rgba(image.width, image.height, out)?;
@@ -1203,6 +1371,11 @@ fn gamma(mut image: Image, gamma: f64, gamma_out: Option<f64>) -> Result<Image> 
 }
 
 fn negate(mut image: Image, alpha: bool) -> Result<Image> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { negate_avx2(&mut image.data, alpha) };
+        return Ok(image);
+    }
     image.data.par_chunks_exact_mut(4).for_each(|px| {
         px[0] = 255 - px[0];
         px[1] = 255 - px[1];
@@ -1212,6 +1385,36 @@ fn negate(mut image: Image, alpha: bool) -> Result<Image> {
         }
     });
     Ok(image)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn negate_avx2(data: &mut [u8], alpha: bool) {
+    use std::arch::x86_64::*;
+    let mut mask = [0u8; 32];
+    for pixel in 0..8 {
+        mask[pixel * 4] = 255;
+        mask[pixel * 4 + 1] = 255;
+        mask[pixel * 4 + 2] = 255;
+        if alpha {
+            mask[pixel * 4 + 3] = 255;
+        }
+    }
+    let mask = _mm256_loadu_si256(mask.as_ptr() as *const __m256i);
+    let mut offset = 0;
+    while offset + 32 <= data.len() {
+        let value = _mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i);
+        _mm256_storeu_si256(
+            data.as_mut_ptr().add(offset) as *mut __m256i,
+            _mm256_xor_si256(value, mask),
+        );
+        offset += 32;
+    }
+    for (index, value) in data[offset..].iter_mut().enumerate() {
+        if index % 4 != 3 || alpha {
+            *value = 255 - *value;
+        }
+    }
 }
 
 fn normalise(mut image: Image, lower: f64, upper: f64) -> Result<Image> {
@@ -1247,10 +1450,14 @@ fn normalise(mut image: Image, lower: f64, upper: f64) -> Result<Image> {
         return Ok(image);
     }
     let scale = 255.0 / (high - low) as f64;
+    let mut lut = [0u8; 256];
+    for (i, value) in lut.iter_mut().enumerate() {
+        *value = (((i as f64 - low as f64) * scale).clamp(0.0, 255.0)) as u8;
+    }
     image.data.par_chunks_exact_mut(4).for_each(|px| {
-        for c in 0..3 {
-            px[c] = (((px[c] as f64 - low as f64) * scale).clamp(0.0, 255.0)) as u8;
-        }
+        px[0] = lut[px[0] as usize];
+        px[1] = lut[px[1] as usize];
+        px[2] = lut[px[2] as usize];
     });
     Ok(image)
 }
@@ -1352,31 +1559,33 @@ fn convolve(
     scale: Option<f64>,
     offset: f64,
 ) -> Result<Image> {
-    let w = image.width as i32;
-    let h = image.height as i32;
-    let kw = width as i32;
-    let kh = height as i32;
-    let cx = kw / 2;
-    let cy = kh / 2;
+    let w = image.width as usize;
+    let h = image.height as usize;
+    let kw = width as usize;
+    let kh = height as usize;
+    let cx = kw as i32 / 2;
+    let cy = kh as i32 / 2;
     let scale = scale.unwrap_or_else(|| kernel.iter().sum::<f64>());
-    let scale = if scale.abs() < 1e-12 { 1.0 } else { scale };
+    let scale = if scale.abs() < 1e-12 { 1.0 } else { scale } as f32;
+    let weights = kernel.iter().map(|value| *value as f32).collect::<Vec<_>>();
     let mut out = image.data.clone();
-    out.par_chunks_exact_mut(4)
+    out.par_chunks_exact_mut(w * 4)
         .enumerate()
-        .for_each(|(idx, px)| {
-            let x = (idx as i32) % w;
-            let y = (idx as i32) / w;
-            for c in 0..3 {
-                let mut acc = 0.0;
-                for ky in 0..kh {
-                    for kx in 0..kw {
-                        let sx = (x + kx - cx).clamp(0, w - 1) as usize;
-                        let sy = (y + ky - cy).clamp(0, h - 1) as usize;
-                        acc += image.data[(sy * w as usize + sx) * 4 + c] as f64
-                            * kernel[(ky * kw + kx) as usize];
+        .for_each(|(y, row)| {
+            for x in 0..w {
+                for c in 0..3 {
+                    let mut acc = 0.0f32;
+                    for ky in 0..kh {
+                        let sy = (y as i32 + ky as i32 - cy).clamp(0, h as i32 - 1) as usize;
+                        let source_row = sy * w;
+                        for kx in 0..kw {
+                            let sx = (x as i32 + kx as i32 - cx).clamp(0, w as i32 - 1) as usize;
+                            acc += image.data[(source_row + sx) * 4 + c] as f32
+                                * weights[ky * kw + kx];
+                        }
                     }
+                    row[x * 4 + c] = (acc / scale + offset as f32).clamp(0.0, 255.0) as u8;
                 }
-                px[c] = (acc / scale + offset).clamp(0.0, 255.0) as u8;
             }
         });
     let mut out_image = Image::from_rgba(image.width, image.height, out)?;
@@ -1469,14 +1678,20 @@ fn linear(mut image: Image, a: Option<&NumberOrArray>, b: Option<&NumberOrArray>
 }
 
 fn recomb(mut image: Image, matrix: &[Vec<f64>]) -> Result<Image> {
-    let n = matrix.len();
+    let n = matrix.len().min(4);
+    let mut coefficients = [[0.0f32; 4]; 4];
+    for (row, values) in matrix.iter().take(n).enumerate() {
+        for (col, value) in values.iter().take(4).enumerate() {
+            coefficients[row][col] = *value as f32;
+        }
+    }
     image.data.par_chunks_exact_mut(4).for_each(|px| {
-        let input = [px[0] as f64, px[1] as f64, px[2] as f64, px[3] as f64];
-        for row in 0..n.min(4) {
-            let mut value = 0.0;
-            for (col, v) in matrix[row].iter().enumerate().take(4) {
-                value += input[col] * v;
-            }
+        let input = [px[0] as f32, px[1] as f32, px[2] as f32, px[3] as f32];
+        for row in 0..n {
+            let value = coefficients[row][0] * input[0]
+                + coefficients[row][1] * input[1]
+                + coefficients[row][2] * input[2]
+                + coefficients[row][3] * input[3];
             px[row] = value.clamp(0.0, 255.0) as u8;
         }
     });
@@ -1490,13 +1705,16 @@ fn modulate(
     hue: f64,
     lightness: f64,
 ) -> Result<Image> {
-    let hue = hue.to_radians();
+    let hue = hue.to_radians() as f32;
     let cos_h = hue.cos();
     let sin_h = hue.sin();
+    let brightness = brightness as f32;
+    let saturation = saturation as f32;
+    let lightness = lightness as f32 / 255.0;
     image.data.par_chunks_exact_mut(4).for_each(|px| {
-        let mut r = px[0] as f64 / 255.0;
-        let mut g = px[1] as f64 / 255.0;
-        let mut b = px[2] as f64 / 255.0;
+        let mut r = px[0] as f32 / 255.0;
+        let mut g = px[1] as f32 / 255.0;
+        let mut b = px[2] as f32 / 255.0;
         let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
         r = (lum + (r - lum) * saturation) * brightness;
         g = (lum + (g - lum) * saturation) * brightness;
@@ -1505,9 +1723,9 @@ fn modulate(
         let ng = r * sin_h + g * cos_h;
         r = nr;
         g = ng;
-        px[0] = ((r + lightness / 255.0) * 255.0).clamp(0.0, 255.0) as u8;
-        px[1] = ((g + lightness / 255.0) * 255.0).clamp(0.0, 255.0) as u8;
-        px[2] = ((b + lightness / 255.0) * 255.0).clamp(0.0, 255.0) as u8;
+        px[0] = ((r + lightness) * 255.0).clamp(0.0, 255.0) as u8;
+        px[1] = ((g + lightness) * 255.0).clamp(0.0, 255.0) as u8;
+        px[2] = ((b + lightness) * 255.0).clamp(0.0, 255.0) as u8;
     });
     Ok(image)
 }

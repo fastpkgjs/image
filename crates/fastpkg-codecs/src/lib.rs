@@ -408,14 +408,11 @@ fn decode_jpeg_mozjpeg(bytes: &[u8], hint: (u32, u32), fast_shrink: bool) -> Opt
         }
         .clamp(1.0, 8.0) as u8;
         decompress.scale(scale);
-        let mut started = decompress.rgb().ok()?;
+        let mut started = decompress.rgba().ok()?;
         let width = started.width() as u32;
         let height = started.height() as u32;
-        let pixels: Vec<[u8; 3]> = started.read_scanlines().ok()?;
-        let mut data = Vec::with_capacity(pixels.len() * 4);
-        for px in pixels {
-            data.extend_from_slice(&[px[0], px[1], px[2], 255]);
-        }
+        let pixels: Vec<[u8; 4]> = started.read_scanlines().ok()?;
+        let data: Vec<u8> = bytemuck::cast_vec(pixels);
         let mut image = Image::from_rgba(width, height, data).ok()?;
         image.has_alpha = false;
         image.format = Format::Jpeg;
@@ -630,15 +627,20 @@ pub fn encode(
 fn encode_jpeg(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Result<()> {
     let quality = options.quality.clamp(1, 100);
     let grayscale = image.gray;
-    let pixels = if grayscale {
-        image
-            .data
-            .chunks_exact(4)
-            .map(|px| px[0])
-            .collect::<Vec<u8>>()
+    let luma = if grayscale {
+        Some(
+            image
+                .data
+                .chunks_exact(4)
+                .map(|px| px[0])
+                .collect::<Vec<u8>>(),
+        )
     } else {
-        image.to_rgb()
+        None
     };
+    let pixels = luma
+        .as_deref()
+        .map_or_else(|| image.data.as_slice(), |pixels| pixels);
     if image.width > u16::MAX as u32 || image.height > u16::MAX as u32 {
         return Err(FastpkgError::Encode(
             "JPEG dimensions exceed 65535 pixels".into(),
@@ -648,7 +650,7 @@ fn encode_jpeg(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Res
         let mut compress = mozjpeg::Compress::new(if grayscale {
             mozjpeg::ColorSpace::JCS_GRAYSCALE
         } else {
-            mozjpeg::ColorSpace::JCS_RGB
+            mozjpeg::ColorSpace::JCS_EXT_RGBA
         });
         compress.set_size(image.width as usize, image.height as usize);
         compress.set_fastest_defaults();
@@ -669,7 +671,7 @@ fn encode_jpeg(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Res
             }
         }
         let mut compress = compress.start_compress(Vec::new()).ok()?;
-        compress.write_scanlines(&pixels).ok()?;
+        compress.write_scanlines(pixels).ok()?;
         compress.finish().ok()
     }))
     .ok()
@@ -677,20 +679,18 @@ fn encode_jpeg(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Res
     match encoded {
         Some(data) => *out = data,
         None => {
+            let rgb;
+            let (samples, color_type) = if grayscale {
+                (pixels, jpeg_encoder::ColorType::Luma)
+            } else {
+                rgb = image.to_rgb();
+                (rgb.as_slice(), jpeg_encoder::ColorType::Rgb)
+            };
             let mut encoder = jpeg_encoder::Encoder::new(&mut *out, quality);
             encoder.set_progressive(options.progressive);
             encoder.set_optimized_huffman_tables(options.optimise_coding);
             encoder
-                .encode(
-                    &pixels,
-                    image.width as u16,
-                    image.height as u16,
-                    if grayscale {
-                        jpeg_encoder::ColorType::Luma
-                    } else {
-                        jpeg_encoder::ColorType::Rgb
-                    },
-                )
+                .encode(samples, image.width as u16, image.height as u16, color_type)
                 .map_err(|e| FastpkgError::Encode(e.to_string()))?;
         }
     }

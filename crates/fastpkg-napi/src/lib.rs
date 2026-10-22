@@ -189,7 +189,14 @@ pub fn set_concurrency(value: Option<u32>) -> u32 {
 
 #[napi]
 pub fn get_concurrency() -> u32 {
-    rayon::current_num_threads() as u32
+    let configured = CONCURRENCY.load(Ordering::Relaxed);
+    if configured > 0 {
+        configured as u32
+    } else {
+        std::thread::available_parallelism()
+            .map(|value| value.get() as u32)
+            .unwrap_or(1)
+    }
 }
 
 #[napi]

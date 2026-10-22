@@ -295,6 +295,42 @@ test('filters and point operations execute', async () => {
   assert.ok(grey.info.channels >= 3);
 });
 
+test('cover resize crops before resampling', async () => {
+  const raw = Buffer.alloc(4 * 2 * 4);
+  for (let y = 0; y < 2; y++) {
+    for (let x = 0; x < 4; x++) {
+      const index = (y * 4 + x) * 4;
+      raw[index] = x < 2 ? 255 : 0;
+      raw[index + 1] = 0;
+      raw[index + 2] = x < 2 ? 0 : 255;
+      raw[index + 3] = 255;
+    }
+  }
+  const out = await image(raw, { raw: { width: 4, height: 2, channels: 4 } })
+    .resize({ width: 1, height: 1, fit: 'cover', position: 'left', kernel: 'nearest' })
+    .raw()
+    .toBuffer();
+  assert.deepEqual([...out.subarray(0, 4)], [255, 0, 0, 255]);
+});
+
+test('median and morphology produce expected windows', async () => {
+  const medianInput = Buffer.from([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+  const median = await image(medianInput, { raw: { width: 3, height: 3, channels: 1 } })
+    .median(3)
+    .raw()
+    .toBuffer();
+  assert.deepEqual([...median.subarray(12, 15)], [4, 4, 4]);
+
+  const morphologyInput = Buffer.alloc(25);
+  morphologyInput[12] = 255;
+  const dilated = await image(morphologyInput, { raw: { width: 5, height: 5, channels: 1 } })
+    .dilate(1)
+    .raw()
+    .toBuffer();
+  assert.equal(dilated[(1 * 5 + 1) * 3], 255);
+  assert.equal(dilated[0], 0);
+});
+
 test('create, raw and text inputs', async () => {
   const created = await image({
     create: { width: 40, height: 30, channels: 4, background: '#ff0000' },

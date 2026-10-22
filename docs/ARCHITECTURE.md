@@ -28,7 +28,7 @@ The JavaScript wrapper is a sharp-compatible builder. Chained methods only mutat
 
 ## Image representation
 
-Internally an image is interleaved RGBA8 with width, height, format, colour space, depth, orientation, and optional metadata payloads. Codecs convert to this representation at the boundary. This keeps the operation set small and fast; 16-bit AVIF/JXL input is downconverted to 8-bit in the current implementation.
+Internally an image is interleaved RGBA8 with width, height, format, colour space, depth, orientation, and optional metadata payloads. PNG/raw 16-bit input additionally carries an optional RGBA16 buffer; geometry operations preserve it, while point/filter operations currently use the 8-bit representation. Codecs convert to this representation at the boundary.
 
 ## Zero-copy boundaries
 
@@ -82,6 +82,7 @@ The JS `Sharp` object extends `node:stream.Duplex`. Writable input chunks are co
 
 - JPEG uses MozJPEG/libjpeg-turbo through the `mozjpeg` crate, with a pure-Rust fallback. This is a codec dependency only; libvips is still not used.
 - AVIF encode uses ravif and is slower than SVT-AV1/aom at high effort.
-- WebP output is lossless-only in the default build.
+- WebP output supports lossy and lossless; lossy uses the pure-Rust `oxideav-webp` encoder.
 - `stats` performs a full decode and is intentionally not a header-only operation.
-- Large median/blur/trim operations are buffered; they do not yet use a strip/spill planner.
+- Blur uses a separable f32 implementation with an SSE4.1 path on x86-64. Median and morphology use bounded scratch buffers/separable passes, but large trim/filter operations still buffer the whole image.
+

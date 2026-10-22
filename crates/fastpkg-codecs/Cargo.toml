@@ -11,6 +11,7 @@ jxl-encode = ["dep:gamut-core", "dep:gamut-jxl"]
 [dependencies]
 avif-decode.workspace = true
 base64 = "0.22"
+bytemuck.workspace = true
 color_quant = "2.0"
 crc32fast.workspace = true
 exif.workspace = true
