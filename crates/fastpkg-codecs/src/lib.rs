@@ -315,9 +315,7 @@ fn decode_with_hint_inner(
                     "webp: RIFF size is larger than the file (truncated)".into(),
                 ));
             }
-            let dynamic = image::load_from_memory_with_format(bytes, image::ImageFormat::WebP)
-                .map_err(|e| FastpkgError::Decode(format!("{}: {e}", format.mime())))?;
-            dynamic_to_image(dynamic, format)?
+            decode_webp(bytes, input, hint, fast_shrink)?
         }
         Format::Gif if input.fail_on == "none" => decode_gif_lenient(bytes)?,
         Format::Raw => {
@@ -340,6 +338,40 @@ fn decode_with_hint_inner(
         image.orientation = Some(orientation);
     }
     Ok(image)
+}
+
+/// WebP through libwebp (exact fancy upsampling as in sharp, SIMD, optional scaled decode);
+/// animated or damaged files fall back to the pure-Rust `image-webp` decoder, which also
+/// decides the error message.
+fn decode_webp(
+    bytes: &[u8],
+    input: &InputOptions,
+    hint: Option<(u32, u32)>,
+    fast_shrink: bool,
+) -> Result<Image> {
+    let max_pixels = if input.unlimited {
+        u64::MAX
+    } else {
+        input.limit_input_pixels.min(Limits::default().max_pixels)
+    };
+    // Keep 2x headroom for the resampler unless `fastShrinkOnLoad` allows decoding straight to
+    // the target size.
+    let scale_to = hint.map(|(w, h)| {
+        let headroom = if fast_shrink { 1 } else { 2 };
+        (w.saturating_mul(headroom), h.saturating_mul(headroom))
+    });
+    if let Some(decoded) = webp::decode(bytes, scale_to, max_pixels)? {
+        let mut image = Image::from_rgba(decoded.width, decoded.height, decoded.rgba)?;
+        image.has_alpha = decoded.has_alpha || image.has_transparency();
+        image.format = Format::Webp;
+        if (decoded.width, decoded.height) != decoded.source {
+            image.pre_shrink = Some(decoded.source);
+        }
+        return Ok(image);
+    }
+    let dynamic = image::load_from_memory_with_format(bytes, image::ImageFormat::WebP)
+        .map_err(|e| FastpkgError::Decode(format!("{}: {e}", Format::Webp.mime())))?;
+    dynamic_to_image(dynamic, Format::Webp)
 }
 
 fn decode_raw(bytes: &[u8], raw: &RawInput) -> Result<Image> {
@@ -1566,8 +1598,12 @@ fn encode_webp_libwebp(
     // sharp/libvips: `nearLossless` switches to the lossless coder and passes the quality as
     // libwebp's `near_lossless` level.
     let near = options.near_lossless && !options.lossless && force_lossless.is_none();
-    let (effort, quality) =
-        force_lossless.unwrap_or((options.effort as i32, options.quality as f32));
+    let (effort, quality) = force_lossless.unwrap_or((
+        options.effort as i32,
+        // In near-lossless mode `quality` is the preprocessing level (below), not the lossless
+        // compression effort; libvips / sharp pin that effort at 75.
+        if near { 75.0 } else { options.quality as f32 },
+    ));
     *out = webp::encode(&webp::Params {
         rgba: &image.data,
         width: image.width,
@@ -1603,11 +1639,53 @@ fn encode_webp(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Res
         return encode_webp_libwebp(image, options, None, out);
     }
     encode_webp_lossless_fast(image, out)?;
-    // Graphic-like content (flat areas, few colours, text) is where the pure-Rust coder loses
-    // badly to libwebp (3-10x larger). Such images shrink to a tiny fraction of their raw size
-    // even with the fast coder, which makes that ratio a free, exact detector: photographs stay
-    // above ~40%, smooth gradients above ~8%. For those, also run libwebp at method 1 (about
-    // sharp's size at 5-10x its speed) and keep whichever file is smaller.
+    let (exif, icc, xmp) = webp_metadata(image, options);
+    if let Some(effort) = lossless_escalation(image, out.len()) {
+        let mut better = Vec::new();
+        if encode_webp_libwebp(image, options, Some(effort), &mut better).is_ok()
+            && better.len() < out.len() + metadata_len(&exif, &icc, &xmp)
+        {
+            *out = better;
+            return Ok(());
+        }
+    }
+    if exif.is_some() || icc.is_some() || xmp.is_some() {
+        *out = webp::attach_metadata(out, exif.as_deref(), icc.as_deref(), xmp.as_deref())?;
+    }
+    Ok(())
+}
+
+fn metadata_len(exif: &Option<Vec<u8>>, icc: &Option<Vec<u8>>, xmp: &Option<Vec<u8>>) -> usize {
+    [exif, icc, xmp]
+        .iter()
+        .map(|m| m.as_ref().map_or(0, |m| m.len() + 8))
+        .sum()
+}
+
+/// Escalate to libwebp when the fast lossless file is below this share of the raw pixel bytes
+/// (3/10). Photographs mostly stay above 40%; flat art, screenshots and gradients land far
+/// below, and smooth photographs between 10% and 30% still shrink 15-30% with libwebp.
+const LIBWEBP_ESCALATE_RATIO: (usize, usize) = (3, 10);
+/// Deterministic pixel sample used by the colour-diversity test.
+const COLOUR_SAMPLE: usize = 4096;
+/// At most this many distinct colours among `COLOUR_SAMPLE` samples mark graphic content
+/// (flat art, indexed and dithered images have well under 25%, photographs 50-100%).
+const COLOUR_SAMPLE_GRAPHIC_MAX: usize = 1024;
+/// Images up to this many pixels are always challenged: it costs a few milliseconds.
+const LIBWEBP_ALWAYS_PIXELS: usize = 16 * 1024;
+
+/// Decides whether the pure-Rust lossless output should be challenged by libwebp, and with which
+/// `(method, quality)`. The pure-Rust coder has a single predictor and no palette, so it loses by
+/// 3-20x on graphics, gradients and indexed-colour art. Those either compress far below raw
+/// size with it (ratio test) or use few distinct colours (sampled colour test, which also
+/// catches dithered or noisy indexed images whose ratio stays high). Photographs fail both
+/// tests, cost one 4096-pixel scan, and keep the fast coder's speed.
+///
+/// The effort scales down with image size and content so the added latency stays bounded:
+/// roughly 0.1 s per megapixel up to 4 MP (method 2), 0.07 s up to 16 MP (method 1) and 0.01 s
+/// beyond (method 0). Quality 100 (best size) is only spent on clearly graphic content; the
+/// noisy mid-ratio cases, where it is several times slower for ~2%, use 75.
+fn lossless_escalation(image: &Image, fast_len: usize) -> Option<(i32, f32)> {
     let channels = if image.gray {
         1
     } else if image.has_alpha {
@@ -1616,29 +1694,57 @@ fn encode_webp(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Res
         3
     };
     let pixels = image.width as usize * image.height as usize;
-    if out.len() * LIBWEBP_ESCALATE_RATIO < pixels * channels
-        && (LIBWEBP_ESCALATE_MIN_PIXELS..=LIBWEBP_ESCALATE_MAX_PIXELS).contains(&pixels)
-    {
-        let mut better = Vec::new();
-        if encode_webp_libwebp(image, options, Some((1, 75.0)), &mut better).is_ok()
-            && better.len() < out.len()
-        {
-            *out = better;
-            return Ok(());
-        }
+    let raw_len = pixels * channels;
+    let (num, den) = LIBWEBP_ESCALATE_RATIO;
+    let by_ratio = fast_len * den < raw_len * num;
+    if !(pixels <= LIBWEBP_ALWAYS_PIXELS || by_ratio || few_colours(image)) {
+        return None;
     }
-    let (exif, icc, xmp) = webp_metadata(image, options);
-    if exif.is_some() || icc.is_some() || xmp.is_some() {
-        *out = webp::attach_metadata(out, exif.as_deref(), icc.as_deref(), xmp.as_deref())?;
-    }
-    Ok(())
+    let clearly_graphic = pixels <= LIBWEBP_ALWAYS_PIXELS || fast_len * 25 < raw_len * 3;
+    let quality = if clearly_graphic { 100.0 } else { 75.0 };
+    Some(match pixels {
+        // Extremely flat content (<2% of raw) gains nothing from the slower method.
+        _ if fast_len * 50 < raw_len && pixels <= 0xFF_FFFF => (1, 100.0),
+        0..=0x3F_FFFF => (2, quality),
+        0x40_0000..=0xFF_FFFF => (1, quality),
+        _ => (0, 75.0),
+    })
 }
 
-/// Escalate to libwebp when the fast lossless file is below 1/20 (5%) of the raw pixel bytes.
-const LIBWEBP_ESCALATE_RATIO: usize = 20;
-const LIBWEBP_ESCALATE_MIN_PIXELS: usize = 1024;
-/// Bound the extra latency on huge graphics (libwebp method 1 is roughly 0.03-0.2 s per MP).
-const LIBWEBP_ESCALATE_MAX_PIXELS: usize = 16 << 20;
+/// True when a deterministic sample of `COLOUR_SAMPLE` pixels contains few distinct colours.
+fn few_colours(image: &Image) -> bool {
+    const SLOTS: usize = 8192;
+    let pixels = image.width as usize * image.height as usize;
+    let samples = pixels.min(COLOUR_SAMPLE);
+    let step = (pixels / samples).max(1);
+    let mut table = vec![u64::MAX; SLOTS];
+    let mut distinct = 0usize;
+    for i in 0..samples {
+        // Strided with a fixed pseudo-random offset inside each stride so periodic content
+        // cannot alias with the sampling grid.
+        let index = (i * step + (i.wrapping_mul(7919) % step)).min(pixels - 1);
+        let px = &image.data[index * 4..index * 4 + 4];
+        // Fully transparent pixels count as one colour (libwebp discards their RGB).
+        let key = if px[3] == 0 {
+            0
+        } else {
+            u64::from(u32::from_le_bytes([px[0], px[1], px[2], px[3]])) | 1 << 32
+        };
+        let mut slot = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 51) as usize;
+        loop {
+            if table[slot] == key {
+                break;
+            }
+            if table[slot] == u64::MAX {
+                table[slot] = key;
+                distinct += 1;
+                break;
+            }
+            slot = (slot + 1) & (SLOTS - 1);
+        }
+    }
+    distinct * COLOUR_SAMPLE <= COLOUR_SAMPLE_GRAPHIC_MAX * samples
+}
 
 /// Pure-Rust (`image-webp`) lossless encoder: very fast, larger files than libwebp.
 fn encode_webp_lossless_fast(image: &Image, out: &mut Vec<u8>) -> Result<()> {

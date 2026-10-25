@@ -205,6 +205,105 @@ pub fn attach_metadata(
     Ok(unsafe { std::slice::from_raw_parts(assembled.0.bytes, assembled.0.size) }.to_vec())
 }
 
+/// A decoded WebP: tightly packed non-premultiplied RGBA.
+pub struct Decoded {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub has_alpha: bool,
+    /// Full-resolution size when libwebp scaled the image while decoding.
+    pub source: (u32, u32),
+}
+
+/// Smallest `(width, height)` that is at least `min` on both axes and keeps the aspect ratio of
+/// `source`. Returns `None` unless that is a reduction of 2x or more on both axes (libwebp's
+/// rescaler is an area filter, so small reductions are better left to the resampler).
+pub fn scaled_size(source: (u32, u32), min: (u32, u32)) -> Option<(u32, u32)> {
+    let (sw, sh) = (source.0 as u64, source.1 as u64);
+    let (mw, mh) = (min.0.max(1) as u64, min.1.max(1) as u64);
+    let (w, h) = if mw * sh >= mh * sw {
+        (mw, (sh * mw).div_ceil(sw))
+    } else {
+        ((sw * mh).div_ceil(sh), mh)
+    };
+    let (w, h) = (w.max(mw), h.max(mh));
+    (w * 2 <= sw && h * 2 <= sh).then_some((w as u32, h as u32))
+}
+
+/// Decodes a still WebP (lossy, lossless, with or without alpha) through libwebp, with its
+/// default fancy upsampling (what libvips / sharp use). `scale_to` asks for libwebp's built-in
+/// scaled decode. `Ok(None)` means libwebp cannot or will not decode the file (animation,
+/// damaged data); the caller falls back to another decoder, which also decides the error.
+/// `max_pixels` is checked against the header before anything is allocated.
+pub fn decode(
+    bytes: &[u8],
+    scale_to: Option<(u32, u32)>,
+    max_pixels: u64,
+) -> Result<Option<Decoded>> {
+    match catch_unwind(AssertUnwindSafe(|| {
+        decode_inner(bytes, scale_to, max_pixels)
+    })) {
+        Ok(result) => result,
+        Err(_) => Ok(None),
+    }
+}
+
+fn decode_inner(
+    bytes: &[u8],
+    scale_to: Option<(u32, u32)>,
+    max_pixels: u64,
+) -> Result<Option<Decoded>> {
+    let Ok(mut config) = w::WebPDecoderConfig::new() else {
+        return Ok(None);
+    };
+    let status = unsafe { w::WebPGetFeatures(bytes.as_ptr(), bytes.len(), &mut config.input) };
+    if status != w::VP8StatusCode::VP8_STATUS_OK || config.input.has_animation != 0 {
+        return Ok(None);
+    }
+    let (source_w, source_h) = (config.input.width as u32, config.input.height as u32);
+    if source_w == 0 || source_h == 0 || source_w > MAX_DIMENSION || source_h > MAX_DIMENSION {
+        return Ok(None);
+    }
+    if source_w as u64 * source_h as u64 > max_pixels {
+        return Err(FastpkgError::InputTooLarge {
+            pixels: source_w as u64 * source_h as u64,
+            limit: max_pixels,
+        });
+    }
+    let (out_w, out_h) = match scale_to.and_then(|min| scaled_size((source_w, source_h), min)) {
+        Some((sw, sh)) => {
+            config.options.use_scaling = 1;
+            config.options.scaled_width = sw as c_int;
+            config.options.scaled_height = sh as c_int;
+            (sw, sh)
+        }
+        None => (source_w, source_h),
+    };
+    // Zeroed memory comes straight from calloc, so a hostile canvas size that fails to decode
+    // never touches the pages.
+    let mut rgba = vec![0u8; out_w as usize * out_h as usize * 4];
+    config.output.colorspace = w::WEBP_CSP_MODE::MODE_RGBA;
+    config.output.width = out_w as c_int;
+    config.output.height = out_h as c_int;
+    config.output.is_external_memory = 1;
+    config.output.u.RGBA = w::WebPRGBABuffer {
+        rgba: rgba.as_mut_ptr(),
+        stride: out_w as c_int * 4,
+        size: rgba.len(),
+    };
+    let status = unsafe { w::WebPDecode(bytes.as_ptr(), bytes.len(), &mut config) };
+    if status != w::VP8StatusCode::VP8_STATUS_OK {
+        return Ok(None);
+    }
+    Ok(Some(Decoded {
+        rgba,
+        width: out_w,
+        height: out_h,
+        has_alpha: config.input.has_alpha != 0,
+        source: (source_w, source_h),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +373,49 @@ mod tests {
         p.exact = true;
         let out = encode(&p).expect("encode");
         assert!(out.windows(4).any(|w| w == b"VP8L"));
+    }
+
+    #[test]
+    fn scaled_size_needs_a_two_fold_reduction_and_never_undershoots() {
+        assert_eq!(scaled_size((4000, 3000), (800, 600)), Some((800, 600)));
+        assert_eq!(scaled_size((2000, 1500), (1000, 750)), Some((1000, 750)));
+        assert_eq!(scaled_size((2000, 1500), (1001, 750)), None, "under 2x");
+        // 1000x777 -> width 101: height must round up, not down.
+        let (w, h) = scaled_size((1000, 777), (101, 1)).unwrap();
+        assert_eq!((w, h), (101, 79));
+        let (w, h) = scaled_size((777, 1000), (1, 101)).unwrap();
+        assert_eq!((w, h), (79, 101));
+        assert_eq!(scaled_size((10, 10), (0, 0)), Some((1, 1)));
+    }
+
+    #[test]
+    fn decodes_what_it_encodes_and_scales() {
+        let rgba: Vec<u8> = (0..64 * 48)
+            .flat_map(|i| [(i % 64 * 4) as u8, (i / 64 * 5) as u8, 90, 255])
+            .collect();
+        let mut p = params(&rgba, 64, 48);
+        p.lossless = true;
+        p.effort = 1;
+        let encoded = encode(&p).expect("encode");
+        let full = decode(&encoded, None, u64::MAX).unwrap().expect("decoded");
+        assert_eq!((full.width, full.height, full.source), (64, 48, (64, 48)));
+        assert_eq!(full.rgba, rgba);
+        assert!(!full.has_alpha);
+        let small = decode(&encoded, Some((16, 12)), u64::MAX)
+            .unwrap()
+            .expect("decoded");
+        assert_eq!(
+            (small.width, small.height, small.source),
+            (16, 12, (64, 48))
+        );
+        assert!(matches!(
+            decode(&encoded, None, 100),
+            Err(FastpkgError::InputTooLarge { .. })
+        ));
+        assert!(decode(&encoded[..20], None, u64::MAX).unwrap().is_none());
+        assert!(decode(b"RIFF\0\0\0\0WEBPjunk", None, u64::MAX)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # @fastpkg/image
 
-A Rust image engine for Node.js with a sharp-compatible API. No libvips, no ImageMagick, no legacy TIFF/JPEG 2000/HEIC/PDF pipeline. JPEG uses the bundled MozJPEG/libjpeg-turbo codec and lossy WebP uses the bundled libwebp, both for speed; the pipeline, PNG, the fast lossless WebP path, AVIF, JPEG XL, QOI, GIF, SVG, and operations are Rust.
+A Rust image engine for Node.js with a sharp-compatible API. No libvips, no ImageMagick, no legacy TIFF/JPEG 2000/HEIC/PDF pipeline. JPEG uses the bundled MozJPEG/libjpeg-turbo codec and WebP decoding and lossy WebP encoding use the bundled libwebp, both for speed; the pipeline, PNG, the fast lossless WebP path, AVIF, JPEG XL, QOI, GIF, SVG, and operations are Rust.
 
 `@fastpkg/image` is built around three ideas:
 
@@ -140,7 +140,7 @@ await image('input.png')
 |---|---|---|---|
 | PNG | Yes | Yes | 8/16-bit, alpha, palette input/output, interlaced input |
 | JPEG | Yes | Yes | MozJPEG codec, baseline/progressive, EXIF orientation, DCT-scaled decode |
-| WebP | Yes | Yes | Lossy and near-lossless via libwebp (BSD-3, bundled via libwebp-sys); lossless via image-webp (fast), switching to libwebp for graphic-like images or when `effort` is set |
+| WebP | Yes | Yes | Lossy and near-lossless via libwebp (BSD-3, bundled via libwebp-sys); lossless via image-webp (fast), switching to libwebp for graphic-like images or when `effort` is set; decoding via libwebp (animated files fall back to image-webp, first frame only) |
 | AVIF | Yes | Yes | Pure-Rust decode via rav1d/avif-decode; encode via ravif |
 | JPEG XL | Yes | Optional | Pure-Rust decode via jxl-oxide; encode behind `jxl-encode` (CMake, ClangCL, libjxl) |
 | QOI | Yes | Yes | |

@@ -3,9 +3,9 @@
 The native addon statically links the following C libraries in addition to Rust crates
 (see `Cargo.lock` for their licences).
 
-## libwebp (lossy and near-lossless WebP encoding)
+## libwebp (WebP decoding, lossy and near-lossless encoding, graphics lossless)
 
-Built from the sources bundled in the `libwebp-sys` crate (libwebp 1.3.1). BSD 3-Clause.
+Built from the sources bundled in the `libwebp-sys` crate (libwebp 1.6.0). BSD 3-Clause.
 
     Copyright (c) 2010, Google Inc. All rights reserved.
 

@@ -1,5 +1,5 @@
-// Lossless WebP: pure-Rust fast coder by default, libwebp for graphic-like content and whenever
-// `effort` is given. sharp (devDependency) is the oracle for decoding and for size comparisons.
+// Lossless WebP: pure-Rust fast coder by default, libwebp for graphic-like content (low ratio or
+// few sampled colours) and whenever `effort` is given. sharp (devDependency) is the oracle for decoding and for size comparisons.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { sharp, engine, prng } from './_util.mjs';
@@ -188,5 +188,67 @@ test('oversized lossless WebP is rejected with an error, not a crash', async () 
   const buf = Buffer.alloc(w * 2 * 3, 5);
   for (const opts of [{}, { effort: 1 }]) {
     await assert.rejects(engine(buf, rawOpts(w, 2, 3)).webp({ lossless: true, ...opts }).toBuffer(), /16383|webp/i);
+  }
+});
+
+// Smooth 8-bit radial gradient with a transparent corner and a half-transparent block. The
+// pure-Rust coder lands at ~6% of the raw size here (above the old 5% escalation rule) while
+// libwebp is 5x smaller.
+function radial(n) {
+  const out = Buffer.alloc(n * n * 4);
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      const v = Math.round((255 * Math.hypot(x - n / 2, y - n / 2)) / (n * 0.707));
+      const o = (y * n + x) * 4;
+      out.set([v, v, 255 - v, x < n / 5 && y < n / 5 ? 0 : x > (n * 3) / 5 && y > (n * 3) / 5 ? 128 : 255], o);
+    }
+  }
+  return out;
+}
+
+test('smooth gradients with alpha reach libwebp size (ratio rule, not only <5%)', async () => {
+  const n = 384;
+  const buf = radial(n);
+  const ours = await lossless(buf, n, n, 4);
+  const theirs = await sharp(buf, rawOpts(n, n, 4)).webp({ lossless: true }).toBuffer();
+  assert.ok(ours.length <= theirs.length * 1.05, `${ours.length} vs sharp ${theirs.length}`);
+  const { data } = await decode(ours);
+  for (let i = 0; i < buf.length; i += 4) {
+    assert.equal(data[i + 3], buf[i + 3]);
+    if (buf[i + 3] !== 0) assert.ok(data[i] === buf[i] && data[i + 1] === buf[i + 1] && data[i + 2] === buf[i + 2], `px ${i / 4}`);
+  }
+});
+
+test('few-colour noise (indexed / dithered art) is detected by colour sampling, not by ratio', async () => {
+  const n = 320;
+  const rnd = prng(3);
+  const buf = Buffer.alloc(n * n * 3);
+  for (let i = 0; i < n * n; i++) {
+    const k = (rnd() * 6) | 0;
+    buf.set([k * 40, 255 - k * 30, k * 7], i * 3);
+  }
+  const ours = await lossless(buf, n, n, 3);
+  const theirs = await sharp(buf, rawOpts(n, n, 3)).webp({ lossless: true }).toBuffer();
+  assert.ok(ours.length <= theirs.length * 1.02, `${ours.length} vs sharp ${theirs.length}`);
+  assert.ok((await decode(ours)).data.equals(await sharp(buf, rawOpts(n, n, 3)).ensureAlpha().raw().toBuffer()));
+});
+
+test('lossless output is deterministic across runs and concurrent encodes', async () => {
+  const n = 300;
+  const buf = radial(n);
+  const first = await lossless(buf, n, n, 4);
+  const batch = await Promise.all(Array.from({ length: 6 }, () => lossless(buf, n, n, 4)));
+  for (const out of batch) assert.ok(out.equals(first));
+  const grain = noisy(200, 150);
+  const g1 = await lossless(grain, 200, 150, 3);
+  const g2 = await Promise.all([lossless(grain, 200, 150, 3), lossless(grain, 200, 150, 3)]);
+  for (const out of g2) assert.ok(out.equals(g1));
+});
+
+test('nearLossless matches sharp size at any quality (quality is the level, effort stays high)', async () => {
+  for (const quality of [20, 60, 100]) {
+    const ours = await engine(gRgba, rawOpts(W, H, 4)).webp({ nearLossless: true, quality }).toBuffer();
+    const theirs = await sharp(gRgba, rawOpts(W, H, 4)).webp({ nearLossless: true, quality }).toBuffer();
+    assert.ok(ours.length <= theirs.length * 1.06, `q${quality}: ${ours.length} vs sharp ${theirs.length}`);
   }
 });

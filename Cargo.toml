@@ -43,7 +43,7 @@ exif = { package = "kamadak-exif", version = "0.6" }
 memmap2 = "0.9"
 mozjpeg = { version = "0.10.13", features = ["with_simd"] }
 mozjpeg-sys = { version = "2.2.3", default-features = false }
-libwebp-sys = "0.9"
+libwebp-sys = "0.14"
 napi = { version = "3.14", features = ["napi9", "async", "serde-json"] }
 napi-build = "2.6"
 napi-derive = "3.6"
