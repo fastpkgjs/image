@@ -144,7 +144,7 @@ The typings mirror sharp's, name for name (`sharp.Metadata`, `sharp.OutputInfo`,
 |---|---|---|---|
 | PNG | Yes | Yes | 8/16-bit, alpha, palette input/output, interlaced input |
 | JPEG | Yes | Yes | MozJPEG codec, baseline/progressive, EXIF orientation, DCT-scaled decode |
-| WebP | Yes | Yes | Lossy and near-lossless via libwebp (BSD-3, bundled via libwebp-sys); lossless via image-webp (fast), switching to libwebp for graphic-like images or when `effort` is set; decoding via libwebp (animated files fall back to image-webp, first frame only) |
+| WebP | Yes | Yes | Lossy and near-lossless via libwebp (BSD-3, bundled via libwebp-sys); lossless via image-webp (fast), switching to libwebp for graphic-like images and gradients (at most about 0.25 s per megapixel) or when `effort` is set; decoding via libwebp (animated files fall back to image-webp, first frame only) |
 | AVIF | Yes | Yes | Pure-Rust decode via rav1d/avif-decode; encode via ravif |
 | JPEG XL | Yes | Optional | Pure-Rust decode via jxl-oxide; encode behind `jxl-encode` (CMake, ClangCL, libjxl) |
 | QOI | Yes | Yes | |
@@ -161,14 +161,14 @@ The typings mirror sharp's, name for name (`sharp.Metadata`, `sharp.OutputInfo`,
 
 | Option | Behaviour |
 |---|---|
-| `compressionLevel` (0-9, default 6) | A zlib ladder as in libpng/sharp: `0` stored (uncompressed) blocks, `1`-`3` fast, `4`-`6` default, `7`-`9` strongest. Deflate is zlib-rs; large images are deflated as fixed 512 KiB blocks in parallel and joined into one zlib stream (about 0.04% larger than one stream). |
-| `adaptiveFiltering` | `true` filters every row adaptively, `false` writes unfiltered rows (what libvips does by default). Left unset, the encoder trial-compresses a sample of rows both ways and keeps the smaller (adaptive only when it wins by 2% or more), so the default output is never meaningfully larger than sharp's and is often several times smaller on photos and gradients. |
+| `compressionLevel` (0-9, default 6) | `0` writes stored (uncompressed) blocks. Levels `1`-`9` are a size/effort ladder like libpng/sharp, but the work is matched to the image: after the row filter is chosen (below), a deterministic sample of rows decides whether the data is best coded by **entropy coding only** (dynamic Huffman blocks plus run-length tokens: photographs, gradients with grain and mostly flat art, where it is both smaller and 3-10x faster than LZ77 at any level, so these images encode identically at every level 1-9), or by **LZ77** (zlib-rs; graphics, screenshots, tiled or dithered art), where the level is the zlib-rs level of the same number (within 0.3% of sharp's size at the same level on the graphics measured, and faster than sharp from level 9 down to about level 6); large images whose LZ77 output stays above 15% of the input (typically decoded JPEG photographs) use a flatter ladder (zlib-rs 1-5), because the strong levels cost 2-5x the time for 3-8% in size. Large images are deflated as fixed 512 KiB blocks in parallel and joined into one zlib stream (about 0.04% larger than one stream). |
+| `adaptiveFiltering` | `true` filters every row adaptively, `false` writes unfiltered rows (what libvips does by default). Left unset, the encoder trial-compresses a 128 KiB sample of rows both ways and keeps the smaller (adaptive only when it wins by 2% or more), so the default output is never meaningfully larger than sharp's and is often several times smaller on photos and gradients. Row filtering itself is vectorised (AVX2 when present) with a shortcut for rows equal to their predecessor. |
 | `palette`, `quality`, `effort`, `colours`/`colors`, `dither` | Indexed output through a built-in median-cut quantiser with error diffusion (no libimagequant, which is GPL). Like sharp, giving `quality`, `effort`, `colours` or `dither` switches `palette` on. Images with at most `colours` distinct colours (alpha included) are converted losslessly. `colours` picks a 1/2/4/8-bit depth (2/4/16/256 entries) exactly as libvips does; translucent entries are written to `tRNS`. |
 | `progressive` | Adam7 interlacing (also for palette output). |
 
 The colour type and channel count are never changed behind your back: RGBA stays RGBA unless `palette` is requested.
 
-PNG bytes are **not** libvips-identical, but the encoder is a pure function of the pixels and the options: the same input gives the same bytes on every run, with any thread count (`image.concurrency()`), and, by construction, on every platform. They are stable within a release line (pinned by `tests/png-stability.test.mjs`); any change to the encoded bytes is listed in the CHANGELOG.
+PNG bytes are **not** libvips-identical, but the encoder (including the sampling that picks the filter and the deflate method) is a pure function of the pixels and the options: the same input gives the same bytes on every run, with any thread count (`image.concurrency()`), and, by construction, on every platform. They are stable within a release line (pinned by `tests/png-stability.test.mjs`); any change to the encoded bytes is listed in the CHANGELOG.
 
 ## API surface
 
@@ -250,7 +250,7 @@ Run:
 node bench/run.mjs
 ```
 
-Current results (the PNG rows were re-measured separately after the PNG encoder rewrite; median ms, `sharp@0.35.5`, concurrency 1, Linux x64, AMD EPYC-Rome 12 vCPU, Node 24):
+Current results (the PNG, WebP lossless and sharpen rows were re-measured after the encoder and sharpen work, the others are from an earlier run; median ms, `sharp@0.35.5`, concurrency 1, Linux x64, AMD EPYC-Rome 12 vCPU shared with other workloads, so expect about 10% jitter, Node 24):
 
 | Scenario | Fastpkg | sharp | Ratio |
 |---|---:|---:|---:|
@@ -261,13 +261,16 @@ Current results (the PNG rows were re-measured separately after the PNG encoder 
 | photo JPEG -> thumbnail 320 JPEG | 16.7 | 21.1 | 1.26x faster |
 | photo JPEG -> JPEG q85, no resize | 113-120 | 98-101 | 12-18% slower (single thread) |
 | photo JPEG -> resize 1200 WebP q80 | 158 | 171 | 1.08x faster |
-| resize 1200 + PNG (default level) | 97.0 | 49.3 | 2.0x slower single-thread, 40% smaller output; 1.3x faster with the default pool |
-| photo PNG 2000 -> PNG (default level) | 531 | 287 | 1.85x slower single-thread, 3.0x smaller output; 2.2x faster with the default pool |
-| alpha PNG 2000 -> resize 800 PNG | 94.0 | 113 | 1.2x faster, 1.9x smaller output |
+| resize 1200 + PNG (default level) | 42.6 | 43.4 | about equal single-thread, 39% smaller output; 1.25x faster with the default pool |
+| photo PNG 2000 -> PNG (default level) | 75.8 | 222.8 | 2.9x faster, 3.2x smaller output; 4.3x faster with the default pool |
+| alpha PNG 2000 -> PNG (default level) | 79.9 | 298 | 3.7x faster, 3.4x smaller output; 6.1x faster with the default pool |
+| photo PNG 2000 -> resize 800 PNG | 56.6 | 65.5 | 1.16x faster |
+| alpha PNG 2000 -> resize 800 PNG | 55.5 | 112.5 | 2.0x faster, 1.9x smaller output |
 | graphic PNG 1200 -> palette PNG | 56 | 113 | 2.0x faster |
 | photo PNG 2000 -> palette PNG | 1325 | 11050 | 8.3x faster |
-| resize 1200 + WebP lossless | 34.7 | 676.2 | 19.5x faster |
-| blur + sharpen + JPEG | 26.4 | 58.9 | 2.2x faster |
+| resize 1200 + WebP lossless | 358 | 694 | 1.9x faster, 13% smaller output (198 KB vs 228 KB) |
+| graphic PNG 1200 -> WebP lossless | 78.3 | 96.7 | 1.24x faster, same size |
+| blur + sharpen + JPEG | 35.4 | 66.6 | 1.9x faster (2.8x with the default pool) |
 | stats 4000x3000 | 141.2 | 419.3 | 3.0x faster |
 | 8 concurrent resizes | 4.7 | 25.7 | 5.5x faster |
 
