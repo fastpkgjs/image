@@ -1209,7 +1209,12 @@ fn sample_pixel(
         if with_alpha {
             premultiplied(color)
         } else {
-            [color.r as f32, color.g as f32, color.b as f32, color.alpha as f32]
+            [
+                color.r as f32,
+                color.g as f32,
+                color.b as f32,
+                color.alpha as f32,
+            ]
         }
     };
     let (wx, wy, first): ([f64; 4], [f64; 4], i64);
@@ -1499,7 +1504,7 @@ fn blur(
         gauss::conv3x3(&data, w, h, [1; 9], 9, 0)
     } else {
         gauss::gaussblur(
-            &data,
+            data,
             w,
             h,
             sigma,
