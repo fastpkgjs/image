@@ -1475,16 +1475,38 @@ fn encode_webp(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Res
     if !options.lossless || options.effort_set {
         return encode_webp_libwebp(image, options, None, out);
     }
-    encode_webp_lossless_fast(image, out)?;
-    let (exif, icc, xmp) = webp_metadata(image, options);
-    if let Some(effort) = lossless_escalation(image, out.len()) {
-        let mut better = Vec::new();
-        if encode_webp_libwebp(image, options, Some(effort), &mut better).is_ok()
-            && better.len() < out.len() + metadata_len(&exif, &icc, &xmp)
-        {
-            *out = better;
+    let pixels = image.width as usize * image.height as usize;
+    // Palette-like content (flat art, screenshots, indexed or dithered images) compresses 3-20x
+    // better with libwebp than with the pure-Rust coder, so the fast pass is skipped for it.
+    if pixels > LIBWEBP_ALWAYS_PIXELS && few_colours(image) {
+        // Method 2 is about 20% slower than method 1 and rarely more than 0.5% smaller, except
+        // on small images, where it saves around 10% (and costs little in absolute terms).
+        let method = match pixels {
+            0..=0x7_FFFF => 2,
+            0x8_0000..=0xFF_FFFF => 1,
+            _ => 0,
+        };
+        if encode_webp_libwebp(image, options, Some((method, 100.0)), out).is_ok() {
             return Ok(());
         }
+    }
+    encode_webp_lossless_fast(image, out)?;
+    let (exif, icc, xmp) = webp_metadata(image, options);
+    let mut best: Option<Vec<u8>> = None;
+    for effort in lossless_candidates(image, options, out.len()) {
+        let mut better = Vec::new();
+        let limit = best
+            .as_ref()
+            .map_or(out.len() + metadata_len(&exif, &icc, &xmp), |b| b.len());
+        if encode_webp_libwebp(image, options, Some(effort), &mut better).is_ok()
+            && better.len() < limit
+        {
+            best = Some(better);
+        }
+    }
+    if let Some(better) = best {
+        *out = better;
+        return Ok(());
     }
     if exif.is_some() || icc.is_some() || xmp.is_some() {
         *out = webp::attach_metadata(out, exif.as_deref(), icc.as_deref(), xmp.as_deref())?;
@@ -1500,8 +1522,7 @@ fn metadata_len(exif: &Option<Vec<u8>>, icc: &Option<Vec<u8>>, xmp: &Option<Vec<
 }
 
 /// Escalate to libwebp when the fast lossless file is below this share of the raw pixel bytes
-/// (3/10). Photographs mostly stay above 40%; flat art, screenshots and gradients land far
-/// below, and smooth photographs between 10% and 30% still shrink 15-30% with libwebp.
+/// (3/10). Photographs mostly stay above 40%; gradients and smooth photographs land below.
 const LIBWEBP_ESCALATE_RATIO: (usize, usize) = (3, 10);
 /// Deterministic pixel sample used by the colour-diversity test.
 const COLOUR_SAMPLE: usize = 4096;
@@ -1510,19 +1531,26 @@ const COLOUR_SAMPLE: usize = 4096;
 const COLOUR_SAMPLE_GRAPHIC_MAX: usize = 1024;
 /// Images up to this many pixels are always challenged: it costs a few milliseconds.
 const LIBWEBP_ALWAYS_PIXELS: usize = 16 * 1024;
+/// Up to this many pixels both libwebp candidates are simply run in full; above it a
+/// deterministic sample of rows predicts which one (if any) is worth running.
+const LIBWEBP_TRY_BOTH_PIXELS: usize = 160 * 1024;
+/// No libwebp challenge to the fast coder above this many pixels for non-graphic content
+/// (about 0.25 s per megapixel).
+const LIBWEBP_MAX_PIXELS: usize = 8 << 20;
+/// Required gain on the sample (15%) before the full image is escalated.
+const LIBWEBP_MIN_GAIN: (usize, usize) = (85, 100);
 
 /// Decides whether the pure-Rust lossless output should be challenged by libwebp, and with which
-/// `(method, quality)`. The pure-Rust coder has a single predictor and no palette, so it loses by
-/// 3-20x on graphics, gradients and indexed-colour art. Those either compress far below raw
-/// size with it (ratio test) or use few distinct colours (sampled colour test, which also
-/// catches dithered or noisy indexed images whose ratio stays high). Photographs fail both
-/// tests, cost one 4096-pixel scan, and keep the fast coder's speed.
-///
-/// The effort scales down with image size and content so the added latency stays bounded:
-/// roughly 0.1 s per megapixel up to 4 MP (method 2), 0.07 s up to 16 MP (method 1) and 0.01 s
-/// beyond (method 0). Quality 100 (best size) is only spent on clearly graphic content; the
-/// noisy mid-ratio cases, where it is several times slower for ~2%, use 75.
-fn lossless_escalation(image: &Image, fast_len: usize) -> Option<(i32, f32)> {
+/// `(method, quality)` candidates (the smallest result wins). The pure-Rust coder has a single
+/// predictor and no palette, so it loses by 25-60% on gradients and smooth content even after
+/// the palette-like content has been routed away. Two libwebp settings matter here, both at
+/// quality 100 (the cheap `method 0` is clearly best on noisy photographic gradients, `method 1`
+/// on exact gradients, with `method 2` never more than 0.5% smaller than `method 1`): they are
+/// either both run (small images) or one is picked by encoding a small deterministic sample of
+/// rows with the fast coder and with each setting, and only escalating when the sample shrinks
+/// by 15%. Photographs fail the ratio test and keep the fast coder's speed. Escalation costs
+/// about 0.25 s per megapixel (method 0) to 0.5 s (method 1) on this kind of content.
+fn lossless_candidates(image: &Image, options: &OutputOptions, fast_len: usize) -> Vec<(i32, f32)> {
     let channels = if image.gray {
         1
     } else if image.has_alpha {
@@ -1531,21 +1559,64 @@ fn lossless_escalation(image: &Image, fast_len: usize) -> Option<(i32, f32)> {
         3
     };
     let pixels = image.width as usize * image.height as usize;
-    let raw_len = pixels * channels;
+    if pixels <= LIBWEBP_ALWAYS_PIXELS {
+        return vec![(1, 100.0)];
+    }
     let (num, den) = LIBWEBP_ESCALATE_RATIO;
-    let by_ratio = fast_len * den < raw_len * num;
-    if !(pixels <= LIBWEBP_ALWAYS_PIXELS || by_ratio || few_colours(image)) {
+    if pixels > LIBWEBP_MAX_PIXELS || fast_len * den >= pixels * channels * num {
+        return Vec::new();
+    }
+    if pixels <= LIBWEBP_TRY_BOTH_PIXELS {
+        return vec![(0, 100.0), (1, 100.0)];
+    }
+    let Some(sample) = sample_rows(image) else {
+        return vec![(0, 100.0), (1, 100.0)];
+    };
+    let mut fast = Vec::new();
+    let size_with = |effort: (i32, f32)| {
+        let mut buf = Vec::new();
+        encode_webp_libwebp(&sample, options, Some(effort), &mut buf)
+            .ok()
+            .map(|_| buf.len())
+    };
+    if encode_webp_lossless_fast(&sample, &mut fast).is_err() {
+        return Vec::new();
+    }
+    let (Some(m0), Some(m1)) = (size_with((0, 100.0)), size_with((1, 100.0))) else {
+        return Vec::new();
+    };
+    let (gain_num, gain_den) = LIBWEBP_MIN_GAIN;
+    if m0.min(m1) * gain_den > fast.len() * gain_num {
+        return Vec::new();
+    }
+    // Method 0 (about 2.5x cheaper, and on whole noisy gradients often smaller than method 1,
+    // which a sample cannot show) unless method 1 is clearly better on the sample.
+    if m1 * 100 < m0 * 85 {
+        vec![(1, 100.0)]
+    } else {
+        vec![(0, 100.0)]
+    }
+}
+
+/// Eight evenly spaced bands of full rows (about 64 Ki pixels in all) as one image, or `None`
+/// when the image is too short to be sampled.
+fn sample_rows(image: &Image) -> Option<Image> {
+    const BANDS: usize = 8;
+    const TARGET: usize = 64 * 1024;
+    let (w, h) = (image.width as usize, image.height as usize);
+    let band = (TARGET / (w * BANDS)).max(2);
+    if h < band * BANDS * 2 {
         return None;
     }
-    let clearly_graphic = pixels <= LIBWEBP_ALWAYS_PIXELS || fast_len * 25 < raw_len * 3;
-    let quality = if clearly_graphic { 100.0 } else { 75.0 };
-    Some(match pixels {
-        // Extremely flat content (<2% of raw) gains nothing from the slower method.
-        _ if fast_len * 50 < raw_len && pixels <= 0xFF_FFFF => (1, 100.0),
-        0..=0x3F_FFFF => (2, quality),
-        0x40_0000..=0xFF_FFFF => (1, quality),
-        _ => (0, 75.0),
-    })
+    let mut data = Vec::with_capacity(band * BANDS * w * 4);
+    for i in 0..BANDS {
+        let start = (h - band) * i / (BANDS - 1);
+        data.extend_from_slice(&image.data[start * w * 4..(start + band) * w * 4]);
+    }
+    let mut sample = Image::new(image.width, (band * BANDS) as u32, data).ok()?;
+    sample.has_alpha = image.has_alpha;
+    sample.gray = image.gray;
+    Some(sample)
 }
 
 /// True when a deterministic sample of `COLOUR_SAMPLE` pixels contains few distinct colours.

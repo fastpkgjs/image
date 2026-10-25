@@ -233,6 +233,32 @@ test('few-colour noise (indexed / dithered art) is detected by colour sampling, 
   assert.ok((await decode(ours)).data.equals(await sharp(buf, rawOpts(n, n, 3)).ensureAlpha().raw().toBuffer()));
 });
 
+// A JPEG-decoded gradient is neither few-colour nor exact: the fast coder lands at ~9% of raw
+// (above the palette rules), a sample of rows shows libwebp 20%+ smaller and the escalation runs
+// libwebp method 0 (about 3x cheaper than sharp's default effort and smaller than it).
+test('JPEG-noisy gradients are escalated by the sample test and beat sharp default size', async () => {
+  const w = 1000;
+  const h = 700;
+  const grad = Buffer.alloc(w * h * 3);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const o = (y * w + x) * 3;
+      grad[o] = ((x * 255) / w) | 0;
+      grad[o + 1] = ((y * 255) / h) | 0;
+      grad[o + 2] = (((x + y) * 255) / (w + h)) | 0;
+    }
+  }
+  const jpg = await sharp(grad, rawOpts(w, h, 3)).jpeg({ quality: 88 }).toBuffer();
+  const ours = await engine(jpg).webp({ lossless: true }).toBuffer();
+  const theirs = await sharp(jpg).webp({ lossless: true }).toBuffer();
+  assert.ok(ours.length <= theirs.length * 0.95, `${ours.length} vs sharp ${theirs.length}`);
+  const m0 = await engine(jpg).webp({ lossless: true, effort: 0, quality: 100 }).toBuffer();
+  assert.ok(ours.equals(m0), 'default is libwebp method 0 at quality 100 for this content');
+  const decoded = await sharp(ours).raw().toBuffer();
+  const source = await sharp(jpg).raw().toBuffer();
+  assert.ok(decoded.equals(source), 'pixel-exact');
+});
+
 test('lossless output is deterministic across runs and concurrent encodes', async () => {
   const n = 300;
   const buf = radial(n);
