@@ -1506,7 +1506,7 @@ fn sample_pixel(
             alpha.clamp(0.0, 255.0) as u8,
         ]
     } else {
-        blended.map(|v| round_f32_u8(v))
+        blended.map(round_f32_u8)
     }
 }
 
@@ -1762,11 +1762,9 @@ fn unpremultiply(data: &mut [u8]) {
         for px in chunk.chunks_exact_mut(4) {
             let a = px[3] as u32;
             for c in &mut px[..3] {
-                *c = if a == 0 {
-                    0
-                } else {
-                    (*c as u32 * 255 / a).min(255) as u8
-                };
+                *c = (*c as u32 * 255)
+                    .checked_div(a)
+                    .map_or(0, |value| value.min(255)) as u8;
             }
         }
     });
@@ -2184,6 +2182,7 @@ fn clahe(image: Image, width: u32, height: u32, max_slope: f64) -> Result<Image>
 /// saturating float-to-int cast does not, so the integer part is read from the mantissa after
 /// adding 2^23.
 #[inline(always)]
+#[allow(clippy::manual_clamp)] // `clamp` would keep a NaN; `max` maps it to 0 like the cast.
 fn trunc_u8(x: f32) -> u8 {
     const MAGIC: f32 = 8_388_608.0;
     let x = x.max(0.0).min(255.0);

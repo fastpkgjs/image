@@ -36,7 +36,7 @@ fn mask(sigma: f64) -> Vec<i32> {
 fn mac_u16(dst: &mut [u16], taps: &[i32], srcs: &[&[u16]], scale: i32) {
     let half = (scale / 2) as u64;
     let recip = ((1u64 << 40) / scale as u64) + 1;
-    let finish = |acc: i32| -> u16 { ((acc as u64 + half) * recip >> 40) as u16 };
+    let finish = |acc: i32| -> u16 { (((acc as u64 + half) * recip) >> 40) as u16 };
     let split = dst.len() / LANES * LANES;
     let (head, tail) = dst.split_at_mut(split);
     for (block, chunk) in head.chunks_exact_mut(LANES).enumerate() {
