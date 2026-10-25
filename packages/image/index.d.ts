@@ -1,446 +1,150 @@
-/// <reference types="node" />
+// ESM entry types. The declarations live in index.d.cts (sharp's `export =` layout, used for
+// `require`); this file re-exposes them as a default export plus named exports so that
+// `import sharp from '@fastpkg/image'`, `import { Sharp, Metadata } from '@fastpkg/image'` and
+// `type M = sharp.Metadata` all work under module node16/nodenext/bundler.
+import sharp from './index.cjs';
 
-import { Duplex, Readable } from 'node:stream';
+export default sharp;
 
-export type Input = string | Buffer | Uint8Array | ArrayBuffer | NodeJS.ReadableStream;
-export type Fit = 'cover' | 'contain' | 'fill' | 'inside' | 'outside';
-export type Kernel =
-  | 'nearest'
-  | 'linear'
-  | 'bilinear'
-  | 'cubic'
-  | 'mitchell'
-  | 'lanczos2'
-  | 'lanczos3'
-  | 'mks2013'
-  | 'mks2021';
-export type Format =
-  | 'jpeg'
-  | 'jpg'
-  | 'png'
-  | 'webp'
-  | 'avif'
-  | 'jxl'
-  | 'gif'
-  | 'qoi'
-  | 'raw'
-  | 'svg';
+// Both a value and a type: re-exported through import aliases so every meaning is kept.
+import Sharp = sharp.Sharp;
+import Gradient = sharp.Gradient;
+export { Sharp, Gradient };
 
-export interface InputOptions {
-  raw?: { width: number; height: number; channels: number; depth?: 'uchar' | 'ushort'; premultiplied?: boolean };
-  create?: { width: number; height: number; channels?: number; background?: string; noise?: number };
-  text?: {
-    text: string;
-    font?: string;
-    fontfile?: string;
-    width?: number;
-    height?: number;
-    align?: 'left' | 'center' | 'right';
-    dpi?: number;
-    rgba?: boolean;
-    spacing?: number;
-    wrap?: string;
-  };
-  page?: number;
-  pages?: number;
-  animated?: boolean;
-  density?: number;
-  limitInputPixels?: number;
-  unlimited?: boolean;
-  autoOrient?: boolean;
-  failOn?: 'none' | 'truncated' | 'error' | 'warning';
-  sequentialRead?: boolean;
-  ignoreIcc?: boolean;
-}
+export declare const align: typeof sharp.align;
+export declare const blend: typeof sharp.blend;
+export declare const block: typeof sharp.block;
+export declare const bool: typeof sharp.bool;
+export declare const cache: typeof sharp.cache;
+export declare const colorspace: typeof sharp.colorspace;
+export declare const colourspace: typeof sharp.colourspace;
+export declare const concurrency: typeof sharp.concurrency;
+export declare const counters: typeof sharp.counters;
+export declare const fit: typeof sharp.fit;
+export declare const format: typeof sharp.format;
+export declare const gradient: typeof sharp.gradient;
+export declare const gravity: typeof sharp.gravity;
+export declare const interpolators: typeof sharp.interpolators;
+export declare const kernel: typeof sharp.kernel;
+export declare const linearGradient: typeof sharp.linearGradient;
+export declare const position: typeof sharp.position;
+export declare const queue: typeof sharp.queue;
+export declare const radialGradient: typeof sharp.radialGradient;
+export declare const simd: typeof sharp.simd;
+export declare const strategy: typeof sharp.strategy;
+export declare const unblock: typeof sharp.unblock;
+export declare const versions: typeof sharp.versions;
 
-export interface ResizeOptions {
-  width?: number | null;
-  height?: number | null;
-  fit?: Fit;
-  position?: string | number | { left?: number; top?: number };
-  background?: string;
-  kernel?: Kernel;
-  withoutEnlargement?: boolean;
-  withoutReduction?: boolean;
-  fastShrinkOnLoad?: boolean;
-}
-
-export interface OutputOptions {
-  quality?: number;
-  lossless?: boolean;
-  effort?: number;
-  progressive?: boolean;
-  compressionLevel?: number;
-  palette?: boolean;
-  colors?: number;
-  colours?: number;
-  dither?: number;
-  loop?: number;
-  delay?: number | number[];
-  pageHeight?: number;
-  depth?: string;
-  bitdepth?: number;
-  chromaSubsampling?: string;
-  mozjpeg?: boolean;
-  trellisQuantisation?: boolean;
-  overshootDeringing?: boolean;
-  optimiseScans?: boolean;
-  optimiseCoding?: boolean;
-  /**
-   * JPEG only, opt-in (default false). Encodes large images (>= 1 megapixel) as independent
-   * horizontal bands on the thread pool and joins them into one baseline JPEG with restart
-   * markers. Decoded pixels are identical to a single-pass baseline encode with the same
-   * quality; the file is typically 5-10% larger because the standard Huffman tables are used
-   * (`optimiseCoding` is ignored). Smaller images, or a pool with a single thread, use the
-   * normal encoder. Cannot be combined with `progressive`, `mozjpeg` or `optimiseScans`
-   * (throws a TypeError).
-   */
-  parallel?: boolean;
-  smartSubsample?: boolean;
-  nearLossless?: boolean;
-  /** WebP: keep the colour values under fully transparent pixels. */
-  exact?: boolean;
-  preset?: string;
-  timeout?: number;
-  resolveWithObject?: boolean;
-}
-
-export interface OutputInfo {
-  format: Format;
-  width: number;
-  height: number;
-  channels: number;
-  size: number;
-  space: string;
-  depth: string;
-  hasAlpha: boolean;
-  premultiplied: boolean;
-}
-
-export interface Metadata extends OutputInfo {
-  /** Present for multi-page containers (and always for GIF). */
-  pages?: number;
-  pageHeight?: number;
-  /** Animation loop count and per-frame delays (ms) of GIF / animated WebP. */
-  loop?: number;
-  delay?: number[];
-  /** JPEG chroma subsampling, e.g. `4:2:0`. */
-  chromaSubsampling?: string;
-  isProgressive?: boolean;
-  isPalette?: boolean;
-  orientation?: number;
-  density?: number;
-  hasProfile: boolean;
-  hasExif: boolean;
-  hasXmp: boolean;
-  exif?: Buffer;
-  icc?: Buffer;
-  xmp?: Buffer;
-  comments?: string;
-}
-
-export interface Stats {
-  channels: Array<{
-    min: number;
-    max: number;
-    sum: number;
-    mean: number;
-    stdev: number;
-    minX: number;
-    minY: number;
-    maxX: number;
-    maxY: number;
-  }>;
-  isOpaque: boolean;
-  entropy: number;
-  sharpness: number;
-  dominant?: { r: number; g: number; b: number; alpha: number };
-}
-
-export type ColorInput = string | { r?: number; g?: number; b?: number; alpha?: number; a?: number };
-export type CurvePoints = Array<[number, number]> | number[];
-
-export interface GradientStop {
-  offset: number;
-  color: ColorInput;
-}
-
-export interface GradientSpec {
-  type?: 'linear' | 'radial';
-  angle?: number;
-  center?: [number, number];
-  radius?: number;
-  spread?: 'pad' | 'repeat' | 'reflect';
-  stops: GradientStop[] | Array<[number, ColorInput]> | ColorInput[];
-}
-
-export interface ReplaceColorOptions {
-  tolerance?: number;
-  softness?: number;
-  amount?: number;
-  preserveOpacity?: boolean;
-}
-
-export interface RecolorOptions {
-  amount?: number;
-  preserveOpacity?: boolean;
-}
-
-export interface GradientOptions {
-  amount?: number;
-  preserveOpacity?: boolean;
-}
-
-export interface ApplyLutOptions {
-  strength?: number;
-  interpolation?: 'trilinear' | 'nearest';
-}
-
-export interface CurvesOptions {
-  rgb?: CurvePoints;
-  master?: CurvePoints;
-  r?: CurvePoints;
-  red?: CurvePoints;
-  g?: CurvePoints;
-  green?: CurvePoints;
-  b?: CurvePoints;
-  blue?: CurvePoints;
-  points?: CurvePoints;
-  channel?: 'rgb' | 'master' | 'r' | 'red' | 'g' | 'green' | 'b' | 'blue';
-}
-
-export interface LevelsOptions {
-  inputBlack?: number | number[];
-  inputWhite?: number | number[];
-  gamma?: number | number[];
-  outputBlack?: number | number[];
-  outputWhite?: number | number[];
-}
-
-export interface WhiteBalanceOptions {
-  temperature?: number;
-  tint?: number;
-}
-
-export interface ColourBalanceOptions {
-  shadows?: number[] | { r?: number; g?: number; b?: number };
-  midtones?: number[] | { r?: number; g?: number; b?: number };
-  highlights?: number[] | { r?: number; g?: number; b?: number };
-}
-
-export interface FillOptions {
-  amount?: number;
-  preserveOpacity?: boolean;
-}
-
-export interface PaletteSwapOptions {
-  dither?: number;
-  preserveOpacity?: boolean;
-}
-
-export interface AlphaFromLumaOptions {
-  channel?: 'luma' | 'r' | 'red' | 'g' | 'green' | 'b' | 'blue' | 'a' | 'alpha';
-  invert?: boolean;
-  multiply?: boolean;
-  scale?: number;
-  offset?: number;
-}
-
-export interface GradientConstructor {
-  new (type?: 'linear' | 'radial'): Gradient;
-  prototype: Gradient;
-}
-
-export class Gradient {
-  constructor(type?: 'linear' | 'radial');
-  type(value: 'linear' | 'radial'): this;
-  linear(angle?: number): this;
-  radial(cx?: number, cy?: number, radius?: number): this;
-  angle(value: number): this;
-  center(x: number, y: number): this;
-  radius(value: number): this;
-  spread(value: 'pad' | 'repeat' | 'reflect'): this;
-  addStop(offset: number, color: ColorInput): this;
-  stop(offset: number, color: ColorInput): this;
-  clone(): Gradient;
-  toJSON(): GradientSpec;
-}
-
-export interface CompositeOptions {
-  input: Input;
-  blend?: string;
-  gravity?: string | number;
-  top?: number;
-  left?: number;
-  tile?: boolean;
-  density?: number;
-  premultiplied?: boolean;
-}
-
-export interface ConvolveKernel {
-  width: number;
-  height: number;
-  kernel: number[];
-  scale?: number;
-  offset?: number;
-}
-
-export class Sharp extends Duplex {
-  constructor(input?: Input | InputOptions, options?: InputOptions);
-  clone(): Sharp;
-
-  resize(width?: number | null | ResizeOptions, height?: number | null, options?: ResizeOptions): this;
-  extend(options: number | { top?: number; left?: number; bottom?: number; right?: number; width?: number; height?: number; background?: string; position?: string; extendWith?: 'background' | 'copy' | 'repeat' | 'mirror' }): this;
-  extract(options: { left: number; top: number; width: number; height: number }): this;
-  trim(options?: { background?: string; threshold?: number; lineArt?: boolean }): this;
-  rotate(angle?: number, options?: { background?: string }): this;
-  autoOrient(): this;
-  flip(flag?: boolean): this;
-  flop(flag?: boolean): this;
-  affine(matrix: number[] | number[][], options?: { idx?: number; idy?: number; odx?: number; ody?: number; background?: string; interpolator?: string }): this;
-  sharpen(options?: number | { sigma?: number; m1?: number; m2?: number; x1?: number; y2?: number; y3?: number }): this;
-  median(size?: number): this;
-  blur(sigma?: number | { sigma: number }): this;
-  dilate(width?: number): this;
-  erode(width?: number): this;
-  flatten(options?: { background?: string }): this;
-  unflatten(): this;
-  gamma(gamma?: number, gammaOut?: number): this;
-  negate(options?: { alpha?: boolean }): this;
-  normalise(options?: { lower?: number; upper?: number }): this;
-  normalize(options?: { lower?: number; upper?: number }): this;
-  clahe(options: { width: number; height: number; maxSlope?: number }): this;
-  convolve(kernel: ConvolveKernel): this;
-  threshold(threshold?: number | { threshold?: number; greyscale?: boolean; grayscale?: boolean }, options?: { greyscale?: boolean; grayscale?: boolean }): this;
-  boolean(operand: Input, operator: 'and' | 'or' | 'eor', options?: { raw?: InputOptions['raw'] }): this;
-  linear(a?: number | number[], b?: number | number[]): this;
-  recomb(matrix: number[][]): this;
-  modulate(options?: { brightness?: number; saturation?: number; hue?: number; lightness?: number }): this;
-  tint(color: string): this;
-  greyscale(): this;
-  grayscale(): this;
-  removeAlpha(): this;
-  ensureAlpha(alpha?: number): this;
-  extractChannel(channel: number | 'red' | 'green' | 'blue' | 'alpha'): this;
-  joinChannel(input: Input, options?: { raw?: InputOptions['raw'] }): this;
-  bandbool(operator: 'and' | 'or' | 'eor'): this;
-  composite(images: CompositeOptions | CompositeOptions[]): this;
-
-  replaceColor(from: ColorInput, to: ColorInput, options?: ReplaceColorOptions): this;
-  recolor(color: ColorInput, options?: RecolorOptions): this;
-  duotone(shadows: ColorInput, highlights: ColorInput, options?: RecolorOptions): this;
-  duotone(options: { shadows: ColorInput; highlights: ColorInput; amount?: number; preserveOpacity?: boolean }): this;
-  gradientMap(gradient: Gradient | GradientSpec | ColorInput[] | Array<[number, ColorInput]>, options?: GradientOptions): this;
-  gradientRecolor(gradient: Gradient | GradientSpec | ColorInput[] | Array<[number, ColorInput]>, options?: GradientOptions): this;
-  gradientFill(gradient: Gradient | GradientSpec | ColorInput[] | Array<[number, ColorInput]>, options?: GradientOptions): this;
-  applyLut(lut: string | Buffer, options?: ApplyLutOptions): this;
-  curves(value: CurvesOptions | CurvePoints): this;
-  levels(options?: LevelsOptions): this;
-  whiteBalance(options?: WhiteBalanceOptions): this;
-  colourBalance(options?: ColourBalanceOptions): this;
-  colorBalance(options?: ColourBalanceOptions): this;
-  posterize(levels?: number | { levels?: number }): this;
-  solarize(options?: number | { threshold?: number }): this;
-  fill(colorOrGradient: ColorInput | Gradient | GradientSpec, options?: FillOptions): this;
-  paletteSwap(palette: ColorInput[] | { palette: ColorInput[] }, options?: PaletteSwapOptions): this;
-  alphaFromLuma(options?: AlphaFromLumaOptions): this;
-  toFormat(format: Format | string, options?: OutputOptions): this;
-  jpeg(options?: OutputOptions): this;
-  png(options?: OutputOptions): this;
-  webp(options?: OutputOptions): this;
-  gif(options?: OutputOptions): this;
-  avif(options?: OutputOptions): this;
-  jxl(options?: OutputOptions): this;
-  qoi(options?: OutputOptions): this;
-  raw(options?: OutputOptions): this;
-  toColourspace(space: string): this;
-  toColorspace(space: string): this;
-  pipelineColourspace(space: string): this;
-  pipelineColorspace(space: string): this;
-  tile(options?: { size?: number; overlap?: number; background?: string; container?: 'fs' | 'zip'; layout?: 'dz' | 'iiif' | 'iiif3' | 'zoomify' | 'google'; skipBlanks?: number; depth?: string; id?: string }): this;
-  heif(options?: OutputOptions): never;
-  tiff(options?: OutputOptions): never;
-  jp2(options?: OutputOptions): never;
-
-  keepMetadata(): this;
-  withMetadata(options?: Record<string, unknown>): this;
-  keepExif(): this;
-  withExif(exif: string | Record<string, unknown>): this;
-  withExifMerge(exif: string | Record<string, unknown>): this;
-  keepIccProfile(): this;
-  withIccProfile(profile: string): this;
-  keepXmp(): this;
-  withXmp(xmp: string): this;
-  keepGainMap(): this;
-  withGainMap(gainmap?: unknown): this;
-  withDensity(dpi: number): this;
-  timeout(options: number | { seconds: number }): this;
-
-  metadata(): Promise<Metadata>;
-  stats(): Promise<Stats>;
-  probe(): Promise<Metadata>;
-  dominant(): Promise<Stats['dominant']>;
-  toBuffer(options?: OutputOptions & { resolveWithObject?: false }): Promise<Buffer>;
-  toBuffer(options: OutputOptions & { resolveWithObject: true }): Promise<{ data: Buffer; info: OutputInfo }>;
-  toBuffer(callback: (error: Error | null, data: Buffer, info: OutputInfo) => void): Promise<undefined>;
-  toBuffer(options: OutputOptions, callback: (error: Error | null, data: Buffer, info: OutputInfo) => void): Promise<undefined>;
-  toUint8Array(options?: OutputOptions): Promise<{ data: Uint8Array; info: OutputInfo }>;
-  toFile(path: string, options?: OutputOptions): Promise<OutputInfo>;
-  toFile(path: string, callback: (error: Error | null, info: OutputInfo) => void): Promise<undefined>;
-  toStream(): Readable;
-  responsive(widths: number[], options?: OutputOptions & { formats?: Format[] }): Promise<Array<{ width: number; format: Format; data: Buffer }>>;
-}
-
-declare function image(input?: Input | InputOptions, options?: InputOptions): Sharp;
-
-declare namespace image {
-  export { Sharp, Input, InputOptions, ResizeOptions, OutputOptions, OutputInfo, Metadata, Stats, CompositeOptions, ConvolveKernel };
-  export const Gradient: GradientConstructor;
-  export const cache: (options?: Record<string, unknown>) => Record<string, number>;
-  export const concurrency: (value?: number) => number;
-  export const counters: () => { queue: number; process: number };
-  export const simd: (value?: boolean) => boolean;
-  export const format: Record<string, Record<string, boolean>>;
-  export const versions: Record<string, string>;
-  export const interpolators: Record<string, string>;
-  /** sharp-compatible constant tables. */
-  export const gravity: Record<'center' | 'centre' | 'north' | 'east' | 'south' | 'west' | 'northeast' | 'southeast' | 'southwest' | 'northwest', number>;
-  export const strategy: Record<'entropy' | 'attention', number>;
-  export const position: Record<'top' | 'right' | 'bottom' | 'left' | 'right top' | 'right bottom' | 'left bottom' | 'left top', number>;
-  export const kernel: Record<'nearest' | 'linear' | 'cubic' | 'mitchell' | 'lanczos2' | 'lanczos3' | 'mks2013' | 'mks2021', string>;
-  export const fit: Record<'contain' | 'cover' | 'fill' | 'inside' | 'outside', string>;
-  export const blend: Record<string, string>;
-  export const bool: Record<'and' | 'or' | 'eor', string>;
-  export const colourspace: Record<string, string>;
-  export const colorspace: Record<string, string>;
-  export const align: Record<string, string>;
-  export const queue: NodeJS.EventEmitter;
-  export function gradient(type?: 'linear' | 'radial'): Gradient;
-  export function linearGradient(angle?: number): Gradient;
-  export function radialGradient(cx?: number, cy?: number, radius?: number): Gradient;
-  export function block(options?: Record<string, unknown>): void;
-  export function unblock(options?: Record<string, unknown>): void;
-}
-
-export default image;
-export const cache: typeof image.cache;
-export const concurrency: typeof image.concurrency;
-export const counters: typeof image.counters;
-export const simd: typeof image.simd;
-export const format: typeof image.format;
-export const versions: typeof image.versions;
-export const interpolators: typeof image.interpolators;
-export const gravity: typeof image.gravity;
-export const strategy: typeof image.strategy;
-export const position: typeof image.position;
-export const kernel: typeof image.kernel;
-export const fit: typeof image.fit;
-export const blend: typeof image.blend;
-export const bool: typeof image.bool;
-export const colourspace: typeof image.colourspace;
-export const colorspace: typeof image.colorspace;
-export const align: typeof image.align;
-export const queue: typeof image.queue;
-export const gradient: typeof image.gradient;
-export const linearGradient: typeof image.linearGradient;
-export const radialGradient: typeof image.radialGradient;
+export type {
+  AffineOptions,
+  AlphaFromLumaOptions,
+  AnimationOptions,
+  ApplyLutOptions,
+  AvailableFormatInfo,
+  AvifOptions,
+  Blend,
+  BlurOptions,
+  BoolEnum,
+  CacheOptions,
+  CacheResult,
+  ChannelStats,
+  Channels,
+  ClaheOptions,
+  Color,
+  ColorInput,
+  Colour,
+  ColourBalanceOptions,
+  ColourBalanceTriple,
+  ColourspaceEnum,
+  CommentsMetadata,
+  Create,
+  CreateChannels,
+  CreateRaw,
+  CreateText,
+  CurvePoints,
+  CurvesOptions,
+  DepthEnum,
+  DuotoneOptions,
+  Exif,
+  ExifDir,
+  ExtendOptions,
+  ExtendWith,
+  FailOnOptions,
+  FillOptions,
+  FitEnum,
+  FlattenOptions,
+  FormatEnum,
+  GainMapMetadata,
+  GifOptions,
+  GradientConstructor,
+  GradientLike,
+  GradientOptions,
+  GradientSpec,
+  GradientStop,
+  Gravity,
+  GravityEnum,
+  HeifCompression,
+  HeifOptions,
+  HeifTune,
+  HorizontalAlignment,
+  Interpolators,
+  Join,
+  Jp2InputOptions,
+  Jp2Options,
+  JpegOptions,
+  JxlOptions,
+  Kernel,
+  KernelEnum,
+  LevelMetadata,
+  LevelsOptions,
+  Matrix2x2,
+  Matrix3x3,
+  Matrix4x4,
+  MediaType,
+  Metadata,
+  NegateOptions,
+  Noise,
+  NormaliseOptions,
+  OpenSlideInputOptions,
+  OutputInfo,
+  OutputOptions,
+  OverlayOptions,
+  PaletteSwapOptions,
+  PdfInputOptions,
+  PngOptions,
+  Precision,
+  PresetEnum,
+  Raw,
+  RawOptions,
+  RecolorOptions,
+  Region,
+  ReplaceColorOptions,
+  ResizeOptions,
+  ResponsiveOptions,
+  ResponsiveOutput,
+  RotateOptions,
+  SharpConstructor,
+  SharpCounters,
+  SharpInput,
+  SharpOptions,
+  SharpenOptions,
+  Stats,
+  StrategyEnum,
+  SvgInputOptions,
+  TextAlign,
+  TextWrap,
+  ThresholdOptions,
+  TiffInputOptions,
+  TiffOptions,
+  TileContainer,
+  TileLayout,
+  TileOptions,
+  TimeoutOptions,
+  TrimOptions,
+  Unit,
+  VerticalAlignment,
+  WebpOptions,
+  WhiteBalanceOptions,
+  WithIccProfileOptions,
+  WriteableMetadata,
+} from './index.cjs';

@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+mod alloc;
+
 use fastpkg_core::PipelineSpec;
 use fastpkg_stream::{
     execute_bytes, execute_path, metadata_bytes, metadata_path, probe_bytes, probe_path,
@@ -9,6 +11,11 @@ use napi::bindgen_prelude::{Buffer, Either};
 use napi::{Error, Result, Status};
 use napi_derive::napi;
 use serde_json::{json, Value};
+
+#[napi_derive::module_init]
+fn init() {
+    alloc::tune();
+}
 
 static CONCURRENCY: AtomicUsize = AtomicUsize::new(0);
 static SIMD_ENABLED: AtomicBool = AtomicBool::new(true);

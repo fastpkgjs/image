@@ -122,7 +122,7 @@ for (const target of targets) {
 const mainDirectory = path.join(output, 'image');
 const mainPackageDirectory = path.join(mainDirectory, 'packages', 'image');
 fs.mkdirSync(mainPackageDirectory, { recursive: true });
-for (const file of ['index.js', 'index.cjs', 'index.d.ts', 'lib.cjs']) {
+for (const file of ['index.js', 'index.cjs', 'index.d.ts', 'index.d.cts', 'lib.cjs']) {
   fs.copyFileSync(
     path.join(root, 'packages', 'image', file),
     path.join(mainPackageDirectory, file),
@@ -130,6 +130,7 @@ for (const file of ['index.js', 'index.cjs', 'index.d.ts', 'lib.cjs']) {
 }
 fs.copyFileSync(path.join(root, 'README.md'), path.join(mainDirectory, 'README.md'));
 fs.copyFileSync(path.join(root, 'LICENSE'), path.join(mainDirectory, 'LICENSE'));
+fs.copyFileSync(path.join(root, 'THIRD_PARTY_NOTICES.md'), path.join(mainDirectory, 'THIRD_PARTY_NOTICES.md'));
 
 const mainManifest = {
   ...rootPackage,
@@ -138,9 +139,11 @@ const mainManifest = {
     'packages/image/index.js',
     'packages/image/index.cjs',
     'packages/image/index.d.ts',
+    'packages/image/index.d.cts',
     'packages/image/lib.cjs',
     'README.md',
     'LICENSE',
+    'THIRD_PARTY_NOTICES.md',
   ],
   optionalDependencies,
   publishConfig: { access: 'public' },
@@ -183,6 +186,21 @@ check(
 for (const [name, range] of Object.entries(stagedMain.optionalDependencies || {})) {
   check(range === version, `optionalDependency ${name} pinned to ${range}, expected ${version}`);
 }
+// `exports` must keep the package.json subpath and a leading `types` condition (backed by a file
+// that ships in the package) for both `import` and `require`.
+const stagedExports = stagedMain.exports || {};
+check(stagedExports['./package.json'] === './package.json', 'main exports lacks "./package.json": "./package.json"');
+for (const condition of ['import', 'require']) {
+  const entry = (stagedExports['.'] || {})[condition];
+  check(entry && Object.keys(entry)[0] === 'types', `exports["."].${condition} must list "types" first`);
+  for (const target of Object.values(entry || {})) {
+    check(fs.existsSync(path.join(mainDirectory, target)), `exports["."].${condition} target ${target} is not staged`);
+  }
+}
+check(
+  stagedMain.types && fs.existsSync(path.join(mainDirectory, stagedMain.types)),
+  `main "types" ${stagedMain.types} is not staged`,
+);
 const napiTargets = (rootPackage.napi && rootPackage.napi.targets) || [];
 check(
   napiTargets.length === targets.length,
@@ -228,9 +246,11 @@ if (pack.status !== 0) {
       'packages/image/index.js',
       'packages/image/index.cjs',
       'packages/image/index.d.ts',
+      'packages/image/index.d.cts',
       'packages/image/lib.cjs',
       'README.md',
       'LICENSE',
+      'THIRD_PARTY_NOTICES.md',
       'package.json',
     ]) {
       check(files.includes(required), `npm pack of main package is missing ${required}`);

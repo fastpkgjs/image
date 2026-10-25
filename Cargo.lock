@@ -526,6 +526,7 @@ dependencies = [
  "fastpkg-codecs",
  "fastpkg-core",
  "fastpkg-stream",
+ "libc",
  "napi",
  "napi-build",
  "napi-derive",
