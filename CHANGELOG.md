@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.3.0
+
+Output-size, speed and parity release. **PNG and WebP output bytes change** (see below); PNG bytes remain deterministic and independent of thread count, and are pinned by `tests/png-stability.test.mjs`. They are not libvips-identical.
+
+### PNG
+
+- The default output is no longer larger than sharp's: the encoder now picks deflate method and row filtering per image from a deterministic sample. Photographs, gradients and flat art use a new Huffman/run-length coder; graphics, screenshots and tiled art use zlib-rs with level N mapped to zlib-rs level N. On the benchmark corpus files are about equal to sharp's on graphics and often 3x or more smaller on photographs and gradients. Large decoded-JPEG-style photos use a flatter level ladder. `compressionLevel: 0` now writes stored (uncompressed) deflate blocks. `adaptiveFiltering` is honoured. Photographic and gradient images encode identically at levels 1-9. Large images are deflated in parallel in fixed blocks, so bytes never depend on the thread count.
+- `png({ palette, quality, effort, colours, dither })` now behaves like sharp: any of the quantisation options implies `palette`, `colours` selects a 1/2/4/8-bit depth, images with at most 256 colours convert losslessly, alpha goes to `tRNS`. A built-in MIT quantiser (no libimagequant) is 5-80x faster than sharp's at comparable size and error.
+- `iCCP` is written before `PLTE`.
+
+### WebP
+
+- Decoding uses libwebp: about 2-5x faster for lossy files and bit-identical to sharp. A resize at the start of a pipeline uses libwebp's scaled decode (resizing a 4000x3000 lossy WebP: about 60 ms instead of about 440 ms).
+- Lossless: graphics, gradients and indexed-colour art are routed to libwebp by a ratio and colour-sampling classifier (fixes gradient art 4-18x larger than sharp's); palette-like images use libwebp at quality 100, noisy gradients escalate to method 0, escalation is capped at 8 MP for non-palette content, photographs keep the fast path.
+- `nearLossless` no longer degrades when `quality` is low.
+- Bundled libwebp updated from 1.3.1 to 1.6.0 (includes the fix for CVE-2023-4863).
+
+### Operations
+
+- `blur()` matches libvips `gaussblur` bit for bit (integer precision, `minAmplitude`, premultiplied RGBA); `precision: 'float'` is within one level on about 0.05% of pixels. `blur()` / `blur(true)` is sharp's 3x3 mild blur. `sharpen()` is sharp's 3x3 convolution (bit-exact); `sharpen({ sigma, m1, m2, x1, y2, y3 })` runs libvips' LAB-lightness unsharp mask (within one grey level).
+- `rotate(angle)` and `affine()` blend border pixels into `background` by coverage like libvips, interpolate images with alpha premultiplied, and match sharp to within one level; `affine({ interpolator: 'bicubic' | 'nearest' })` is honoured.
+- Resize kernels `lanczos2`, `mks2013` and `mks2021` use their own filters instead of Lanczos3.
+- `dilate()`/`erode()` keep metadata and grey images.
+
+### Performance
+
+- Gaussian blur 2-8x faster; `sharpen()`, mild `blur()`, `convolve`, `dilate`/`erode`, `trim` (parallel), `composite` (parallel, table-driven), `extend`, arbitrary-angle `rotate`/`affine`, `bandbool` faster with byte-identical output; LAB `sharpen({sigma})` about 2.5x faster with identical output.
+- Single-thread `photo png 2000 -> png`: about 520 ms to about 76 ms (sharp about 223 ms).
+- On glibc Linux the addon pins glibc's mmap threshold at 4 MiB (`FASTPKG_MALLOC_TUNING=0` disables), cutting steady-state RSS about 30-45% on 1024^2 RGBA workloads at about +10% CPU on 4 MiB-frame pipelines; musl, macOS and Windows are unchanged.
+
+### Packaging and typings
+
+- `require('@fastpkg/image/package.json')` works.
+- TypeScript declarations mirror sharp's (`sharp.Metadata`, `sharp.OutputInfo`, `sharp.Sharp`, `sharp.ResizeOptions`, ... ) for `import`, `require` and `import x = require()` under node16, nodenext and bundler resolution. `npm run test:types` compiles the same sources against fastpkg and sharp. `index.d.cts` and `THIRD_PARTY_NOTICES.md` ship in the package.
+- `bench/mem.mjs` (memory harness) added.
+
+### Known limits
+
+- Options accepted but without effect: JPEG `trellisQuantisation`/`quantisationTable`/`overshootDeringing`; WebP `smartDeblock`/`minSize`/`mixed`; GIF `colours`/`dither`/`reuse`/frame-error options; AVIF `lossless`/`bitdepth`/`tune`.
+- Single-thread PNG encode of flat art and screenshots at levels 1-6 is 1.1-2x slower than sharp (files within 0.3% of sharp's size); with the default thread pool most cases are faster.
+
 ## 0.2.0
 
 ### Fixes

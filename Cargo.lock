@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "fastpkg-codecs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "avif-decode",
  "base64 0.22.1",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "fastpkg-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "imagesize",
  "rayon",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "fastpkg-meta"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fastpkg-core",
  "flate2",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "fastpkg-napi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fastpkg-codecs",
  "fastpkg-core",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "fastpkg-ops"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "fast_image_resize",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "fastpkg-stream"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "fastpkg-codecs",

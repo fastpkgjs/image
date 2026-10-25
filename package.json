@@ -1,6 +1,6 @@
 {
   "name": "@fastpkg/image",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Fast Rust image processing for Node.js, sharp-compatible, no libvips",
   "license": "MIT",
   "repository": {
