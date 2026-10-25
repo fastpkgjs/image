@@ -3,9 +3,9 @@
 
 use std::sync::OnceLock;
 
-const ENCODE_STEPS: usize = 8192;
+pub(crate) const ENCODE_STEPS: usize = 8192;
 
-fn decode_lut() -> &'static [f32; 256] {
+pub(crate) fn decode_lut() -> &'static [f32; 256] {
     static LUT: OnceLock<[f32; 256]> = OnceLock::new();
     LUT.get_or_init(|| {
         let mut lut = [0f32; 256];
@@ -16,7 +16,7 @@ fn decode_lut() -> &'static [f32; 256] {
     })
 }
 
-fn encode_lut() -> &'static [f32] {
+pub(crate) fn encode_lut() -> &'static [f32] {
     static LUT: OnceLock<Vec<f32>> = OnceLock::new();
     LUT.get_or_init(|| {
         (0..=ENCODE_STEPS)
@@ -79,15 +79,15 @@ pub fn bw_rgba_run(run: &mut [u8]) {
     }
 }
 
-const RGB2XYZ: [[f64; 3]; 3] = [
+pub(crate) const RGB2XYZ: [[f64; 3]; 3] = [
     [0.4124, 0.3576, 0.1805],
     [0.2126, 0.7152, 0.0722],
     [0.0193, 0.1192, 0.9505],
 ];
-const WHITE: [f64; 3] = [95.047, 100.0, 108.883];
-const EPS: f64 = 0.008856;
+pub(crate) const WHITE: [f64; 3] = [95.047, 100.0, 108.883];
+pub(crate) const EPS: f64 = 0.008856;
 
-fn xyz2rgb() -> &'static [[f64; 3]; 3] {
+pub(crate) fn xyz2rgb() -> &'static [[f64; 3]; 3] {
     static M: OnceLock<[[f64; 3]; 3]> = OnceLock::new();
     M.get_or_init(|| {
         let m = RGB2XYZ;
