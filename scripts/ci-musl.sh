@@ -24,6 +24,10 @@ if [ "$mode" = build ]; then
   # rust-toolchain.toml pins the toolchain; this installs it for the musl host.
   rustup show active-toolchain >/dev/null 2>&1 || rustup toolchain install --profile minimal
   npm ci
+  # Native build on Alpine: use the container's gcc as the linker. Without this the napi CLI
+  # treats the musl target as a cross build and asks for `<arch>-linux-musl-gcc`.
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=gcc
+  export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=gcc
   RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-Bsymbolic" \
     npx napi build --platform --release --target "$target" --no-js \
       --dts native.d.ts --manifest-path crates/fastpkg-napi/Cargo.toml \
