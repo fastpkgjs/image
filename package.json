@@ -10,18 +10,25 @@
   "type": "module",
   "main": "./packages/image/index.cjs",
   "module": "./packages/image/index.js",
-  "types": "./packages/image/index.d.ts",
+  "types": "./packages/image/index.d.cts",
   "exports": {
     ".": {
-      "types": "./packages/image/index.d.ts",
-      "import": "./packages/image/index.js",
-      "require": "./packages/image/index.cjs"
-    }
+      "import": {
+        "types": "./packages/image/index.d.ts",
+        "default": "./packages/image/index.js"
+      },
+      "require": {
+        "types": "./packages/image/index.d.cts",
+        "default": "./packages/image/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "packages/image/index.js",
     "packages/image/index.cjs",
     "packages/image/index.d.ts",
+    "packages/image/index.d.cts",
     "packages/image/lib.cjs",
     "packages/image/image.*.node",
     "README.md",
@@ -35,7 +42,8 @@
     "fixtures": "node scripts/fixtures.mjs",
     "test": "node scripts/test.mjs",
     "bench": "node bench/run.mjs",
-    "bench:sharp": "node bench/sharp.mjs"
+    "bench:sharp": "node bench/sharp.mjs",
+    "test:types": "node tests/types/run.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.10.8",

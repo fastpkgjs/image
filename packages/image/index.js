@@ -27,3 +27,5 @@ export const Gradient = image.Gradient;
 export const gradient = image.gradient;
 export const linearGradient = image.linearGradient;
 export const radialGradient = image.radialGradient;
+export const block = image.block;
+export const unblock = image.unblock;

@@ -40,6 +40,8 @@ jobs:
           sudo apt-get install -y nasm
       - run: npm ci
       - run: node scripts/check-version.mjs
+      - name: Typings (tsc matrix, @fastpkg/image vs sharp)
+        run: npm run test:types
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace

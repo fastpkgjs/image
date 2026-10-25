@@ -11,3 +11,4 @@ tools/nasm-*/
 dist/
 artifacts/
 bench/.cache/
+tests/types/.work/
