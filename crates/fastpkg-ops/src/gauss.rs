@@ -312,7 +312,9 @@ fn blur_fixed(
 
     // Vertical pass in blocks of rows and strips of columns: the rows a strip needs are widened
     // to f32 once into a small scratch (L2-resident) and every output row of the block reads them.
-    let block_rows = (height / (rayon::current_num_threads() * 4)).clamp(32, 256).max(4 * radius);
+    let block_rows = (height / (rayon::current_num_threads() * 4))
+        .clamp(32, 256)
+        .max(4 * radius);
     let mut out = vec![0u8; data.len()];
     out.par_chunks_mut(block_rows * row_len)
         .enumerate()

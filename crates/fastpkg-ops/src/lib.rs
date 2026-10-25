@@ -791,18 +791,21 @@ fn extend(
     let fill = [color.r, color.g, color.b, color.alpha];
     let src_stride = image.width as usize * 4;
     let (x, y) = (x as usize, y as usize);
+    let row_bytes = width as usize * 4;
     if matches!(extend_with, ExtendWith::Background) {
-        data.par_chunks_exact_mut(width as usize * 4)
+        let template: Vec<u8> = fill.iter().copied().cycle().take(row_bytes).collect();
+        data.par_chunks_exact_mut(row_bytes)
             .enumerate()
             .for_each(|(row_index, row)| {
-                let inside = row_index >= y && row_index < y + image.height as usize;
-                for px in row.chunks_exact_mut(4) {
-                    px.copy_from_slice(&fill);
-                }
-                if inside {
+                if row_index >= y && row_index < y + image.height as usize {
+                    // Only the borders need the background; the middle is the source row.
                     let src = (row_index - y) * src_stride;
+                    row[..x * 4].copy_from_slice(&template[..x * 4]);
                     row[x * 4..x * 4 + src_stride]
                         .copy_from_slice(&image.data[src..src + src_stride]);
+                    row[x * 4 + src_stride..].copy_from_slice(&template[x * 4 + src_stride..]);
+                } else {
+                    row.copy_from_slice(&template);
                 }
             });
     } else {
@@ -816,12 +819,22 @@ fn extend(
         let columns = (0..width as i64)
             .map(|col| map(col - x as i64, image.width))
             .collect::<Vec<_>>();
-        data.par_chunks_exact_mut(width as usize * 4)
+        data.par_chunks_exact_mut(row_bytes)
             .enumerate()
             .for_each(|(row_index, row)| {
                 let sy = map(row_index as i64 - y as i64, image.height);
                 let src_row = &image.data[sy * src_stride..(sy + 1) * src_stride];
-                for (px, &sx) in row.chunks_exact_mut(4).zip(&columns) {
+                // The pixels over the source itself are a straight copy of the row.
+                row[x * 4..x * 4 + src_stride].copy_from_slice(src_row);
+                let (left, rest) = row.split_at_mut(x * 4);
+                let right = &mut rest[src_stride..];
+                for (px, &sx) in left.chunks_exact_mut(4).zip(&columns[..x]) {
+                    px.copy_from_slice(&src_row[sx * 4..sx * 4 + 4]);
+                }
+                for (px, &sx) in right
+                    .chunks_exact_mut(4)
+                    .zip(&columns[x + image.width as usize..])
+                {
                     px.copy_from_slice(&src_row[sx * 4..sx * 4 + 4]);
                 }
             });
@@ -1146,16 +1159,34 @@ fn sample_bilinear_wide(
     out
 }
 
+/// `alpha / 255.0` in `f32` for every alpha value.
+const ALPHA_FACTOR: [f32; 256] = {
+    let mut table = [0.0; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = i as f32 / 255.0;
+        i += 1;
+    }
+    table
+};
+
 /// Premultiplied float colour as libvips computes it: `colour * (alpha / 255)` in `f32`.
-#[inline]
+#[inline(always)]
 fn premultiplied(color: Color) -> [f32; 4] {
-    let factor = color.alpha as f32 / 255.0;
+    let factor = ALPHA_FACTOR[color.alpha as usize];
     [
         color.r as f32 * factor,
         color.g as f32 * factor,
         color.b as f32 * factor,
         color.alpha as f32,
     ]
+}
+
+/// `x.floor() as i64` without the libm call (valid for |x| < 2^62).
+#[inline(always)]
+fn floor_i64(x: f64) -> i64 {
+    let truncated = x as i64;
+    truncated - i64::from((truncated as f64) > x)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1205,81 +1236,65 @@ fn sample_pixel(
         if px < 0 || py < 0 || px >= w || py >= h {
             return background;
         }
-        let color = image.get(px as u32, py as u32);
+        let idx = (py as usize * w as usize + px as usize) * 4;
+        let color = &image.data[idx..idx + 4];
         if with_alpha {
-            premultiplied(color)
+            premultiplied(Color {
+                r: color[0],
+                g: color[1],
+                b: color[2],
+                alpha: color[3],
+            })
         } else {
             [
-                color.r as f32,
-                color.g as f32,
-                color.b as f32,
-                color.alpha as f32,
+                color[0] as f32,
+                color[1] as f32,
+                color[2] as f32,
+                color[3] as f32,
             ]
         }
     };
-    let (wx, wy, first): ([f64; 4], [f64; 4], i64);
-    let (x0, y0);
-    let taps;
-    match interpolator {
-        Interpolator::Nearest => {
-            x0 = x.floor() as i64;
-            y0 = y.floor() as i64;
-            wx = [1.0, 0.0, 0.0, 0.0];
-            wy = wx;
-            first = 0;
-            taps = 1;
-        }
-        Interpolator::Bilinear => {
-            let (fx, fy) = (x.floor(), y.floor());
-            x0 = fx as i64;
-            y0 = fy as i64;
-            wx = [1.0 - (x - fx), x - fx, 0.0, 0.0];
-            wy = [1.0 - (y - fy), y - fy, 0.0, 0.0];
-            first = 0;
-            taps = 2;
-        }
-        Interpolator::Bicubic => {
-            let (fx, fy) = (x.floor(), y.floor());
-            x0 = fx as i64;
-            y0 = fy as i64;
-            wx = catmull_rom(x - fx);
-            wy = catmull_rom(y - fy);
-            first = -1;
-            taps = 4;
-        }
-    }
-    let far = 3 as f64;
+    let far = 3.0;
     let blended = if x < -far || y < -far || x > w as f64 + far || y > h as f64 + far {
         background
-    } else if interpolator == Interpolator::Bilinear {
-        // Same arithmetic as the generic loop below, spelled out as two lerps.
-        let c00 = tap(x0, y0);
-        let c10 = tap(x0 + 1, y0);
-        let c01 = tap(x0, y0 + 1);
-        let c11 = tap(x0 + 1, y0 + 1);
-        let (fx, fy) = (wx[1], wy[1]);
-        let mut out = [0f32; 4];
-        for c in 0..4 {
-            let top = c00[c] as f64 + (c10[c] as f64 - c00[c] as f64) * fx;
-            let bottom = c01[c] as f64 + (c11[c] as f64 - c01[c] as f64) * fx;
-            out[c] = (top + (bottom - top) * fy) as f32;
-        }
-        out
     } else {
-        let mut acc = [0f64; 4];
-        for j in 0..taps {
-            let mut row = [0f64; 4];
-            for i in 0..taps {
-                let value = tap(x0 + first + i as i64, y0 + first + j as i64);
+        match interpolator {
+            Interpolator::Nearest => tap(floor_i64(x), floor_i64(y)),
+            Interpolator::Bilinear => {
+                let (x0, y0) = (floor_i64(x), floor_i64(y));
+                let (fx, fy) = (x - x0 as f64, y - y0 as f64);
+                let c00 = tap(x0, y0);
+                let c10 = tap(x0 + 1, y0);
+                let c01 = tap(x0, y0 + 1);
+                let c11 = tap(x0 + 1, y0 + 1);
+                let mut out = [0f32; 4];
                 for c in 0..4 {
-                    row[c] += value[c] as f64 * wx[i];
+                    let top = c00[c] as f64 + (c10[c] as f64 - c00[c] as f64) * fx;
+                    let bottom = c01[c] as f64 + (c11[c] as f64 - c01[c] as f64) * fx;
+                    out[c] = (top + (bottom - top) * fy) as f32;
                 }
+                out
             }
-            for c in 0..4 {
-                acc[c] += row[c] * wy[j];
+            Interpolator::Bicubic => {
+                let (x0, y0) = (floor_i64(x), floor_i64(y));
+                let wx = catmull_rom(x - x0 as f64);
+                let wy = catmull_rom(y - y0 as f64);
+                let mut acc = [0f64; 4];
+                for (j, &weight_y) in wy.iter().enumerate() {
+                    let mut row = [0f64; 4];
+                    for (i, &weight_x) in wx.iter().enumerate() {
+                        let value = tap(x0 - 1 + i as i64, y0 - 1 + j as i64);
+                        for c in 0..4 {
+                            row[c] += value[c] as f64 * weight_x;
+                        }
+                    }
+                    for c in 0..4 {
+                        acc[c] += row[c] * weight_y;
+                    }
+                }
+                acc.map(|v| v as f32)
             }
         }
-        acc.map(|v| v as f32)
     };
     if with_alpha {
         let alpha = blended[3];
@@ -1291,8 +1306,16 @@ fn sample_pixel(
             alpha.clamp(0.0, 255.0) as u8,
         ]
     } else {
-        blended.map(|v| v.clamp(0.0, 255.0).round() as u8)
+        blended.map(|v| round_f32_u8(v))
     }
+}
+
+/// `v.clamp(0.0, 255.0).round() as u8` without the libm `round` call.
+#[inline(always)]
+fn round_f32_u8(v: f32) -> u8 {
+    let v = v.clamp(0.0, 255.0);
+    let whole = v as u32;
+    (whole + u32::from(v - whole as f32 >= 0.5)) as u8
 }
 
 fn auto_orient(image: Image) -> Result<Image> {
@@ -3185,42 +3208,103 @@ fn composite(
         Align::End => out.height as i32 - overlay.height as i32,
     });
     if global {
-        let (ow, oh) = (overlay.width as i32, overlay.height as i32);
-        for dy in 0..out.height as i32 {
-            for dx in 0..out.width as i32 {
-                let (sx, sy) = (dx - x, dy - y);
-                let s = if sx >= 0 && sy >= 0 && sx < ow && sy < oh {
-                    overlay.get(sx as u32, sy as u32)
-                } else {
-                    Color::TRANSPARENT
-                };
-                let d = out.get(dx as u32, dy as u32);
-                out.set(
-                    dx as u32,
-                    dy as u32,
-                    blend_pixel(d, s, blend, premultiplied),
-                );
-            }
-        }
+        let (ow, oh) = (overlay.width as i64, overlay.height as i64);
+        let (x, y) = (x as i64, y as i64);
+        let width = out.width as usize;
+        out.data
+            .par_chunks_exact_mut(width * 4)
+            .enumerate()
+            .for_each(|(dy, row)| {
+                let sy = dy as i64 - y;
+                for (dx, d) in row.chunks_exact_mut(4).enumerate() {
+                    let sx = dx as i64 - x;
+                    let s = if sx >= 0 && sy >= 0 && sx < ow && sy < oh {
+                        overlay.get(sx as u32, sy as u32)
+                    } else {
+                        Color::TRANSPARENT
+                    };
+                    let d_color = Color {
+                        r: d[0],
+                        g: d[1],
+                        b: d[2],
+                        alpha: d[3],
+                    };
+                    let c = blend_pixel(d_color, s, blend, premultiplied);
+                    d.copy_from_slice(&[c.r, c.g, c.b, c.alpha]);
+                }
+            });
         return Ok(out);
     }
     blend_at(&mut out, &overlay, x, y, blend, premultiplied);
     Ok(out)
 }
 
+/// `c / 255.0` for every 8-bit value (the table holds exactly what the division yields).
+const UNIT: [f64; 256] = {
+    let mut table = [0.0; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = i as f64 / 255.0;
+        i += 1;
+    }
+    table
+};
+
+/// Exactly `value.clamp(0.0, 255.0).round() as u8` (ties away from zero) without the libm
+/// `round` call, which does not inline on baseline x86-64.
+#[inline(always)]
+fn round_u8_f64(value: f64) -> u8 {
+    let value = value.clamp(0.0, 255.0);
+    let whole = value as u32;
+    (whole + u32::from(value - whole as f64 >= 0.5)) as u8
+}
+
 fn blend_at(dst: &mut Image, src: &Image, ox: i32, oy: i32, blend: Blend, premult: bool) {
-    for sy in 0..src.height {
-        for sx in 0..src.width {
-            let dx = ox + sx as i32;
-            let dy = oy + sy as i32;
-            if dx < 0 || dy < 0 || dx >= dst.width as i32 || dy >= dst.height as i32 {
-                continue;
-            }
-            let s = src.get(sx, sy);
-            let d = dst.get(dx as u32, dy as u32);
-            let color = blend_pixel(d, s, blend, premult);
-            dst.set(dx as u32, dy as u32, color);
+    let (dw, dh) = (dst.width as i64, dst.height as i64);
+    let (sw, sh) = (src.width as i64, src.height as i64);
+    let (ox, oy) = (ox as i64, oy as i64);
+    let (x0, x1) = (ox.max(0), (ox + sw).min(dw));
+    let (y0, y1) = (oy.max(0), (oy + sh).min(dh));
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let row_bytes = dw as usize * 4;
+    let rows = &mut dst.data[y0 as usize * row_bytes..y1 as usize * row_bytes];
+    let work = |(row_index, dst_row): (usize, &mut [u8])| {
+        let sy = (y0 + row_index as i64 - oy) as usize;
+        let src_row = &src.data[sy * sw as usize * 4..(sy + 1) * sw as usize * 4];
+        let from = (x0 - ox) as usize * 4;
+        let to = (x1 - ox) as usize * 4;
+        let target = &mut dst_row[x0 as usize * 4..x1 as usize * 4];
+        for (d, s) in target
+            .chunks_exact_mut(4)
+            .zip(src_row[from..to].chunks_exact(4))
+        {
+            let color = blend_pixel(
+                Color {
+                    r: d[0],
+                    g: d[1],
+                    b: d[2],
+                    alpha: d[3],
+                },
+                Color {
+                    r: s[0],
+                    g: s[1],
+                    b: s[2],
+                    alpha: s[3],
+                },
+                blend,
+                premult,
+            );
+            d.copy_from_slice(&[color.r, color.g, color.b, color.alpha]);
         }
+    };
+    if (x1 - x0) * (y1 - y0) >= 16_384 {
+        rows.par_chunks_exact_mut(row_bytes)
+            .enumerate()
+            .for_each(work);
+    } else {
+        rows.chunks_exact_mut(row_bytes).enumerate().for_each(work);
     }
 }
 
@@ -3241,75 +3325,172 @@ fn blend_pixel(d: Color, s: Color, blend: Blend, src_premultiplied: bool) -> Col
         return d;
     }
 
-    let sa = s.alpha as f64 / 255.0;
-    let da = d.alpha as f64 / 255.0;
+    if blend == Blend::Over {
+        // The general arithmetic reduces exactly to these results (see the test
+        // `over_fast_paths_match_general_blend`).
+        if s.alpha == 255 {
+            return s;
+        }
+        if s.alpha == 0 && !src_premultiplied {
+            return if d.alpha == 0 { Color::TRANSPARENT } else { d };
+        }
+    }
+    if blend == Blend::Over {
+        return blend_over(d, s, src_premultiplied);
+    }
+    blend_general(d, s, blend, src_premultiplied)
+}
+
+/// `Blend::Over` with the same floating-point operations, in the same order, as the
+/// `fa = 1, fb = 1 - sa` case of [`blend_general`].
+#[inline]
+fn blend_over(d: Color, s: Color, src_premultiplied: bool) -> Color {
+    let sa = UNIT[s.alpha as usize];
+    let da = UNIT[d.alpha as usize];
+    let dfb = da * (1.0 - sa);
+    let out_a = sa + dfb;
+    if out_a <= 0.0 {
+        return Color::TRANSPARENT;
+    }
+    let channel = |s: u8, d: u8| -> u8 {
+        let sp = if src_premultiplied {
+            UNIT[s as usize]
+        } else {
+            UNIT[s as usize] * sa
+        };
+        round_u8_f64((sp + dfb * UNIT[d as usize]) / out_a * 255.0)
+    };
+    Color {
+        r: channel(s.r, d.r),
+        g: channel(s.g, d.g),
+        b: channel(s.b, d.b),
+        alpha: round_u8_f64(out_a * 255.0),
+    }
+}
+
+/// Separable blend function `B(cb, cs)` on non-premultiplied backdrop/source values.
+#[inline(always)]
+fn separable(mode: Blend, cb: f64, cs: f64) -> f64 {
+    match mode {
+        Blend::Multiply => cb * cs,
+        Blend::Screen => cb + cs - cb * cs,
+        Blend::Overlay => {
+            if cb <= 0.5 {
+                2.0 * cb * cs
+            } else {
+                1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
+            }
+        }
+        Blend::Darken => cb.min(cs),
+        Blend::Lighten => cb.max(cs),
+        Blend::Difference => (cb - cs).abs(),
+        Blend::Exclusion => cb + cs - 2.0 * cb * cs,
+        Blend::HardLight => {
+            if cs <= 0.5 {
+                2.0 * cb * cs
+            } else {
+                1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
+            }
+        }
+        Blend::SoftLight => {
+            let d = if cb <= 0.25 {
+                ((16.0 * cb - 12.0) * cb + 4.0) * cb
+            } else {
+                cb.sqrt()
+            };
+            if cs <= 0.5 {
+                cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
+            } else {
+                cb + (2.0 * cs - 1.0) * (d - cb)
+            }
+        }
+        Blend::ColourDodge | Blend::ColorDodge => {
+            if cs >= 1.0 {
+                1.0
+            } else if cb <= 0.0 {
+                0.0
+            } else {
+                (cb / (1.0 - cs)).min(1.0)
+            }
+        }
+        Blend::ColourBurn | Blend::ColorBurn => {
+            if cs <= 0.0 {
+                0.0
+            } else if cb >= 1.0 {
+                1.0
+            } else {
+                1.0 - ((1.0 - cb) / cs).min(1.0)
+            }
+        }
+        _ => cs,
+    }
+}
+
+/// The separable family of `composite` blend modes, monomorphised per mode by the caller.
+#[inline(always)]
+fn blend_separable(
+    d: Color,
+    s: Color,
+    src_premultiplied: bool,
+    sep: impl Fn(f64, f64) -> f64,
+) -> Color {
+    let sa = UNIT[s.alpha as usize];
+    let da = UNIT[d.alpha as usize];
+    let out_a = sa + da - sa * da;
+    if out_a <= 0.0 {
+        return Color::TRANSPARENT;
+    }
+    let channel = |s: u8, d: u8| -> u8 {
+        let a = if src_premultiplied {
+            UNIT[s as usize]
+        } else {
+            UNIT[s as usize] * sa
+        };
+        let b = da * UNIT[d as usize];
+        let premult = (1.0 - da) * a + (1.0 - sa) * b + sa * da * sep(b, a);
+        round_u8_f64(premult / out_a * 255.0)
+    };
+    Color {
+        r: channel(s.r, d.r),
+        g: channel(s.g, d.g),
+        b: channel(s.b, d.b),
+        alpha: round_u8_f64(out_a * 255.0),
+    }
+}
+
+fn blend_general(d: Color, s: Color, blend: Blend, src_premultiplied: bool) -> Color {
+    macro_rules! separable_arm {
+        ($mode:expr) => {
+            return blend_separable(d, s, src_premultiplied, |cb, cs| separable($mode, cb, cs))
+        };
+    }
+    match blend {
+        Blend::Multiply => separable_arm!(Blend::Multiply),
+        Blend::Screen => separable_arm!(Blend::Screen),
+        Blend::Overlay => separable_arm!(Blend::Overlay),
+        Blend::Darken => separable_arm!(Blend::Darken),
+        Blend::Lighten => separable_arm!(Blend::Lighten),
+        Blend::Difference => separable_arm!(Blend::Difference),
+        Blend::Exclusion => separable_arm!(Blend::Exclusion),
+        Blend::HardLight => separable_arm!(Blend::HardLight),
+        Blend::SoftLight => separable_arm!(Blend::SoftLight),
+        Blend::ColourDodge | Blend::ColorDodge => separable_arm!(Blend::ColourDodge),
+        Blend::ColourBurn | Blend::ColorBurn => separable_arm!(Blend::ColourBurn),
+        _ => {}
+    }
+    let sa = UNIT[s.alpha as usize];
+    let da = UNIT[d.alpha as usize];
     // Premultiplied overlay colour (`A'`): with `premultiplied: true` the stored values are
     // used as-is, even where they exceed the alpha (libvips does not clamp them).
     let sp = [s.r, s.g, s.b].map(|c| {
-        let c = c as f64 / 255.0;
+        let c = UNIT[c as usize];
         if src_premultiplied {
             c
         } else {
             c * sa
         }
     });
-    let dst = [d.r as f64 / 255.0, d.g as f64 / 255.0, d.b as f64 / 255.0];
-
-    let separable = |mode: Blend, cb: f64, cs: f64| -> f64 {
-        match mode {
-            Blend::Multiply => cb * cs,
-            Blend::Screen => cb + cs - cb * cs,
-            Blend::Overlay => {
-                if cb <= 0.5 {
-                    2.0 * cb * cs
-                } else {
-                    1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
-                }
-            }
-            Blend::Darken => cb.min(cs),
-            Blend::Lighten => cb.max(cs),
-            Blend::Difference => (cb - cs).abs(),
-            Blend::Exclusion => cb + cs - 2.0 * cb * cs,
-            Blend::HardLight => {
-                if cs <= 0.5 {
-                    2.0 * cb * cs
-                } else {
-                    1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
-                }
-            }
-            Blend::SoftLight => {
-                let d = if cb <= 0.25 {
-                    ((16.0 * cb - 12.0) * cb + 4.0) * cb
-                } else {
-                    cb.sqrt()
-                };
-                if cs <= 0.5 {
-                    cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
-                } else {
-                    cb + (2.0 * cs - 1.0) * (d - cb)
-                }
-            }
-            Blend::ColourDodge | Blend::ColorDodge => {
-                if cs >= 1.0 {
-                    1.0
-                } else if cb <= 0.0 {
-                    0.0
-                } else {
-                    (cb / (1.0 - cs)).min(1.0)
-                }
-            }
-            Blend::ColourBurn | Blend::ColorBurn => {
-                if cs <= 0.0 {
-                    0.0
-                } else if cb >= 1.0 {
-                    1.0
-                } else {
-                    1.0 - ((1.0 - cb) / cs).min(1.0)
-                }
-            }
-            _ => cs,
-        }
-    };
+    let dst = [UNIT[d.r as usize], UNIT[d.g as usize], UNIT[d.b as usize]];
 
     // (output alpha, premultiplied output colour)
     let (out_a, premult): (f64, [f64; 3]) = match blend {
@@ -3355,14 +3536,14 @@ fn blend_pixel(d: Color, s: Color, blend: Blend, src_premultiplied: bool) -> Col
         if out_a <= 0.0 {
             return 0;
         }
-        (premult[index] / out_a * 255.0).clamp(0.0, 255.0).round() as u8
+        round_u8_f64(premult[index] / out_a * 255.0)
     };
 
     Color {
         r: channel(0),
         g: channel(1),
         b: channel(2),
-        alpha: (out_a * 255.0).round() as u8,
+        alpha: round_u8_f64(out_a * 255.0),
     }
 }
 
@@ -3692,5 +3873,325 @@ pub fn apply_output_colourspace(image: &mut Image, space: &str) -> Result<()> {
         other => Err(FastpkgError::UnsupportedOutput(format!(
             "colourspace {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lcg(state: &mut u64) -> u8 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 33) as u8
+    }
+
+    #[test]
+    fn over_fast_paths_match_general_blend() {
+        let mut state = 7u64;
+        for premultiplied in [false, true] {
+            for sa in [0u8, 255] {
+                for da in 0..=255u8 {
+                    for _ in 0..4000 {
+                        let d = Color {
+                            r: lcg(&mut state),
+                            g: lcg(&mut state),
+                            b: lcg(&mut state),
+                            alpha: da,
+                        };
+                        let s = Color {
+                            r: lcg(&mut state),
+                            g: lcg(&mut state),
+                            b: lcg(&mut state),
+                            alpha: sa,
+                        };
+                        assert_eq!(
+                            blend_pixel(d, s, Blend::Over, premultiplied),
+                            blend_general(d, s, Blend::Over, premultiplied),
+                            "{d:?} {s:?} premultiplied {premultiplied}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blend_over_matches_general() {
+        let mut state = 31u64;
+        for premultiplied in [false, true] {
+            for _ in 0..3_000_000 {
+                let d = Color {
+                    r: lcg(&mut state),
+                    g: lcg(&mut state),
+                    b: lcg(&mut state),
+                    alpha: lcg(&mut state),
+                };
+                let s = Color {
+                    r: lcg(&mut state),
+                    g: lcg(&mut state),
+                    b: lcg(&mut state),
+                    alpha: lcg(&mut state),
+                };
+                assert_eq!(
+                    blend_over(d, s, premultiplied),
+                    blend_general(d, s, Blend::Over, premultiplied),
+                    "{d:?} {s:?} premultiplied {premultiplied}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rounding_helpers_match_std() {
+        let mut state = 99u64;
+        for _ in 0..2_000_000 {
+            let value = (lcg(&mut state) as f64) * 1.0307 + (lcg(&mut state) as f64) / 256.0 - 7.0;
+            assert_eq!(round_u8_f64(value), value.clamp(0.0, 255.0).round() as u8);
+        }
+        for half in 0..=510 {
+            let value = half as f64 / 2.0;
+            assert_eq!(round_u8_f64(value), value.clamp(0.0, 255.0).round() as u8);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_blend() {
+        let mut state = 5u64;
+        let px: Vec<(Color, Color)> = (0..2_000_000)
+            .map(|_| {
+                (
+                    Color {
+                        r: lcg(&mut state),
+                        g: lcg(&mut state),
+                        b: lcg(&mut state),
+                        alpha: 100 + lcg(&mut state) % 100,
+                    },
+                    Color {
+                        r: lcg(&mut state),
+                        g: lcg(&mut state),
+                        b: lcg(&mut state),
+                        alpha: 100 + lcg(&mut state) % 100,
+                    },
+                )
+            })
+            .collect();
+        for blend in [
+            Blend::Over,
+            Blend::Multiply,
+            Blend::SoftLight,
+            Blend::Screen,
+        ] {
+            let t = std::time::Instant::now();
+            let mut acc = 0u32;
+            for &(d, s) in &px {
+                let c = blend_pixel(d, s, blend, false);
+                acc = acc.wrapping_add(c.r as u32 + c.g as u32 + c.b as u32 + c.alpha as u32);
+            }
+            println!(
+                "{blend:?}: {:.1} ns/px ({acc})",
+                t.elapsed().as_nanos() as f64 / px.len() as f64
+            );
+        }
+    }
+
+    /// The straightforward implementation (before the table lookups and monomorphised
+    /// separable modes), kept as the reference the optimised code must reproduce exactly.
+    fn reference_blend(d: Color, s: Color, blend: Blend, src_premultiplied: bool) -> Color {
+        if blend == Blend::Clear {
+            return Color::TRANSPARENT;
+        }
+        if blend == Blend::Source {
+            return s;
+        }
+        if blend == Blend::Dest {
+            return d;
+        }
+
+        let sa = s.alpha as f64 / 255.0;
+        let da = d.alpha as f64 / 255.0;
+        // Premultiplied overlay colour (`A'`): with `premultiplied: true` the stored values are
+        // used as-is, even where they exceed the alpha (libvips does not clamp them).
+        let sp = [s.r, s.g, s.b].map(|c| {
+            let c = c as f64 / 255.0;
+            if src_premultiplied {
+                c
+            } else {
+                c * sa
+            }
+        });
+        let dst = [d.r as f64 / 255.0, d.g as f64 / 255.0, d.b as f64 / 255.0];
+
+        let separable = |mode: Blend, cb: f64, cs: f64| -> f64 {
+            match mode {
+                Blend::Multiply => cb * cs,
+                Blend::Screen => cb + cs - cb * cs,
+                Blend::Overlay => {
+                    if cb <= 0.5 {
+                        2.0 * cb * cs
+                    } else {
+                        1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
+                    }
+                }
+                Blend::Darken => cb.min(cs),
+                Blend::Lighten => cb.max(cs),
+                Blend::Difference => (cb - cs).abs(),
+                Blend::Exclusion => cb + cs - 2.0 * cb * cs,
+                Blend::HardLight => {
+                    if cs <= 0.5 {
+                        2.0 * cb * cs
+                    } else {
+                        1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
+                    }
+                }
+                Blend::SoftLight => {
+                    let d = if cb <= 0.25 {
+                        ((16.0 * cb - 12.0) * cb + 4.0) * cb
+                    } else {
+                        cb.sqrt()
+                    };
+                    if cs <= 0.5 {
+                        cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
+                    } else {
+                        cb + (2.0 * cs - 1.0) * (d - cb)
+                    }
+                }
+                Blend::ColourDodge | Blend::ColorDodge => {
+                    if cs >= 1.0 {
+                        1.0
+                    } else if cb <= 0.0 {
+                        0.0
+                    } else {
+                        (cb / (1.0 - cs)).min(1.0)
+                    }
+                }
+                Blend::ColourBurn | Blend::ColorBurn => {
+                    if cs <= 0.0 {
+                        0.0
+                    } else if cb >= 1.0 {
+                        1.0
+                    } else {
+                        1.0 - ((1.0 - cb) / cs).min(1.0)
+                    }
+                }
+                _ => cs,
+            }
+        };
+
+        // (output alpha, premultiplied output colour)
+        let (out_a, premult): (f64, [f64; 3]) = match blend {
+            Blend::Atop => (da, [0, 1, 2].map(|i| sp[i] + (1.0 - sa) * da * dst[i])),
+            Blend::DestAtop => (sa, [0, 1, 2].map(|i| (1.0 - da) * sp[i] + da * dst[i])),
+            Blend::Add => ((sa + da).min(1.0), [0, 1, 2].map(|i| sp[i] + da * dst[i])),
+            Blend::Saturate => (
+                (sa + da).min(1.0),
+                [0, 1, 2].map(|i| sa.min(1.0 - da) * sp[i] + da * dst[i]),
+            ),
+            Blend::Over
+            | Blend::In
+            | Blend::Out
+            | Blend::DestOver
+            | Blend::DestIn
+            | Blend::DestOut
+            | Blend::Xor => {
+                let (fa, fb) = match blend {
+                    Blend::In => (da, 0.0),
+                    Blend::Out => (1.0 - da, 0.0),
+                    Blend::DestOver => (1.0 - da, 1.0),
+                    Blend::DestIn => (0.0, sa),
+                    Blend::DestOut => (0.0, 1.0 - sa),
+                    Blend::Xor => (1.0 - da, 1.0 - sa),
+                    _ => (1.0, 1.0 - sa),
+                };
+                (
+                    sa * fa + da * fb,
+                    [0, 1, 2].map(|i| fa * sp[i] + da * fb * dst[i]),
+                )
+            }
+            _ => (
+                sa + da - sa * da,
+                [0, 1, 2].map(|i| {
+                    let a = sp[i];
+                    let b = da * dst[i];
+                    (1.0 - da) * a + (1.0 - sa) * b + sa * da * separable(blend, b, a)
+                }),
+            ),
+        };
+
+        let channel = |index: usize| -> u8 {
+            if out_a <= 0.0 {
+                return 0;
+            }
+            (premult[index] / out_a * 255.0).clamp(0.0, 255.0).round() as u8
+        };
+
+        Color {
+            r: channel(0),
+            g: channel(1),
+            b: channel(2),
+            alpha: (out_a * 255.0).round() as u8,
+        }
+    }
+
+    #[test]
+    fn optimised_blends_match_reference() {
+        let blends = [
+            Blend::Clear,
+            Blend::Source,
+            Blend::Over,
+            Blend::In,
+            Blend::Out,
+            Blend::Atop,
+            Blend::Dest,
+            Blend::DestOver,
+            Blend::DestIn,
+            Blend::DestOut,
+            Blend::DestAtop,
+            Blend::Xor,
+            Blend::Add,
+            Blend::Saturate,
+            Blend::Multiply,
+            Blend::Screen,
+            Blend::Overlay,
+            Blend::Darken,
+            Blend::Lighten,
+            Blend::ColourDodge,
+            Blend::ColourBurn,
+            Blend::HardLight,
+            Blend::SoftLight,
+            Blend::Difference,
+            Blend::Exclusion,
+        ];
+        let mut state = 1234u64;
+        for blend in blends {
+            for premultiplied in [false, true] {
+                for round in 0..400_000 {
+                    // Mix fully random pixels with extreme alphas and colours.
+                    let pick = |state: &mut u64| match round % 7 {
+                        0 => [0u8, 255][(lcg(state) & 1) as usize],
+                        _ => lcg(state),
+                    };
+                    let d = Color {
+                        r: pick(&mut state),
+                        g: pick(&mut state),
+                        b: pick(&mut state),
+                        alpha: pick(&mut state),
+                    };
+                    let s = Color {
+                        r: pick(&mut state),
+                        g: pick(&mut state),
+                        b: pick(&mut state),
+                        alpha: pick(&mut state),
+                    };
+                    assert_eq!(
+                        blend_pixel(d, s, blend, premultiplied),
+                        reference_blend(d, s, blend, premultiplied),
+                        "{blend:?} {d:?} {s:?} premultiplied {premultiplied}"
+                    );
+                }
+            }
+        }
     }
 }
