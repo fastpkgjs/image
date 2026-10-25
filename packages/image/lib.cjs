@@ -950,7 +950,7 @@ function positionName(position) {
   return 'centre';
 }
 
-function mapOutputOptions(options = {}) {
+function mapOutputOptions(options = {}, format) {
   const out = {};
   const keys = [
     'quality',
@@ -999,6 +999,15 @@ function mapOutputOptions(options = {}) {
     out.progressive = true;
   }
   if (is.defined(options.effort)) out.effortSet = true;
+  if (is.defined(options.quality)) out.qualitySet = true;
+  if (format === 'png') {
+    // sharp: any of quality/effort/colours/dither switches palette output on unless `palette`
+    // is given explicitly.
+    if (!is.defined(options.palette) && [options.quality, options.effort, options.colours, options.colors, options.dither].some(is.defined)) {
+      out.palette = true;
+    }
+    if (is.bool(options.adaptiveFiltering)) out.adaptiveFiltering = options.adaptiveFiltering;
+  }
   if (is.defined(options.loop)) out.loopCount = options.loop;
   if (is.defined(options.delay)) out.delay = Array.isArray(options.delay) ? options.delay : [options.delay];
   return out;
@@ -2135,7 +2144,7 @@ class Sharp extends Duplex {
     const opts = is.object(options) && options !== null ? options : {};
     // force:false keeps the input format (the options only apply if it matches).
     if (opts.force !== false) this._spec.output.format = format;
-    Object.assign(this._spec.output, mapOutputOptions(opts));
+    Object.assign(this._spec.output, mapOutputOptions(opts, format));
     return this;
   }
 

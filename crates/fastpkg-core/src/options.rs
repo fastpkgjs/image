@@ -823,6 +823,14 @@ pub struct OutputOptions {
     pub colors: u16,
     #[serde(default = "default_dither")]
     pub dither: f64,
+    /// True when the caller passed `quality` explicitly (PNG palette quality defaults to 100,
+    /// not 80).
+    #[serde(default)]
+    pub quality_set: bool,
+    /// PNG `adaptiveFiltering`: `Some(true)` filters every row adaptively, `Some(false)` writes
+    /// unfiltered rows (libvips' default), `None` lets the encoder pick whichever is smaller.
+    #[serde(default)]
+    pub adaptive_filtering: Option<bool>,
     #[serde(default)]
     pub loop_count: Option<u32>,
     #[serde(default)]

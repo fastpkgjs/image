@@ -80,7 +80,7 @@ Operations run in sharp's fixed pipeline order, not call order (`packages/image/
 - `dominant()` convenience wrapper around `stats`
 - `joinChannel` alpha-mask helper
 - `tile({ layout: 'dz' | 'google' | 'zoomify' | 'iiif' | 'iiif3' })` pyramid output to a directory or zip archive
-- `png({ palette: true, colors, dither })` indexed PNG output
+- `png({ palette, quality, effort, colours, dither, compressionLevel, adaptiveFiltering, progressive })` PNG output; indexed output uses the built-in quantiser (see the README, "PNG output"). Bytes are stable within a release line but not libvips-identical.
 - `toStream()` readable convenience
 - `replaceColor`, `recolor`, `duotone`, `gradientMap`, `gradientRecolor`, `gradientFill`
 - `applyLut`, `curves`, `levels`, `whiteBalance`, `colourBalance`/`colorBalance`
