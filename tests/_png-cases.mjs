@@ -46,6 +46,21 @@ export function smooth(width, height, channels, noise = 3) {
   return { px, width, height, channels };
 }
 
+/** A random tile repeated across the image with a few exact-colour overlays: LZ77 territory
+ * (long matches, many colours), where neither adaptive filtering nor plain entropy coding helps. */
+export function tiled(width, height, channels) {
+  const px = Buffer.alloc(width * height * channels);
+  const r = rng(5);
+  const tile = Buffer.from(Array.from({ length: 37 * 23 * channels }, () => Math.floor(r() * 256)));
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const t = ((y % 23) * 37 + (x % 37)) * channels;
+      for (let c = 0; c < channels; c++) px[(y * width + x) * channels + c] = x > width * 0.7 && y > height * 0.6 ? 200 : tile[t + c];
+    }
+  }
+  return { px, width, height, channels };
+}
+
 export const images = {
   flatRgba: flat(160, 120, 4),
   flatRgb: flat(150, 90, 3),
@@ -55,6 +70,9 @@ export const images = {
   gray: smooth(100, 80, 1, 6),
   // Large enough that the filtered stream is deflated as several independent blocks.
   largeRgba: smooth(720, 640, 4, 20),
+  // Several independently deflated blocks each, through the run-length / LZ77 paths.
+  bigFlat: flat(1100, 700, 4),
+  tiled: tiled(900, 600, 4),
 };
 
 const make = (name) => {
@@ -73,6 +91,12 @@ cases.push(
   { id: 'largeRgba/default', name: 'largeRgba', options: {} },
   { id: 'largeRgba/level1', name: 'largeRgba', options: { compressionLevel: 1 } },
   { id: 'largeRgba/level9', name: 'largeRgba', options: { compressionLevel: 9 } },
+  { id: 'bigFlat/default', name: 'bigFlat', options: {} },
+  { id: 'bigFlat/level1', name: 'bigFlat', options: { compressionLevel: 1 } },
+  { id: 'tiled/default', name: 'tiled', options: {} },
+  { id: 'tiled/level1', name: 'tiled', options: { compressionLevel: 1 } },
+  { id: 'tiled/level3', name: 'tiled', options: { compressionLevel: 3 } },
+  { id: 'tiled/level9', name: 'tiled', options: { compressionLevel: 9 } },
   { id: 'gradientRgb/adaptiveFiltering=false', name: 'gradientRgb', options: { adaptiveFiltering: false } },
   { id: 'flatRgb/adaptiveFiltering=true', name: 'flatRgb', options: { adaptiveFiltering: true } },
   { id: 'noisyRgb/progressive', name: 'noisyRgb', options: { progressive: true } },

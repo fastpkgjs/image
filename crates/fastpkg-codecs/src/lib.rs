@@ -17,6 +17,7 @@ use image::{Delay, DynamicImage, ExtendedColorType, Frame, ImageDecoder, ImageEn
 
 pub mod header;
 pub mod png_enc;
+pub mod png_huff;
 pub mod png_quant;
 pub mod svg;
 mod webp;
