@@ -1,9 +1,10 @@
+import { fileURLToPath } from 'node:url';
 // Lossy / near-lossless WebP is encoded by libwebp (libwebp-sys). sharp is the oracle.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { sharp, engine, diffStats } from './_util.mjs';
 
-const photoPath = new URL('../fixtures/photo.jpg', import.meta.url).pathname;
+const photoPath = fileURLToPath(new URL('../fixtures/photo.jpg', import.meta.url));
 
 async function rgbaSource() {
   const w = 240;

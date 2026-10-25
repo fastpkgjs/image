@@ -812,11 +812,12 @@ group('tiff output is rejected with a clear error', [{ name: 'tiff()' }, { name:
   // Unknown extensions: sharp silently keeps the input format (PNG here); the engine must not throw.
   const fallback = ['bmp', 'txt', 'fits', 'xyz'];
   const cases = [...same.map((ext) => ({ name: ext, ext })), ...fallback.map((ext) => ({ name: `${ext} (unknown: falls back to input format)`, ext }))];
+  let extCounter = 0; // unique names: 'png' and 'PNG' are the same file on case-insensitive filesystems
   group('toFile: output format from extension', cases, async (c) => {
     const src = await make('png', 24, 16);
     const out = {};
     for (const [label, lib] of [['sharp', sharp], ['engine', engine]]) {
-      const file = path.join(tmp, `${label}-ext.${c.ext}`);
+      const file = path.join(tmp, `${label}-${extCounter++}-ext.${c.ext}`);
       try {
         const info = await lib(src).toFile(file);
         const buf = fs.readFileSync(file);

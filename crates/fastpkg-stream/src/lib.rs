@@ -262,13 +262,20 @@ pub fn write_file(path: &str, result: &RunResult) -> Result<()> {
     let path = Path::new(path);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
+    // Unique per write so concurrent writes to one destination (or to paths that differ only in
+    // case on case-insensitive filesystems) never share a temporary file.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("img")
+        "{}.{}-{unique}.tmp",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("img"),
+        std::process::id()
     ));
-    std::fs::write(&temp, &result.data)?;
-    std::fs::rename(&temp, path)?;
-    Ok(())
+    let written = std::fs::write(&temp, &result.data).and_then(|()| std::fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    Ok(written?)
 }
 
 fn check_deadline(deadline: Option<Instant>) -> Result<()> {

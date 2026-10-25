@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 // Focused regression tests for the "fixes B" batch: API validation parity, libvips-exact
 // filters, composite semantics, output/metadata parity and input handling. sharp (devDependency)
 // is the oracle wherever a behaviour is defined by it.
@@ -7,7 +8,7 @@ import { sharp, engine, make, pattern, compare, exec, diffStats } from './_util.
 
 const small = await make('png', 32, 24);
 const smallA = await make('pnga', 32, 24);
-const photo = await sharp(new URL('../fixtures/photo.jpg', import.meta.url).pathname).resize(160).png().toBuffer();
+const photo = await sharp(fileURLToPath(new URL('../fixtures/photo.jpg', import.meta.url))).resize(160).png().toBuffer();
 
 const sync = (lib, build) => {
   try {

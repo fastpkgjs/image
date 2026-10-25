@@ -3,6 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -84,7 +85,7 @@ const svgHead = '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
 const nested = (n) => `${svgHead}${'<g>'.repeat(n)}<rect width="5" height="5" fill="red"/>${'</g>'.repeat(n)}</svg>`;
 
 test('svg: absurd nesting is rejected cleanly (no stack overflow)', () => {
-  const dir = fs.mkdtempSync(path.join(fs.realpathSync(process.env.TMPDIR || '/tmp'), 'fixes-a-'));
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'fixes-a-'));
   try {
     const file = path.join(dir, 'deep.svg');
     fs.writeFileSync(file, nested(20000));
@@ -100,7 +101,8 @@ test('svg: absurd nesting is rejected cleanly (no stack overflow)', () => {
 });
 
 test('svg: nesting limit mirrors librsvg (255 groups render, 300 do not)', async () => {
-  await assert.doesNotReject(sharp(Buffer.from(nested(255))).raw().toBuffer());
+  // sharp's own depth limit depends on the platform's glib/cairo build (musl builds stop at 50 layers),
+  // so only the engine's behaviour is asserted for the passing case.
   await assert.doesNotReject(engine(Buffer.from(nested(255))).raw().toBuffer());
   await assert.rejects(sharp(Buffer.from(nested(300))).raw().toBuffer());
   await assert.rejects(engine(Buffer.from(nested(300))).raw().toBuffer(), Error);

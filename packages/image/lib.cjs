@@ -1412,7 +1412,7 @@ class Sharp extends Duplex {
   // The native layer reports a missing file as a bare io error; sharp names the path.
   _fail(error) {
     cleanNativeError(error);
-    if (typeof this._input === 'string' && error && /No such file|os error 2|ENOENT/i.test(String(error.message)) && !String(error.message).includes(this._input)) {
+    if (typeof this._input === 'string' && error && /No such file|os error [23]\b|cannot find the (file|path)|ENOENT/i.test(String(error.message)) && !String(error.message).includes(this._input)) {
       error.message = `Input file is missing: ${this._input}`;
     }
     return error;
