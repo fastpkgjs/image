@@ -504,6 +504,15 @@ pub enum Operation {
     Blur {
         #[serde(default = "default_blur_sigma")]
         sigma: f64,
+        /// libvips `min_ampl` of the Gaussian mask (default 0.2).
+        #[serde(default)]
+        min_amplitude: Option<f64>,
+        /// `integer` (default), `float` or `approximate`.
+        #[serde(default)]
+        precision: Option<String>,
+        /// sharp's sigma-less `blur()`: a 3x3 box convolution.
+        #[serde(default)]
+        mild: bool,
     },
     Dilate {
         #[serde(default = "default_morph_width")]

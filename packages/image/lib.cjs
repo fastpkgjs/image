@@ -1672,11 +1672,16 @@ class Sharp extends Duplex {
       if ('minAmplitude' in options) checkNumRange('minAmplitude', options.minAmplitude, 0.001, 1);
     }
     if (!is.defined(options) || (is.bool(options) && options)) {
-      return setOperation(this, { op: 'blur', sigma: 1 });
+      return setOperation(this, { op: 'blur', sigma: 1, mild: true });
     }
     if (is.bool(options)) return this; // blur(false): no blur
     if (!(is.number(sigma) && is.inRange(sigma, 0.3, 1000))) throw invalid('sigma', 'number between 0.3 and 1000', sigma);
-    return setOperation(this, { op: 'blur', sigma });
+    return setOperation(this, {
+      op: 'blur',
+      sigma,
+      precision: is.plainObject(options) ? options.precision : undefined,
+      minAmplitude: is.plainObject(options) ? options.minAmplitude : undefined,
+    });
   }
 
   dilate(width) {

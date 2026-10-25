@@ -19,6 +19,8 @@ use fastpkg_core::{Color, FastpkgError, Format, Image, Result, Stats};
 use image::imageops::FilterType as ImageFilter;
 use rayon::prelude::*;
 
+mod gauss;
+mod sharpen;
 mod vips;
 
 pub fn apply(mut image: Image, operations: &[Operation]) -> Result<Image> {
@@ -138,8 +140,17 @@ fn apply_op(mut image: Image, op: &Operation) -> Result<Image> {
             odx,
             ody,
             background,
-            ..
-        } => affine(image, matrix, *idx, *idy, *odx, *ody, background),
+            interpolator,
+        } => affine(
+            image,
+            matrix,
+            *idx,
+            *idy,
+            *odx,
+            *ody,
+            background,
+            interpolator.as_deref(),
+        ),
         Operation::Sharpen {
             sigma,
             m1,
@@ -150,7 +161,12 @@ fn apply_op(mut image: Image, op: &Operation) -> Result<Image> {
             simple,
         } => sharpen(image, *sigma, *m1, *m2, *x1, *y2, *y3, *simple),
         Operation::Median { size } => median(image, *size),
-        Operation::Blur { sigma } => blur(image, *sigma),
+        Operation::Blur {
+            sigma,
+            min_amplitude,
+            precision,
+            mild,
+        } => blur(image, *sigma, *min_amplitude, precision.as_deref(), *mild),
         Operation::Dilate { width } => morphology(image, *width, true),
         Operation::Erode { width } => morphology(image, *width, false),
         Operation::Flatten { background } => flatten(image, background),
@@ -588,15 +604,71 @@ fn resize_raw_wide(
     Ok(image)
 }
 
+fn custom_filter(name: &'static str, func: fn(f64) -> f64, support: f64) -> FirFilter {
+    // The supports are positive constants, so construction cannot fail.
+    FirFilter::Custom(
+        fast_image_resize::Filter::new(name, func, support)
+            .unwrap_or_else(|_| unreachable!("filter support is a positive constant")),
+    )
+}
+
+/// Lanczos window with two lobes (libvips `lanczos2`).
+fn lanczos2_filter(x: f64) -> f64 {
+    let x = x.abs();
+    if x == 0.0 {
+        1.0
+    } else if x >= 2.0 {
+        0.0
+    } else {
+        let px = std::f64::consts::PI * x;
+        2.0 * px.sin() * (px / 2.0).sin() / (px * px)
+    }
+}
+
+/// Quadratic "magic kernel" `m` (Costella): the base of both Magic Kernel Sharp variants.
+fn magic_kernel(x: f64) -> f64 {
+    let x = x.abs();
+    if x < 0.5 {
+        0.75 - x * x
+    } else if x < 1.5 {
+        0.5 * (x - 1.5) * (x - 1.5)
+    } else {
+        0.0
+    }
+}
+
+/// Magic Kernel Sharp 2013: `m` sharpened with the `[-1, 6, -1] / 4` filter (radius 2.5).
+fn mks2013_filter(x: f64) -> f64 {
+    (6.0 * magic_kernel(x) - magic_kernel(x + 1.0) - magic_kernel(x - 1.0)) / 4.0
+}
+
+/// Magic Kernel Sharp 2021: `m` convolved with the truncated (seven taps) inverse of its own
+/// sampled response, which makes the kernel interpolating (radius 4.5).
+fn mks2021_filter(x: f64) -> f64 {
+    // g[n] = sqrt(2) * (2 * sqrt(2) - 3)^|n|
+    const G: [f64; 4] = [
+        std::f64::consts::SQRT_2,
+        -0.242_640_687_119_284_88,
+        0.041_630_560_342_615_74,
+        -0.007_142_674_936_409_807,
+    ];
+    let mut sum = G[0] * magic_kernel(x);
+    for (n, g) in G.iter().enumerate().skip(1) {
+        sum += g * (magic_kernel(x - n as f64) + magic_kernel(x + n as f64));
+    }
+    sum
+}
+
 fn resize_options(kernel: Kernel, has_alpha: bool) -> ResizeOptions {
     let algorithm = match kernel {
         Kernel::Nearest => ResizeAlg::Nearest,
         Kernel::Linear | Kernel::Bilinear => ResizeAlg::Convolution(FirFilter::Bilinear),
         Kernel::Cubic => ResizeAlg::Convolution(FirFilter::CatmullRom),
         Kernel::Mitchell => ResizeAlg::Convolution(FirFilter::Mitchell),
-        Kernel::Lanczos2 => ResizeAlg::Convolution(FirFilter::Lanczos3),
+        Kernel::Lanczos2 => ResizeAlg::Convolution(custom_filter("lanczos2", lanczos2_filter, 2.0)),
         Kernel::Lanczos3 => ResizeAlg::Convolution(FirFilter::Lanczos3),
-        Kernel::Mks2013 | Kernel::Mks2021 => ResizeAlg::Convolution(FirFilter::Lanczos3),
+        Kernel::Mks2013 => ResizeAlg::Convolution(custom_filter("mks2013", mks2013_filter, 2.5)),
+        Kernel::Mks2021 => ResizeAlg::Convolution(custom_filter("mks2021", mks2021_filter, 4.5)),
     };
     ResizeOptions::new()
         .resize_alg(algorithm)
@@ -775,18 +847,21 @@ fn extend(
     let fill = [color.r, color.g, color.b, color.alpha];
     let src_stride = image.width as usize * 4;
     let (x, y) = (x as usize, y as usize);
+    let row_bytes = width as usize * 4;
     if matches!(extend_with, ExtendWith::Background) {
-        data.par_chunks_exact_mut(width as usize * 4)
+        let template: Vec<u8> = fill.iter().copied().cycle().take(row_bytes).collect();
+        data.par_chunks_exact_mut(row_bytes)
             .enumerate()
             .for_each(|(row_index, row)| {
-                let inside = row_index >= y && row_index < y + image.height as usize;
-                for px in row.chunks_exact_mut(4) {
-                    px.copy_from_slice(&fill);
-                }
-                if inside {
+                if row_index >= y && row_index < y + image.height as usize {
+                    // Only the borders need the background; the middle is the source row.
                     let src = (row_index - y) * src_stride;
+                    row[..x * 4].copy_from_slice(&template[..x * 4]);
                     row[x * 4..x * 4 + src_stride]
                         .copy_from_slice(&image.data[src..src + src_stride]);
+                    row[x * 4 + src_stride..].copy_from_slice(&template[x * 4 + src_stride..]);
+                } else {
+                    row.copy_from_slice(&template);
                 }
             });
     } else {
@@ -800,12 +875,22 @@ fn extend(
         let columns = (0..width as i64)
             .map(|col| map(col - x as i64, image.width))
             .collect::<Vec<_>>();
-        data.par_chunks_exact_mut(width as usize * 4)
+        data.par_chunks_exact_mut(row_bytes)
             .enumerate()
             .for_each(|(row_index, row)| {
                 let sy = map(row_index as i64 - y as i64, image.height);
                 let src_row = &image.data[sy * src_stride..(sy + 1) * src_stride];
-                for (px, &sx) in row.chunks_exact_mut(4).zip(&columns) {
+                // The pixels over the source itself are a straight copy of the row.
+                row[x * 4..x * 4 + src_stride].copy_from_slice(src_row);
+                let (left, rest) = row.split_at_mut(x * 4);
+                let right = &mut rest[src_stride..];
+                for (px, &sx) in left.chunks_exact_mut(4).zip(&columns[..x]) {
+                    px.copy_from_slice(&src_row[sx * 4..sx * 4 + 4]);
+                }
+                for (px, &sx) in right
+                    .chunks_exact_mut(4)
+                    .zip(&columns[x + image.width as usize..])
+                {
                     px.copy_from_slice(&src_row[sx * 4..sx * 4 + 4]);
                 }
             });
@@ -844,61 +929,135 @@ fn trim(
     margin: u32,
 ) -> Result<Image> {
     let (w, h) = (image.width as usize, image.height as usize);
+    // Alpha-premultiplied ("flattened") colour of a pixel, in float.
     let flat = |px: &[u8]| -> [f32; 3] {
-        let a = px[3] as f32 / 255.0;
+        let a = ALPHA_FACTOR[px[3] as usize];
         [px[0] as f32 * a, px[1] as f32 * a, px[2] as f32 * a]
     };
-    let mut values: Vec<[f32; 3]> = image.data.chunks_exact(4).map(flat).collect();
-    if !line_art && w > 1 && h > 1 {
-        let source = values.clone();
-        values.par_iter_mut().enumerate().for_each(|(index, out)| {
-            let (x, y) = ((index % w) as isize, (index / w) as isize);
-            for (c, slot) in out.iter_mut().enumerate() {
-                let mut window = [0f32; 9];
-                let mut n = 0;
-                for dy in -1..=1isize {
-                    for dx in -1..=1isize {
-                        let sx = (x + dx).clamp(0, w as isize - 1) as usize;
-                        let sy = (y + dy).clamp(0, h as isize - 1) as usize;
-                        window[n] = source[sy * w + sx][c];
-                        n += 1;
-                    }
-                }
-                window.sort_by(|a, b| a.total_cmp(b));
-                *slot = window[4];
+    // libvips trim runs a 3x3 median over the flattened image first (not for line art).
+    let median_filter = !line_art && w > 1 && h > 1;
+    // Planar flattened rows, one extra replicated pixel on each side: [channel][x + 1].
+    let plane = w + 2;
+    let flat_row = |y: usize, out: &mut [f32]| {
+        for (x, px) in image.data[y * w * 4..(y + 1) * w * 4]
+            .chunks_exact(4)
+            .enumerate()
+        {
+            let value = flat(px);
+            for c in 0..3 {
+                out[c * plane + x + 1] = value[c];
             }
-        });
-    }
+        }
+        for c in 0..3 {
+            out[c * plane] = out[c * plane + 1];
+            out[c * plane + w + 1] = out[c * plane + w];
+        }
+    };
     let bg = match background {
         Some(text) => {
             let color = Color::parse(text)
                 .ok_or_else(|| FastpkgError::InvalidOptions(format!("invalid color {text}")))?;
             flat(&[color.r, color.g, color.b, color.alpha])
         }
-        None => values.first().copied().unwrap_or([0.0; 3]),
+        None if w == 0 || h == 0 => [0.0; 3],
+        None if !median_filter => flat(&image.data[..4]),
+        None => {
+            // The first (top-left) filtered pixel: rows -1 and 0 are both row 0.
+            let mut row0 = vec![0f32; 3 * plane];
+            let mut row1 = vec![0f32; 3 * plane];
+            flat_row(0, &mut row0);
+            flat_row(1, &mut row1);
+            [0, 1, 2].map(|c| {
+                let at = |row: &[f32], dx: usize| row[c * plane + dx];
+                median9([
+                    at(&row0, 0),
+                    at(&row0, 1),
+                    at(&row0, 2),
+                    at(&row0, 0),
+                    at(&row0, 1),
+                    at(&row0, 2),
+                    at(&row1, 0),
+                    at(&row1, 1),
+                    at(&row1, 2),
+                ])
+            })
+        }
     };
-    let mut left = w;
-    let mut top = h;
-    let mut right = 0usize;
-    let mut bottom = 0usize;
-    let mut found = false;
-    for (index, v) in values.iter().enumerate() {
+    let differs = |v: [f32; 3]| -> bool {
         let diff = (v[0] - bg[0])
             .abs()
             .max((v[1] - bg[1]).abs())
             .max((v[2] - bg[2]).abs());
-        if f64::from(diff) > threshold {
-            let (x, y) = (index % w, index / w);
-            left = left.min(x);
-            top = top.min(y);
-            right = right.max(x);
-            bottom = bottom.max(y);
-            found = true;
-        }
-    }
-    if !found {
+        f64::from(diff) > threshold
+    };
+    // Per block of rows: (first row with a differing pixel, last such row, left, right).
+    const BLOCK: usize = 32;
+    let blocks: Vec<usize> = (0..h).step_by(BLOCK).collect();
+    let bounds = blocks
+        .par_iter()
+        .map(|&y0| {
+            let y1 = (y0 + BLOCK).min(h);
+            let lo = if median_filter {
+                y0.saturating_sub(1)
+            } else {
+                y0
+            };
+            let hi = if median_filter { y1.min(h - 1) } else { y1 - 1 };
+            let mut rows = vec![0f32; (hi - lo + 1) * 3 * plane];
+            for (i, row) in rows.chunks_exact_mut(3 * plane).enumerate() {
+                flat_row(lo + i, row);
+            }
+            let row_at = |y: usize| &rows[(y - lo) * 3 * plane..(y - lo + 1) * 3 * plane];
+            let mut found: Option<(usize, usize, usize, usize)> = None;
+            let mut filtered = vec![0f32; 3 * w];
+            for y in y0..y1 {
+                if median_filter {
+                    let triple = [
+                        row_at(y.saturating_sub(1)),
+                        row_at(y),
+                        row_at((y + 1).min(h - 1)),
+                    ];
+                    for c in 0..3 {
+                        median_row(
+                            [
+                                &triple[0][c * plane..(c + 1) * plane],
+                                &triple[1][c * plane..(c + 1) * plane],
+                                &triple[2][c * plane..(c + 1) * plane],
+                            ],
+                            &mut filtered[c * w..(c + 1) * w],
+                        );
+                    }
+                } else {
+                    let row = row_at(y);
+                    for c in 0..3 {
+                        filtered[c * w..(c + 1) * w]
+                            .copy_from_slice(&row[c * plane + 1..c * plane + 1 + w]);
+                    }
+                }
+                let at = |x: usize| [filtered[x], filtered[w + x], filtered[2 * w + x]];
+                let first = (0..w).find(|&x| differs(at(x)));
+                if let Some(first) = first {
+                    let last = (first..w).rev().find(|&x| differs(at(x))).unwrap_or(first);
+                    found = Some(match found {
+                        None => (y, y, first, last),
+                        Some((top, _, left, right)) => (top, y, left.min(first), right.max(last)),
+                    });
+                }
+            }
+            found
+        })
+        .reduce(
+            || None,
+            |a, b| match (a, b) {
+                (None, other) | (other, None) => other,
+                (Some((t1, b1, l1, r1)), Some((t2, b2, l2, r2))) => {
+                    Some((t1.min(t2), b1.max(b2), l1.min(l2), r1.max(r2)))
+                }
+            },
+        );
+    let Some((top, bottom, left, right)) = bounds else {
         return Ok(image);
-    }
+    };
     let margin = margin as usize;
     let left = left.saturating_sub(margin);
     let top = top.saturating_sub(margin);
@@ -912,6 +1071,76 @@ fn trim(
         (bottom - top + 1) as u32,
     )
 }
+
+/// Median of nine values through a sorting network (exact: no arithmetic is involved).
+#[inline]
+fn median9(mut p: [f32; 9]) -> f32 {
+    #[inline(always)]
+    fn sort(p: &mut [f32; 9], a: usize, b: usize) {
+        if p[a] > p[b] {
+            p.swap(a, b);
+        }
+    }
+    for (a, b) in MEDIAN9_NETWORK {
+        sort(&mut p, a, b);
+    }
+    p[4]
+}
+
+/// 3x3 median of one channel for a whole row. `rows` are the three source rows (each with one
+/// replicated pixel on both sides, so `rows[r][x..x + 3]` is the window of output `x`).
+fn median_row(rows: [&[f32]; 3], out: &mut [f32]) {
+    const L: usize = 8;
+    #[inline(always)]
+    fn sort(p: &mut [[f32; L]; 9], a: usize, b: usize) {
+        for i in 0..L {
+            let (x, y) = (p[a][i], p[b][i]);
+            p[a][i] = x.min(y);
+            p[b][i] = x.max(y);
+        }
+    }
+    let w = out.len();
+    let mut x = 0;
+    while x < w {
+        let n = L.min(w - x);
+        let mut p = [[0f32; L]; 9];
+        for (r, row) in rows.iter().enumerate() {
+            for d in 0..3 {
+                for i in 0..L {
+                    // Lanes past the end repeat the last pixel; their results are discarded.
+                    p[r * 3 + d][i] = row[(x + i).min(w - 1) + d];
+                }
+            }
+        }
+        for (a, b) in MEDIAN9_NETWORK {
+            sort(&mut p, a, b);
+        }
+        out[x..x + n].copy_from_slice(&p[4][..n]);
+        x += n;
+    }
+}
+
+const MEDIAN9_NETWORK: [(usize, usize); 19] = [
+    (1, 2),
+    (4, 5),
+    (7, 8),
+    (0, 1),
+    (3, 4),
+    (6, 7),
+    (1, 2),
+    (4, 5),
+    (7, 8),
+    (0, 3),
+    (5, 8),
+    (4, 7),
+    (3, 6),
+    (1, 4),
+    (2, 5),
+    (4, 7),
+    (4, 2),
+    (6, 4),
+    (4, 2),
+];
 
 fn flip(mut image: Image, flip: bool) -> Result<Image> {
     if !flip {
@@ -977,14 +1206,26 @@ fn rotate(image: Image, angle: f64, background: &str) -> Result<Image> {
     let (cos, sin, new_w, new_h, left, top) = rotation_frame(image.width, image.height, angle);
     let mut out = Image::from_rgba(new_w, new_h, vec![0u8; new_w as usize * new_h as usize * 4])?;
     out.has_alpha = image.has_alpha || bg.alpha < 255;
+    let with_alpha = out.has_alpha;
+    let fill = if with_alpha {
+        premultiplied(bg)
+    } else {
+        [bg.r as f32, bg.g as f32, bg.b as f32, bg.alpha as f32]
+    };
     out.data
         .par_chunks_exact_mut(new_w as usize * 4)
         .enumerate()
         .for_each(|(y, row)| {
             for (x, dst) in row.chunks_exact_mut(4).enumerate() {
                 let (sx, sy) = rotation_source(cos, sin, left, top, x as u32, y as u32);
-                let color = sample_bilinear(&image, sx, sy, bg);
-                dst.copy_from_slice(&[color.r, color.g, color.b, color.alpha]);
+                dst.copy_from_slice(&sample_pixel(
+                    &image,
+                    sx,
+                    sy,
+                    Interpolator::Bilinear,
+                    fill,
+                    with_alpha,
+                ));
             }
         });
     out.format = image.format;
@@ -1074,6 +1315,9 @@ fn rotate_wide(mut image: Image, angle: f64, background: &str) -> Result<Image> 
     Ok(image)
 }
 
+/// Bilinear sample at source position `(x, y)` (pixel-index space). Like libvips' `affine`, taps
+/// that fall outside the image read the background colour, so the edge of the image blends into
+/// the background by coverage instead of ending in a hard line.
 fn sample_bilinear_wide(
     wide: &[u16],
     width: usize,
@@ -1082,19 +1326,19 @@ fn sample_bilinear_wide(
     y: f64,
     fallback: [u16; 4],
 ) -> [u16; 4] {
-    if x < -0.5 || y < -0.5 || x > width as f64 - 0.5 || y > height as f64 - 0.5 {
+    if x <= -1.0 || y <= -1.0 || x >= width as f64 || y >= height as f64 {
         return fallback;
     }
-    let x = x.clamp(0.0, (width - 1) as f64);
-    let y = y.clamp(0.0, (height - 1) as f64);
-    let x0 = x.floor() as usize;
-    let y0 = y.floor() as usize;
-    let x1 = (x0 + 1).min(width - 1);
-    let y1 = (y0 + 1).min(height - 1);
-    let fx = x - x0 as f64;
-    let fy = y - y0 as f64;
-    let at = |px: usize, py: usize| -> [f64; 4] {
-        let idx = (py * width + px) * 4;
+    let x0 = x.floor();
+    let y0 = y.floor();
+    let fx = x - x0;
+    let fy = y - y0;
+    let (x0, y0) = (x0 as i64, y0 as i64);
+    let at = |px: i64, py: i64| -> [f64; 4] {
+        if px < 0 || py < 0 || px >= width as i64 || py >= height as i64 {
+            return fallback.map(|v| v as f64);
+        }
+        let idx = (py as usize * width + px as usize) * 4;
         [
             wide[idx] as f64,
             wide[idx + 1] as f64,
@@ -1103,9 +1347,9 @@ fn sample_bilinear_wide(
         ]
     };
     let c00 = at(x0, y0);
-    let c10 = at(x1, y0);
-    let c01 = at(x0, y1);
-    let c11 = at(x1, y1);
+    let c10 = at(x0 + 1, y0);
+    let c01 = at(x0, y0 + 1);
+    let c11 = at(x0 + 1, y0 + 1);
     let mut out = [0u16; 4];
     for c in 0..4 {
         let top = c00[c] + (c10[c] - c00[c]) * fx;
@@ -1115,33 +1359,163 @@ fn sample_bilinear_wide(
     out
 }
 
-fn sample_bilinear(image: &Image, x: f64, y: f64, fallback: Color) -> Color {
-    if x < -0.5 || y < -0.5 || x > image.width as f64 - 0.5 || y > image.height as f64 - 0.5 {
-        return fallback;
+/// `alpha / 255.0` in `f32` for every alpha value.
+const ALPHA_FACTOR: [f32; 256] = {
+    let mut table = [0.0; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = i as f32 / 255.0;
+        i += 1;
     }
-    let x = x.clamp(0.0, (image.width - 1) as f64);
-    let y = y.clamp(0.0, (image.height - 1) as f64);
-    let x0 = x.floor() as u32;
-    let y0 = y.floor() as u32;
-    let x1 = (x0 + 1).min(image.width - 1);
-    let y1 = (y0 + 1).min(image.height - 1);
-    let fx = x - x0 as f64;
-    let fy = y - y0 as f64;
-    let c00 = image.get(x0, y0);
-    let c10 = image.get(x1, y0);
-    let c01 = image.get(x0, y1);
-    let c11 = image.get(x1, y1);
-    let lerp = |a: u8, b: u8, c: u8, d: u8| -> u8 {
-        let top = a as f64 + (b as f64 - a as f64) * fx;
-        let bottom = c as f64 + (d as f64 - c as f64) * fx;
-        (top + (bottom - top) * fy).clamp(0.0, 255.0).round() as u8
+    table
+};
+
+/// Premultiplied float colour as libvips computes it: `colour * (alpha / 255)` in `f32`.
+#[inline(always)]
+fn premultiplied(color: Color) -> [f32; 4] {
+    let factor = ALPHA_FACTOR[color.alpha as usize];
+    [
+        color.r as f32 * factor,
+        color.g as f32 * factor,
+        color.b as f32 * factor,
+        color.alpha as f32,
+    ]
+}
+
+/// `x.floor() as i64` without the libm call (valid for |x| < 2^62).
+#[inline(always)]
+fn floor_i64(x: f64) -> i64 {
+    let truncated = x as i64;
+    truncated - i64::from((truncated as f64) > x)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interpolator {
+    Nearest,
+    Bilinear,
+    Bicubic,
+}
+
+impl Interpolator {
+    /// `nohalo`, `lbb` and `vsqbs` are approximated by bilinear.
+    fn parse(name: Option<&str>) -> Self {
+        match name {
+            Some("nearest") => Interpolator::Nearest,
+            Some("bicubic") => Interpolator::Bicubic,
+            _ => Interpolator::Bilinear,
+        }
+    }
+}
+
+/// Catmull-Rom weights for the four taps `floor(x) - 1 ..= floor(x) + 2` (libvips `bicubic`).
+#[inline]
+fn catmull_rom(t: f64) -> [f64; 4] {
+    [
+        ((-0.5 * t + 1.0) * t - 0.5) * t,
+        (1.5 * t - 2.5) * t * t + 1.0,
+        ((-1.5 * t + 2.0) * t + 0.5) * t,
+        (0.5 * t - 0.5) * t * t,
+    ]
+}
+
+/// Samples the image at source position `(x, y)` (pixel-index space) the way libvips' `affine`
+/// does: taps outside the image read the background, so the edge blends into it by coverage.
+/// Images with alpha are premultiplied, interpolated in float, unpremultiplied
+/// (`value * (255 / alpha)`, zero for alpha 0) and truncated to 8 bits; opaque images are
+/// interpolated directly and rounded. `background` is premultiplied for images with alpha.
+fn sample_pixel(
+    image: &Image,
+    x: f64,
+    y: f64,
+    interpolator: Interpolator,
+    background: [f32; 4],
+    with_alpha: bool,
+) -> [u8; 4] {
+    let (w, h) = (image.width as i64, image.height as i64);
+    let tap = |px: i64, py: i64| -> [f32; 4] {
+        if px < 0 || py < 0 || px >= w || py >= h {
+            return background;
+        }
+        let idx = (py as usize * w as usize + px as usize) * 4;
+        let color = &image.data[idx..idx + 4];
+        if with_alpha {
+            premultiplied(Color {
+                r: color[0],
+                g: color[1],
+                b: color[2],
+                alpha: color[3],
+            })
+        } else {
+            [
+                color[0] as f32,
+                color[1] as f32,
+                color[2] as f32,
+                color[3] as f32,
+            ]
+        }
     };
-    Color {
-        r: lerp(c00.r, c10.r, c01.r, c11.r),
-        g: lerp(c00.g, c10.g, c01.g, c11.g),
-        b: lerp(c00.b, c10.b, c01.b, c11.b),
-        alpha: lerp(c00.alpha, c10.alpha, c01.alpha, c11.alpha),
+    let far = 3.0;
+    let blended = if x < -far || y < -far || x > w as f64 + far || y > h as f64 + far {
+        background
+    } else {
+        match interpolator {
+            Interpolator::Nearest => tap(floor_i64(x), floor_i64(y)),
+            Interpolator::Bilinear => {
+                let (x0, y0) = (floor_i64(x), floor_i64(y));
+                let (fx, fy) = (x - x0 as f64, y - y0 as f64);
+                let c00 = tap(x0, y0);
+                let c10 = tap(x0 + 1, y0);
+                let c01 = tap(x0, y0 + 1);
+                let c11 = tap(x0 + 1, y0 + 1);
+                let mut out = [0f32; 4];
+                for c in 0..4 {
+                    let top = c00[c] as f64 + (c10[c] as f64 - c00[c] as f64) * fx;
+                    let bottom = c01[c] as f64 + (c11[c] as f64 - c01[c] as f64) * fx;
+                    out[c] = (top + (bottom - top) * fy) as f32;
+                }
+                out
+            }
+            Interpolator::Bicubic => {
+                let (x0, y0) = (floor_i64(x), floor_i64(y));
+                let wx = catmull_rom(x - x0 as f64);
+                let wy = catmull_rom(y - y0 as f64);
+                let mut acc = [0f64; 4];
+                for (j, &weight_y) in wy.iter().enumerate() {
+                    let mut row = [0f64; 4];
+                    for (i, &weight_x) in wx.iter().enumerate() {
+                        let value = tap(x0 - 1 + i as i64, y0 - 1 + j as i64);
+                        for c in 0..4 {
+                            row[c] += value[c] as f64 * weight_x;
+                        }
+                    }
+                    for c in 0..4 {
+                        acc[c] += row[c] * weight_y;
+                    }
+                }
+                acc.map(|v| v as f32)
+            }
+        }
+    };
+    if with_alpha {
+        let alpha = blended[3];
+        let factor = if alpha == 0.0 { 0.0 } else { 255.0 / alpha };
+        [
+            (blended[0] * factor).clamp(0.0, 255.0) as u8,
+            (blended[1] * factor).clamp(0.0, 255.0) as u8,
+            (blended[2] * factor).clamp(0.0, 255.0) as u8,
+            alpha.clamp(0.0, 255.0) as u8,
+        ]
+    } else {
+        blended.map(round_f32_u8)
     }
+}
+
+/// `v.clamp(0.0, 255.0).round() as u8` without the libm `round` call.
+#[inline(always)]
+fn round_f32_u8(v: f32) -> u8 {
+    let v = v.clamp(0.0, 255.0);
+    let whole = v as u32;
+    (whole + u32::from(v - whole as f32 >= 0.5)) as u8
 }
 
 fn auto_orient(image: Image) -> Result<Image> {
@@ -1177,6 +1551,7 @@ fn affine(
     odx: f64,
     ody: f64,
     background: &str,
+    interpolator: Option<&str>,
 ) -> Result<Image> {
     if matrix.len() != 4 && matrix.len() != 6 {
         return Err(FastpkgError::InvalidOptions(
@@ -1258,6 +1633,13 @@ fn affine(
         vec![0u8; width as usize * height as usize * 4],
     )?;
     out.has_alpha = image.has_alpha || bg.alpha < 255;
+    let with_alpha = out.has_alpha;
+    let fill = if with_alpha {
+        premultiplied(bg)
+    } else {
+        [bg.r as f32, bg.g as f32, bg.b as f32, bg.alpha as f32]
+    };
+    let interpolator = Interpolator::parse(interpolator);
     out.data
         .par_chunks_exact_mut(width as usize * 4)
         .enumerate()
@@ -1269,8 +1651,14 @@ fn affine(
                 let dy = oy - ody;
                 let sx = inv_a * dx + inv_b * dy - idx;
                 let sy = inv_c * dx + inv_d * dy - idy;
-                let color = sample_bilinear(&image, sx, sy, bg);
-                dst.copy_from_slice(&[color.r, color.g, color.b, color.alpha]);
+                dst.copy_from_slice(&sample_pixel(
+                    &image,
+                    sx,
+                    sy,
+                    interpolator,
+                    fill,
+                    with_alpha,
+                ));
             }
         });
     out.format = image.format;
@@ -1278,7 +1666,7 @@ fn affine(
 }
 
 fn sharpen(
-    image: Image,
+    mut image: Image,
     sigma: f64,
     m1: f64,
     m2: f64,
@@ -1287,146 +1675,109 @@ fn sharpen(
     y3: f64,
     simple: bool,
 ) -> Result<Image> {
-    let sigma = sigma.clamp(0.1, 10.0);
-    let blurred = blur_pixels(
-        &image.data,
-        image.width as usize,
-        image.height as usize,
-        if simple { 1.0 } else { sigma },
-    );
-    let x1 = if simple { f64::MAX } else { x1.max(0.0) };
-    let m1 = if simple { 0.5 } else { m1.max(0.0) };
-    let m2 = if simple { 0.5 } else { m2.max(0.0) };
-    let bright_limit = if simple { 1.0 } else { (y2 / 255.0).max(0.0) };
-    let dark_limit = if simple { 1.0 } else { (y3 / 255.0).max(0.0) };
-    let mut out = image;
-    let row_bytes = (out.width as usize * 4).max(4);
-    out.data
-        .par_chunks_mut(row_bytes)
-        .zip(blurred.par_chunks(row_bytes))
-        .for_each(|(dst_row, blur_row)| {
-            for (dst, blur_px) in dst_row.chunks_exact_mut(4).zip(blur_row.chunks_exact(4)) {
-                let original_lum = luminance(dst[0], dst[1], dst[2]) as f64;
-                let blurred_lum = luminance(blur_px[0], blur_px[1], blur_px[2]) as f64;
-                let diff = original_lum - blurred_lum;
-                let contrast = diff.abs();
-                let amount = if contrast < x1 { m1 } else { m2 } * 0.5;
-                let boost = (diff * amount).clamp(-dark_limit * 255.0, bright_limit * 255.0);
-                for channel in 0..3 {
-                    dst[channel] = (dst[channel] as f64 + boost).clamp(0.0, 255.0) as u8;
-                }
-            }
-        });
-    Ok(out)
+    let (w, h) = (image.width as usize, image.height as usize);
+    let has_alpha = image.has_alpha;
+    // sharp premultiplies RGBA before sharpening and unpremultiplies afterwards.
+    let mut data = std::mem::take(&mut image.data);
+    if has_alpha {
+        premultiply(&mut data);
+    }
+    if simple {
+        // Fast, mild sharpen: a 3x3 integer convolution.
+        data = gauss::conv3x3(&data, w, h, [-1, -1, -1, -1, 32, -1, -1, -1, -1], 24);
+    } else {
+        sharpen::sharpen(
+            &mut data,
+            w,
+            h,
+            sigma,
+            (
+                m1.max(0.0),
+                m2.max(0.0),
+                x1.max(0.0),
+                y2.max(0.0),
+                y3.max(0.0),
+            ),
+        );
+    }
+    if has_alpha {
+        unpremultiply(&mut data);
+    }
+    let mut image = image;
+    image.data = data;
+    image.wide = None;
+    Ok(image)
 }
 
-fn blur(image: Image, sigma: f64) -> Result<Image> {
-    let out = blur_pixels(
-        &image.data,
-        image.width as usize,
-        image.height as usize,
-        sigma,
-    );
+fn blur(
+    image: Image,
+    sigma: f64,
+    min_ampl: Option<f64>,
+    precision: Option<&str>,
+    mild: bool,
+) -> Result<Image> {
+    let (w, h) = (image.width as usize, image.height as usize);
+    let has_alpha = image.has_alpha;
+    // sharp premultiplies RGBA before blurring and unpremultiplies afterwards.
+    let mut data = image.data;
+    if has_alpha {
+        premultiply(&mut data);
+    }
+    let mut out = if mild {
+        gauss::conv3x3(&data, w, h, [1; 9], 9)
+    } else {
+        gauss::gaussblur(
+            data,
+            w,
+            h,
+            sigma,
+            min_ampl.unwrap_or(0.2),
+            gauss::Precision::parse(precision),
+        )
+    };
+    if has_alpha {
+        unpremultiply(&mut out);
+    }
     let mut out_image = Image::from_rgba(image.width, image.height, out)?;
     out_image.format = image.format;
-    out_image.has_alpha = image.has_alpha;
+    out_image.has_alpha = has_alpha;
     Ok(out_image)
 }
 
-/// `dst[i] = sum_k kernel[k] * srcs[k][i]`, accumulated in tap order. Columns are processed in
-/// blocks so the accumulator stays in registers across all taps.
-#[inline(always)]
-fn mac_rows(dst: &mut [f32], kernel: &[f32], srcs: &[&[f32]]) {
-    const LANES: usize = 16;
-    let split = dst.len() / LANES * LANES;
-    let (head, tail) = dst.split_at_mut(split);
-    for (block, chunk) in head.chunks_exact_mut(LANES).enumerate() {
-        let base = block * LANES;
-        let mut acc = [0.0f32; LANES];
-        for (&weight, src) in kernel.iter().zip(srcs) {
-            for (a, &value) in acc.iter_mut().zip(&src[base..base + LANES]) {
-                *a += value * weight;
+/// libvips `premultiply().cast(uchar)`: colour * alpha / 255, truncated.
+fn premultiply(data: &mut [u8]) {
+    data.par_chunks_mut(4096).for_each(|chunk| {
+        for px in chunk.chunks_exact_mut(4) {
+            let a = px[3] as u32;
+            for c in &mut px[..3] {
+                *c = (*c as u32 * a / 255) as u8;
             }
         }
-        chunk.copy_from_slice(&acc);
-    }
-    for (i, out) in tail.iter_mut().enumerate() {
-        let mut acc = 0.0f32;
-        for (&weight, src) in kernel.iter().zip(srcs) {
-            acc += src[split + i] * weight;
-        }
-        *out = acc;
-    }
+    });
 }
 
-/// Exactly `value.clamp(0.0, 255.0).round() as u8` (ties away from zero), written with an
-/// integer truncation so it vectorises instead of calling `roundf` per sample.
-#[inline(always)]
-fn round_u8(value: f32) -> u8 {
-    let value = value.clamp(0.0, 255.0);
-    let whole = value as i32;
-    (whole + i32::from(value - whole as f32 >= 0.5)) as u8
-}
-
-/// Separable Gaussian blur on RGBA8. Both passes accumulate whole rows (`acc[i] += w * src[i]`)
-/// in tap order, so the compiler vectorises them without any architecture-specific code and
-/// the f32 result is identical to a per-pixel multiply-accumulate over the same taps.
-fn blur_pixels(data: &[u8], width: usize, height: usize, sigma: f64) -> Vec<u8> {
-    if width == 0 || height == 0 {
-        return Vec::new();
+/// `ceil(2^32 / a)` for every alpha (0 for alpha 0): `n / a == (n * RECIPROCAL[a]) >> 32` for
+/// every `n < 2^16`, which replaces a hardware division per channel.
+const RECIPROCAL: [u64; 256] = {
+    let mut table = [0u64; 256];
+    let mut a = 1;
+    while a < 256 {
+        table[a] = (1u64 << 32).div_ceil(a as u64);
+        a += 1;
     }
-    let sigma = sigma.max(0.1) as f32;
-    let radius = (sigma * 3.0).ceil() as usize;
-    let mut kernel = Vec::with_capacity(radius * 2 + 1);
-    let mut sum = 0.0f32;
-    for i in -(radius as i32)..=(radius as i32) {
-        let value = (-(i * i) as f32 / (2.0 * sigma * sigma)).exp();
-        kernel.push(value);
-        sum += value;
-    }
-    for value in &mut kernel {
-        *value /= sum;
-    }
+    table
+};
 
-    let row_len = width * 4;
-    let mut horizontal = vec![0.0f32; data.len()];
-    horizontal
-        .par_chunks_exact_mut(row_len)
-        .zip(data.par_chunks_exact(row_len))
-        .for_each_init(
-            || vec![0.0f32; (width + 2 * radius) * 4],
-            |padded, (row, source)| {
-                // Edge-clamped copy of the source row as f32: padded[j] = source[clamp(j - radius)].
-                for (j, dst) in padded.chunks_exact_mut(4).enumerate() {
-                    let sx = j.saturating_sub(radius).min(width - 1);
-                    for (d, &v) in dst.iter_mut().zip(&source[sx * 4..sx * 4 + 4]) {
-                        *d = v as f32;
-                    }
-                }
-                let taps: Vec<&[f32]> = (0..kernel.len())
-                    .map(|k| &padded[k * 4..k * 4 + row_len])
-                    .collect();
-                mac_rows(row, &kernel, &taps);
-            },
-        );
-
-    let mut out = vec![0u8; data.len()];
-    out.par_chunks_exact_mut(row_len).enumerate().for_each_init(
-        || vec![0.0f32; row_len],
-        |acc, (y, row)| {
-            let taps: Vec<&[f32]> = (0..kernel.len())
-                .map(|k| {
-                    let sy = (y + k).saturating_sub(radius).min(height - 1);
-                    &horizontal[sy * row_len..(sy + 1) * row_len]
-                })
-                .collect();
-            mac_rows(acc, &kernel, &taps);
-            for (dst, &value) in row.iter_mut().zip(acc.iter()) {
-                *dst = round_u8(value);
+/// libvips `unpremultiply().cast(uchar)`: colour * 255 / alpha, truncated; alpha 0 gives 0.
+fn unpremultiply(data: &mut [u8]) {
+    data.par_chunks_mut(4096).for_each(|chunk| {
+        for px in chunk.chunks_exact_mut(4) {
+            let reciprocal = RECIPROCAL[px[3] as usize];
+            for c in &mut px[..3] {
+                *c = (((*c as u64 * 255 * reciprocal) >> 32).min(255)) as u8;
             }
-        },
-    );
-    out
+        }
+    });
 }
 
 fn median(image: Image, size: u32) -> Result<Image> {
@@ -1499,48 +1850,122 @@ fn median(image: Image, size: u32) -> Result<Image> {
     Ok(out_image)
 }
 
+/// `dst[i] = max(dst[i], src[i])` (or `min`), which compiles to `pmaxub`/`pminub`.
+#[inline(always)]
+fn fold_extreme(dst: &mut [u8], src: &[u8], dilate: bool) {
+    if dilate {
+        for (a, &b) in dst.iter_mut().zip(src) {
+            *a = (*a).max(b);
+        }
+    } else {
+        for (a, &b) in dst.iter_mut().zip(src) {
+            *a = (*a).min(b);
+        }
+    }
+}
+
+/// Copies the alpha byte of every RGBA pixel from `source` into `target`.
+#[inline(always)]
+fn restore_alpha(target: &mut [u8], source: &[u8]) {
+    for (t, s) in target.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+        let word = (u32::from_le_bytes([t[0], t[1], t[2], t[3]]) & 0x00FF_FFFF)
+            | (u32::from_le_bytes([s[0], s[1], s[2], s[3]]) & 0xFF00_0000);
+        t.copy_from_slice(&word.to_le_bytes());
+    }
+}
+
+/// `dst[i] = extreme of padded[i + k * stride]` for `k` in `0..count`. Wide windows use
+/// power-of-two partial results so the cost grows with `log(count)`.
+fn window_extreme(
+    dst: &mut [u8],
+    padded: &[u8],
+    count: usize,
+    stride: usize,
+    dilate: bool,
+    scratch: &mut [Vec<u8>; 2],
+) {
+    let n = dst.len();
+    if count <= 16 {
+        dst.copy_from_slice(&padded[..n]);
+        for k in 1..count {
+            fold_extreme(dst, &padded[k * stride..k * stride + n], dilate);
+        }
+        return;
+    }
+    let mut span = 1;
+    let mut len = padded.len();
+    scratch[0].clear();
+    scratch[0].extend_from_slice(padded);
+    let mut current = 0;
+    while span * 2 <= count {
+        let shift = span * stride;
+        len -= shift;
+        let (head, tail) = scratch.split_at_mut(1);
+        let (source, target) = if current == 0 {
+            (&head[0], &mut tail[0])
+        } else {
+            (&tail[0], &mut head[0])
+        };
+        target.clear();
+        target.extend_from_slice(&source[..len]);
+        fold_extreme(target, &source[shift..shift + len], dilate);
+        current ^= 1;
+        span *= 2;
+    }
+    let source = &scratch[current];
+    dst.copy_from_slice(&source[..n]);
+    let offset = (count - span) * stride;
+    fold_extreme(dst, &source[offset..offset + n], dilate);
+}
+
 fn morphology(image: Image, width: u32, dilate: bool) -> Result<Image> {
-    let radius = width.max(1) as i32;
+    let radius = width.max(1) as usize;
     let w = image.width as usize;
     let h = image.height as usize;
-    let mut horizontal = vec![0u8; image.data.len()];
+    let row_len = w * 4;
+    let mut image = image;
+    if w == 0 || h == 0 {
+        return Ok(image);
+    }
+    let mut data = std::mem::take(&mut image.data);
+    let mut horizontal = vec![0u8; data.len()];
+    // Horizontal pass: a window of 2 * radius + 1 pixels with the edge pixels replicated. All four
+    // bytes are folded together; alpha is put back from the source afterwards.
     horizontal
-        .par_chunks_exact_mut(w * 4)
-        .enumerate()
-        .for_each(|(y, row)| {
-            for x in 0..w {
-                for c in 0..3 {
-                    let mut value = if dilate { 0u8 } else { 255u8 };
-                    for dx in -radius..=radius {
-                        let sx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
-                        let v = image.data[(y * w + sx) * 4 + c];
-                        value = if dilate { value.max(v) } else { value.min(v) };
-                    }
-                    row[x * 4 + c] = value;
+        .par_chunks_exact_mut(row_len)
+        .zip(data.par_chunks_exact(row_len))
+        .for_each_init(
+            || (Vec::<u8>::new(), [Vec::<u8>::new(), Vec::<u8>::new()]),
+            |(padded, scratch), (dst, src)| {
+                padded.clear();
+                for _ in 0..radius {
+                    padded.extend_from_slice(&src[..4]);
                 }
-                row[x * 4 + 3] = image.data[(y * w + x) * 4 + 3];
-            }
-        });
-    let mut out = horizontal.clone();
-    out.par_chunks_exact_mut(w * 4)
-        .enumerate()
-        .for_each(|(y, row)| {
-            for x in 0..w {
-                for c in 0..3 {
-                    let mut value = if dilate { 0u8 } else { 255u8 };
-                    for dy in -radius..=radius {
-                        let sy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
-                        let v = horizontal[(sy * w + x) * 4 + c];
-                        value = if dilate { value.max(v) } else { value.min(v) };
-                    }
-                    row[x * 4 + c] = value;
+                padded.extend_from_slice(src);
+                for _ in 0..radius {
+                    padded.extend_from_slice(&src[row_len - 4..]);
                 }
+                window_extreme(dst, padded, 2 * radius + 1, 4, dilate, scratch);
+                restore_alpha(dst, src);
+            },
+        );
+    // Vertical pass, written over the source buffer.
+    data.par_chunks_exact_mut(row_len)
+        .enumerate()
+        .for_each(|(y, dst)| {
+            let row = |d: usize| {
+                let sy = (y + d).saturating_sub(radius).min(h - 1);
+                &horizontal[sy * row_len..(sy + 1) * row_len]
+            };
+            dst.copy_from_slice(row(0));
+            for d in 1..=2 * radius {
+                fold_extreme(dst, row(d), dilate);
             }
+            restore_alpha(dst, &horizontal[y * row_len..(y + 1) * row_len]);
         });
-    let mut out_image = Image::from_rgba(image.width, image.height, out)?;
-    out_image.format = image.format;
-    out_image.has_alpha = image.has_alpha;
-    Ok(out_image)
+    image.data = data;
+    image.wide = None;
+    Ok(image)
 }
 
 fn flatten(mut image: Image, background: &str) -> Result<Image> {
@@ -1763,6 +2188,19 @@ fn clahe(image: Image, width: u32, height: u32, max_slope: f64) -> Result<Image>
     Ok(result)
 }
 
+/// `x.clamp(0.0, 255.0) as u8` (truncation; NaN becomes 0) in a form that vectorises: the
+/// saturating float-to-int cast does not, so the integer part is read from the mantissa after
+/// adding 2^23.
+#[inline(always)]
+#[allow(clippy::manual_clamp)] // `clamp` would keep a NaN; `max` maps it to 0 like the cast.
+fn trunc_u8(x: f32) -> u8 {
+    const MAGIC: f32 = 8_388_608.0;
+    let x = x.max(0.0).min(255.0);
+    let nearest = (x + MAGIC) - MAGIC;
+    let floor = nearest - f32::from(u8::from(nearest > x));
+    (floor + MAGIC).to_bits() as u8
+}
+
 fn convolve(
     image: Image,
     width: u32,
@@ -1775,82 +2213,138 @@ fn convolve(
     let h = image.height as usize;
     let kw = width as usize;
     let kh = height as usize;
-    let cx = kw as i32 / 2;
-    let cy = kh as i32 / 2;
+    let cx = kw / 2;
+    let cy = kh / 2;
     let scale = scale.unwrap_or_else(|| kernel.iter().sum::<f64>());
     let scale = if scale.abs() < 1e-12 { 1.0 } else { scale } as f32;
     let weights = kernel.iter().map(|value| *value as f32).collect::<Vec<_>>();
+    let offset = offset as f32;
     // sharp premultiplies RGBA input before convolving (and unpremultiplies afterwards), and
     // convolves the alpha band as well.
-    let premultiply = image.has_alpha;
-    let source: Vec<u8> = if premultiply {
-        image
-            .data
-            .chunks_exact(4)
-            .flat_map(|px| {
-                let a = px[3] as u32;
-                [
-                    (px[0] as u32 * a / 255) as u8,
-                    (px[1] as u32 * a / 255) as u8,
-                    (px[2] as u32 * a / 255) as u8,
-                    px[3],
-                ]
-            })
-            .collect()
+    let premultiplied = image.has_alpha;
+    let mut image = image;
+    let original = std::mem::take(&mut image.data);
+    let source: Vec<u8> = if premultiplied {
+        let mut copy = original.clone();
+        premultiply(&mut copy);
+        copy
     } else {
-        image.data.clone()
+        Vec::new()
     };
-    // Accumulate in float without clamping: sharp unpremultiplies the raw convolution result,
-    // so negative sums (e.g. a laplacian) still divide by a negative alpha.
-    let mut sums = vec![0f32; w * h * 4];
-    sums.par_chunks_exact_mut(w * 4)
+    let source: &[u8] = if premultiplied { &source } else { &original };
+    let row_len = w * 4;
+    let padded_len = (w + kw - 1) * 4;
+    let mut out = original.clone();
+    const BLOCK_ROWS: usize = 16;
+    out.par_chunks_mut(BLOCK_ROWS * row_len)
         .enumerate()
-        .for_each(|(y, row)| {
-            for x in 0..w {
-                for c in 0..4 {
-                    if c == 3 && !premultiply {
-                        continue;
+        .for_each_init(
+            || (Vec::<f32>::new(), vec![0f32; row_len]),
+            |(padded, acc), (block, chunk)| {
+                let y0 = block * BLOCK_ROWS;
+                let rows = chunk.len() / row_len;
+                // f32 copies of the source rows this block reads, edges replicated by the
+                // kernel's reach so every tap is a plain slice.
+                let lo = y0.saturating_sub(cy);
+                let hi = (y0 + rows - 1 + (kh - 1 - cy)).min(h - 1);
+                padded.clear();
+                padded.resize((hi - lo + 1) * padded_len, 0.0);
+                for (i, line) in padded.chunks_exact_mut(padded_len).enumerate() {
+                    let row = &source[(lo + i) * row_len..(lo + i + 1) * row_len];
+                    let lead = cx * 4;
+                    for (d, &v) in line[lead..lead + row_len].iter_mut().zip(row) {
+                        *d = v as f32;
                     }
-                    let mut acc = 0.0f32;
-                    for ky in 0..kh {
-                        let sy = (y as i32 + ky as i32 - cy).clamp(0, h as i32 - 1) as usize;
-                        let source_row = sy * w;
-                        for kx in 0..kw {
-                            let sx = (x as i32 + kx as i32 - cx).clamp(0, w as i32 - 1) as usize;
-                            acc += source[(source_row + sx) * 4 + c] as f32 * weights[ky * kw + kx];
+                    let first = [row[0], row[1], row[2], row[3]].map(|v| v as f32);
+                    let last = [
+                        row[row_len - 4],
+                        row[row_len - 3],
+                        row[row_len - 2],
+                        row[row_len - 1],
+                    ]
+                    .map(|v| v as f32);
+                    for px in line[..lead].chunks_exact_mut(4) {
+                        px.copy_from_slice(&first);
+                    }
+                    for px in line[lead + row_len..].chunks_exact_mut(4) {
+                        px.copy_from_slice(&last);
+                    }
+                }
+                for r in 0..rows {
+                    let y = y0 + r;
+                    // Taps in the order the kernel is applied: row by row, left to right.
+                    let taps: Vec<(&[f32], f32)> = (0..kh)
+                        .flat_map(|ky| {
+                            let sy = (y + ky).saturating_sub(cy).min(h - 1) - lo;
+                            let line = &padded[sy * padded_len..(sy + 1) * padded_len];
+                            let weights = &weights;
+                            (0..kw).map(move |kx| {
+                                (&line[kx * 4..kx * 4 + row_len], weights[ky * kw + kx])
+                            })
+                        })
+                        .collect();
+                    convolve_row(acc, &taps, scale, offset);
+                    let dst = &mut chunk[r * row_len..(r + 1) * row_len];
+                    if premultiplied {
+                        for (px, sum) in dst.chunks_exact_mut(4).zip(acc.chunks_exact(4)) {
+                            let alpha = sum[3];
+                            for c in 0..3 {
+                                // Negative sums divide by a negative alpha (no clamping); alpha 0
+                                // gives 0.
+                                let value = if alpha != 0.0 {
+                                    (sum[c] as f64 * 255.0 / alpha as f64) as f32
+                                } else {
+                                    0.0
+                                };
+                                px[c] = value.clamp(0.0, 255.0) as u8;
+                            }
+                            px[3] = alpha.clamp(0.0, 255.0) as u8;
+                        }
+                    } else {
+                        for (px, sum) in dst.chunks_exact_mut(4).zip(acc.chunks_exact(4)) {
+                            px[0] = trunc_u8(sum[0]);
+                            px[1] = trunc_u8(sum[1]);
+                            px[2] = trunc_u8(sum[2]);
                         }
                     }
-                    // No clamping or rounding here: sharp unpremultiplies the raw float result.
-                    row[x * 4 + c] = acc / scale + offset as f32;
                 }
-            }
-        });
-    let mut out = image.data.clone();
-    out.par_chunks_exact_mut(4)
-        .zip(sums.par_chunks_exact(4))
-        .for_each(|(px, sum)| {
-            if premultiply {
-                let alpha = sum[3];
-                for c in 0..3 {
-                    // Negative sums divide by a negative alpha (no clamping); alpha 0 gives 0.
-                    let value = if alpha != 0.0 {
-                        (sum[c] as f64 * 255.0 / alpha as f64) as f32
-                    } else {
-                        0.0
-                    };
-                    px[c] = value.clamp(0.0, 255.0) as u8;
-                }
-                px[3] = alpha.clamp(0.0, 255.0) as u8;
-            } else {
-                for c in 0..3 {
-                    px[c] = sum[c].clamp(0.0, 255.0) as u8;
-                }
-            }
-        });
+            },
+        );
+    // Keep the metadata-free result the previous implementation returned.
     let mut out_image = Image::from_rgba(image.width, image.height, out)?;
     out_image.format = image.format;
     out_image.has_alpha = image.has_alpha;
     Ok(out_image)
+}
+
+/// `acc[i] = (sum over taps in order of taps[k].0[i] * taps[k].1) / scale + offset`, with the
+/// taps of a register block accumulated in order so each lane sees the same f32 operations as a
+/// per-pixel loop would.
+#[inline(always)]
+fn convolve_row(acc: &mut [f32], taps: &[(&[f32], f32)], scale: f32, offset: f32) {
+    const LANES: usize = 32;
+    let split = acc.len() / LANES * LANES;
+    let (head, tail) = acc.split_at_mut(split);
+    for (block, chunk) in head.chunks_exact_mut(LANES).enumerate() {
+        let base = block * LANES;
+        let mut sum = [0f32; LANES];
+        for &(line, weight) in taps {
+            let src = &line[base..base + LANES];
+            for i in 0..LANES {
+                sum[i] += src[i] * weight;
+            }
+        }
+        for (out, &v) in chunk.iter_mut().zip(&sum) {
+            *out = v / scale + offset;
+        }
+    }
+    for (i, out) in tail.iter_mut().enumerate() {
+        let mut sum = 0f32;
+        for &(line, weight) in taps {
+            sum += line[split + i] * weight;
+        }
+        *out = sum / scale + offset;
+    }
 }
 
 /// sharp `threshold`: with `grayscale` the image is first converted to `B_W`; every band
@@ -2134,26 +2628,27 @@ fn join_channel(
 fn bandbool(image: Image, operator: &str) -> Result<Image> {
     let mut out = image;
     let has_alpha = out.has_alpha;
-    out.data.par_chunks_exact_mut(4).for_each(|px| {
-        let mut value = match operator {
-            "and" => px[0] & px[1] & px[2],
-            "or" => px[0] | px[1] | px[2],
-            "eor" | "xor" => px[0] ^ px[1] ^ px[2],
-            _ => px[0],
-        };
-        if has_alpha {
-            match operator {
-                "and" => value &= px[3],
-                "or" => value |= px[3],
-                "eor" | "xor" => value ^= px[3],
-                _ => {}
+    // Choose the combining function once instead of matching the operator for every pixel.
+    #[inline(always)]
+    fn run(data: &mut [u8], has_alpha: bool, combine: impl Fn(u8, u8) -> u8 + Sync) {
+        data.par_chunks_mut(1 << 14).for_each(|chunk| {
+            for px in chunk.chunks_exact_mut(4) {
+                let mut value = combine(combine(px[0], px[1]), px[2]);
+                if has_alpha {
+                    value = combine(value, px[3]);
+                }
+                px[..3].fill(value);
+                px[3] = 255;
             }
-        }
-        px[0] = value;
-        px[1] = value;
-        px[2] = value;
-        px[3] = 255;
-    });
+        });
+    }
+    match operator {
+        "and" => run(&mut out.data, has_alpha, |a, b| a & b),
+        "or" => run(&mut out.data, has_alpha, |a, b| a | b),
+        "eor" | "xor" => run(&mut out.data, has_alpha, |a, b| a ^ b),
+        // Any other operator keeps the first band and ignores alpha.
+        _ => run(&mut out.data, false, |a, _| a),
+    }
     out.has_alpha = false;
     Ok(out)
 }
@@ -3065,42 +3560,103 @@ fn composite(
         Align::End => out.height as i32 - overlay.height as i32,
     });
     if global {
-        let (ow, oh) = (overlay.width as i32, overlay.height as i32);
-        for dy in 0..out.height as i32 {
-            for dx in 0..out.width as i32 {
-                let (sx, sy) = (dx - x, dy - y);
-                let s = if sx >= 0 && sy >= 0 && sx < ow && sy < oh {
-                    overlay.get(sx as u32, sy as u32)
-                } else {
-                    Color::TRANSPARENT
-                };
-                let d = out.get(dx as u32, dy as u32);
-                out.set(
-                    dx as u32,
-                    dy as u32,
-                    blend_pixel(d, s, blend, premultiplied),
-                );
-            }
-        }
+        let (ow, oh) = (overlay.width as i64, overlay.height as i64);
+        let (x, y) = (x as i64, y as i64);
+        let width = out.width as usize;
+        out.data
+            .par_chunks_exact_mut(width * 4)
+            .enumerate()
+            .for_each(|(dy, row)| {
+                let sy = dy as i64 - y;
+                for (dx, d) in row.chunks_exact_mut(4).enumerate() {
+                    let sx = dx as i64 - x;
+                    let s = if sx >= 0 && sy >= 0 && sx < ow && sy < oh {
+                        overlay.get(sx as u32, sy as u32)
+                    } else {
+                        Color::TRANSPARENT
+                    };
+                    let d_color = Color {
+                        r: d[0],
+                        g: d[1],
+                        b: d[2],
+                        alpha: d[3],
+                    };
+                    let c = blend_pixel(d_color, s, blend, premultiplied);
+                    d.copy_from_slice(&[c.r, c.g, c.b, c.alpha]);
+                }
+            });
         return Ok(out);
     }
     blend_at(&mut out, &overlay, x, y, blend, premultiplied);
     Ok(out)
 }
 
+/// `c / 255.0` for every 8-bit value (the table holds exactly what the division yields).
+const UNIT: [f64; 256] = {
+    let mut table = [0.0; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = i as f64 / 255.0;
+        i += 1;
+    }
+    table
+};
+
+/// Exactly `value.clamp(0.0, 255.0).round() as u8` (ties away from zero) without the libm
+/// `round` call, which does not inline on baseline x86-64.
+#[inline(always)]
+fn round_u8_f64(value: f64) -> u8 {
+    let value = value.clamp(0.0, 255.0);
+    let whole = value as u32;
+    (whole + u32::from(value - whole as f64 >= 0.5)) as u8
+}
+
 fn blend_at(dst: &mut Image, src: &Image, ox: i32, oy: i32, blend: Blend, premult: bool) {
-    for sy in 0..src.height {
-        for sx in 0..src.width {
-            let dx = ox + sx as i32;
-            let dy = oy + sy as i32;
-            if dx < 0 || dy < 0 || dx >= dst.width as i32 || dy >= dst.height as i32 {
-                continue;
-            }
-            let s = src.get(sx, sy);
-            let d = dst.get(dx as u32, dy as u32);
-            let color = blend_pixel(d, s, blend, premult);
-            dst.set(dx as u32, dy as u32, color);
+    let (dw, dh) = (dst.width as i64, dst.height as i64);
+    let (sw, sh) = (src.width as i64, src.height as i64);
+    let (ox, oy) = (ox as i64, oy as i64);
+    let (x0, x1) = (ox.max(0), (ox + sw).min(dw));
+    let (y0, y1) = (oy.max(0), (oy + sh).min(dh));
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let row_bytes = dw as usize * 4;
+    let rows = &mut dst.data[y0 as usize * row_bytes..y1 as usize * row_bytes];
+    let work = |(row_index, dst_row): (usize, &mut [u8])| {
+        let sy = (y0 + row_index as i64 - oy) as usize;
+        let src_row = &src.data[sy * sw as usize * 4..(sy + 1) * sw as usize * 4];
+        let from = (x0 - ox) as usize * 4;
+        let to = (x1 - ox) as usize * 4;
+        let target = &mut dst_row[x0 as usize * 4..x1 as usize * 4];
+        for (d, s) in target
+            .chunks_exact_mut(4)
+            .zip(src_row[from..to].chunks_exact(4))
+        {
+            let color = blend_pixel(
+                Color {
+                    r: d[0],
+                    g: d[1],
+                    b: d[2],
+                    alpha: d[3],
+                },
+                Color {
+                    r: s[0],
+                    g: s[1],
+                    b: s[2],
+                    alpha: s[3],
+                },
+                blend,
+                premult,
+            );
+            d.copy_from_slice(&[color.r, color.g, color.b, color.alpha]);
         }
+    };
+    if (x1 - x0) * (y1 - y0) >= 16_384 {
+        rows.par_chunks_exact_mut(row_bytes)
+            .enumerate()
+            .for_each(work);
+    } else {
+        rows.chunks_exact_mut(row_bytes).enumerate().for_each(work);
     }
 }
 
@@ -3121,75 +3677,172 @@ fn blend_pixel(d: Color, s: Color, blend: Blend, src_premultiplied: bool) -> Col
         return d;
     }
 
-    let sa = s.alpha as f64 / 255.0;
-    let da = d.alpha as f64 / 255.0;
+    if blend == Blend::Over {
+        // The general arithmetic reduces exactly to these results (see the test
+        // `over_fast_paths_match_general_blend`).
+        if s.alpha == 255 {
+            return s;
+        }
+        if s.alpha == 0 && !src_premultiplied {
+            return if d.alpha == 0 { Color::TRANSPARENT } else { d };
+        }
+    }
+    if blend == Blend::Over {
+        return blend_over(d, s, src_premultiplied);
+    }
+    blend_general(d, s, blend, src_premultiplied)
+}
+
+/// `Blend::Over` with the same floating-point operations, in the same order, as the
+/// `fa = 1, fb = 1 - sa` case of [`blend_general`].
+#[inline]
+fn blend_over(d: Color, s: Color, src_premultiplied: bool) -> Color {
+    let sa = UNIT[s.alpha as usize];
+    let da = UNIT[d.alpha as usize];
+    let dfb = da * (1.0 - sa);
+    let out_a = sa + dfb;
+    if out_a <= 0.0 {
+        return Color::TRANSPARENT;
+    }
+    let channel = |s: u8, d: u8| -> u8 {
+        let sp = if src_premultiplied {
+            UNIT[s as usize]
+        } else {
+            UNIT[s as usize] * sa
+        };
+        round_u8_f64((sp + dfb * UNIT[d as usize]) / out_a * 255.0)
+    };
+    Color {
+        r: channel(s.r, d.r),
+        g: channel(s.g, d.g),
+        b: channel(s.b, d.b),
+        alpha: round_u8_f64(out_a * 255.0),
+    }
+}
+
+/// Separable blend function `B(cb, cs)` on non-premultiplied backdrop/source values.
+#[inline(always)]
+fn separable(mode: Blend, cb: f64, cs: f64) -> f64 {
+    match mode {
+        Blend::Multiply => cb * cs,
+        Blend::Screen => cb + cs - cb * cs,
+        Blend::Overlay => {
+            if cb <= 0.5 {
+                2.0 * cb * cs
+            } else {
+                1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
+            }
+        }
+        Blend::Darken => cb.min(cs),
+        Blend::Lighten => cb.max(cs),
+        Blend::Difference => (cb - cs).abs(),
+        Blend::Exclusion => cb + cs - 2.0 * cb * cs,
+        Blend::HardLight => {
+            if cs <= 0.5 {
+                2.0 * cb * cs
+            } else {
+                1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
+            }
+        }
+        Blend::SoftLight => {
+            let d = if cb <= 0.25 {
+                ((16.0 * cb - 12.0) * cb + 4.0) * cb
+            } else {
+                cb.sqrt()
+            };
+            if cs <= 0.5 {
+                cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
+            } else {
+                cb + (2.0 * cs - 1.0) * (d - cb)
+            }
+        }
+        Blend::ColourDodge | Blend::ColorDodge => {
+            if cs >= 1.0 {
+                1.0
+            } else if cb <= 0.0 {
+                0.0
+            } else {
+                (cb / (1.0 - cs)).min(1.0)
+            }
+        }
+        Blend::ColourBurn | Blend::ColorBurn => {
+            if cs <= 0.0 {
+                0.0
+            } else if cb >= 1.0 {
+                1.0
+            } else {
+                1.0 - ((1.0 - cb) / cs).min(1.0)
+            }
+        }
+        _ => cs,
+    }
+}
+
+/// The separable family of `composite` blend modes, monomorphised per mode by the caller.
+#[inline(always)]
+fn blend_separable(
+    d: Color,
+    s: Color,
+    src_premultiplied: bool,
+    sep: impl Fn(f64, f64) -> f64,
+) -> Color {
+    let sa = UNIT[s.alpha as usize];
+    let da = UNIT[d.alpha as usize];
+    let out_a = sa + da - sa * da;
+    if out_a <= 0.0 {
+        return Color::TRANSPARENT;
+    }
+    let channel = |s: u8, d: u8| -> u8 {
+        let a = if src_premultiplied {
+            UNIT[s as usize]
+        } else {
+            UNIT[s as usize] * sa
+        };
+        let b = da * UNIT[d as usize];
+        let premult = (1.0 - da) * a + (1.0 - sa) * b + sa * da * sep(b, a);
+        round_u8_f64(premult / out_a * 255.0)
+    };
+    Color {
+        r: channel(s.r, d.r),
+        g: channel(s.g, d.g),
+        b: channel(s.b, d.b),
+        alpha: round_u8_f64(out_a * 255.0),
+    }
+}
+
+fn blend_general(d: Color, s: Color, blend: Blend, src_premultiplied: bool) -> Color {
+    macro_rules! separable_arm {
+        ($mode:expr) => {
+            return blend_separable(d, s, src_premultiplied, |cb, cs| separable($mode, cb, cs))
+        };
+    }
+    match blend {
+        Blend::Multiply => separable_arm!(Blend::Multiply),
+        Blend::Screen => separable_arm!(Blend::Screen),
+        Blend::Overlay => separable_arm!(Blend::Overlay),
+        Blend::Darken => separable_arm!(Blend::Darken),
+        Blend::Lighten => separable_arm!(Blend::Lighten),
+        Blend::Difference => separable_arm!(Blend::Difference),
+        Blend::Exclusion => separable_arm!(Blend::Exclusion),
+        Blend::HardLight => separable_arm!(Blend::HardLight),
+        Blend::SoftLight => separable_arm!(Blend::SoftLight),
+        Blend::ColourDodge | Blend::ColorDodge => separable_arm!(Blend::ColourDodge),
+        Blend::ColourBurn | Blend::ColorBurn => separable_arm!(Blend::ColourBurn),
+        _ => {}
+    }
+    let sa = UNIT[s.alpha as usize];
+    let da = UNIT[d.alpha as usize];
     // Premultiplied overlay colour (`A'`): with `premultiplied: true` the stored values are
     // used as-is, even where they exceed the alpha (libvips does not clamp them).
     let sp = [s.r, s.g, s.b].map(|c| {
-        let c = c as f64 / 255.0;
+        let c = UNIT[c as usize];
         if src_premultiplied {
             c
         } else {
             c * sa
         }
     });
-    let dst = [d.r as f64 / 255.0, d.g as f64 / 255.0, d.b as f64 / 255.0];
-
-    let separable = |mode: Blend, cb: f64, cs: f64| -> f64 {
-        match mode {
-            Blend::Multiply => cb * cs,
-            Blend::Screen => cb + cs - cb * cs,
-            Blend::Overlay => {
-                if cb <= 0.5 {
-                    2.0 * cb * cs
-                } else {
-                    1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
-                }
-            }
-            Blend::Darken => cb.min(cs),
-            Blend::Lighten => cb.max(cs),
-            Blend::Difference => (cb - cs).abs(),
-            Blend::Exclusion => cb + cs - 2.0 * cb * cs,
-            Blend::HardLight => {
-                if cs <= 0.5 {
-                    2.0 * cb * cs
-                } else {
-                    1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
-                }
-            }
-            Blend::SoftLight => {
-                let d = if cb <= 0.25 {
-                    ((16.0 * cb - 12.0) * cb + 4.0) * cb
-                } else {
-                    cb.sqrt()
-                };
-                if cs <= 0.5 {
-                    cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
-                } else {
-                    cb + (2.0 * cs - 1.0) * (d - cb)
-                }
-            }
-            Blend::ColourDodge | Blend::ColorDodge => {
-                if cs >= 1.0 {
-                    1.0
-                } else if cb <= 0.0 {
-                    0.0
-                } else {
-                    (cb / (1.0 - cs)).min(1.0)
-                }
-            }
-            Blend::ColourBurn | Blend::ColorBurn => {
-                if cs <= 0.0 {
-                    0.0
-                } else if cb >= 1.0 {
-                    1.0
-                } else {
-                    1.0 - ((1.0 - cb) / cs).min(1.0)
-                }
-            }
-            _ => cs,
-        }
-    };
+    let dst = [UNIT[d.r as usize], UNIT[d.g as usize], UNIT[d.b as usize]];
 
     // (output alpha, premultiplied output colour)
     let (out_a, premult): (f64, [f64; 3]) = match blend {
@@ -3235,14 +3888,14 @@ fn blend_pixel(d: Color, s: Color, blend: Blend, src_premultiplied: bool) -> Col
         if out_a <= 0.0 {
             return 0;
         }
-        (premult[index] / out_a * 255.0).clamp(0.0, 255.0).round() as u8
+        round_u8_f64(premult[index] / out_a * 255.0)
     };
 
     Color {
         r: channel(0),
         g: channel(1),
         b: channel(2),
-        alpha: (out_a * 255.0).round() as u8,
+        alpha: round_u8_f64(out_a * 255.0),
     }
 }
 
@@ -3572,5 +4225,391 @@ pub fn apply_output_colourspace(image: &mut Image, space: &str) -> Result<()> {
         other => Err(FastpkgError::UnsupportedOutput(format!(
             "colourspace {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lcg(state: &mut u64) -> u8 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 33) as u8
+    }
+
+    #[test]
+    fn over_fast_paths_match_general_blend() {
+        let mut state = 7u64;
+        for premultiplied in [false, true] {
+            for sa in [0u8, 255] {
+                for da in 0..=255u8 {
+                    for _ in 0..4000 {
+                        let d = Color {
+                            r: lcg(&mut state),
+                            g: lcg(&mut state),
+                            b: lcg(&mut state),
+                            alpha: da,
+                        };
+                        let s = Color {
+                            r: lcg(&mut state),
+                            g: lcg(&mut state),
+                            b: lcg(&mut state),
+                            alpha: sa,
+                        };
+                        assert_eq!(
+                            blend_pixel(d, s, Blend::Over, premultiplied),
+                            blend_general(d, s, Blend::Over, premultiplied),
+                            "{d:?} {s:?} premultiplied {premultiplied}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blend_over_matches_general() {
+        let mut state = 31u64;
+        for premultiplied in [false, true] {
+            for _ in 0..3_000_000 {
+                let d = Color {
+                    r: lcg(&mut state),
+                    g: lcg(&mut state),
+                    b: lcg(&mut state),
+                    alpha: lcg(&mut state),
+                };
+                let s = Color {
+                    r: lcg(&mut state),
+                    g: lcg(&mut state),
+                    b: lcg(&mut state),
+                    alpha: lcg(&mut state),
+                };
+                assert_eq!(
+                    blend_over(d, s, premultiplied),
+                    blend_general(d, s, Blend::Over, premultiplied),
+                    "{d:?} {s:?} premultiplied {premultiplied}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn morphology_matches_naive_window() {
+        let mut state = 5u64;
+        for (w, h, radius, dilate) in [
+            (13usize, 9usize, 1u32, true),
+            (13, 9, 3, false),
+            (40, 11, 9, true),
+            (7, 30, 25, false),
+            (3, 3, 80, true),
+            (64, 64, 8, false),
+        ] {
+            let data: Vec<u8> = (0..w * h * 4).map(|_| lcg(&mut state)).collect();
+            let image = Image::from_rgba(w as u32, h as u32, data.clone()).unwrap();
+            let out = morphology(image, radius, dilate).unwrap().data;
+            let r = radius as i64;
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..4 {
+                        let mut value = if dilate { 0u8 } else { 255u8 };
+                        if c == 3 {
+                            value = data[(y * w + x) * 4 + 3];
+                        } else {
+                            for dy in -r..=r {
+                                for dx in -r..=r {
+                                    let sx = (x as i64 + dx).clamp(0, w as i64 - 1) as usize;
+                                    let sy = (y as i64 + dy).clamp(0, h as i64 - 1) as usize;
+                                    let v = data[(sy * w + sx) * 4 + c];
+                                    value = if dilate { value.max(v) } else { value.min(v) };
+                                }
+                            }
+                        }
+                        assert_eq!(
+                            out[(y * w + x) * 4 + c],
+                            value,
+                            "{w}x{h} r{radius} ({x},{y},{c})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reciprocal_division_is_exact() {
+        for alpha in 1..=255u64 {
+            for colour in 0..=255u64 {
+                let n = colour * 255;
+                assert_eq!((n * RECIPROCAL[alpha as usize]) >> 32, n / alpha);
+            }
+        }
+    }
+
+    #[test]
+    fn median9_matches_sorting() {
+        let mut state = 17u64;
+        for _ in 0..200_000 {
+            let mut values = [0f32; 9];
+            for v in &mut values {
+                *v = (lcg(&mut state) % 7) as f32 * 0.25 + (lcg(&mut state) % 2) as f32;
+            }
+            let mut sorted = values;
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            assert_eq!(median9(values), sorted[4], "{values:?}");
+        }
+    }
+
+    #[test]
+    fn rounding_helpers_match_std() {
+        let mut state = 99u64;
+        for _ in 0..2_000_000 {
+            let value = (lcg(&mut state) as f64) * 1.0307 + (lcg(&mut state) as f64) / 256.0 - 7.0;
+            assert_eq!(round_u8_f64(value), value.clamp(0.0, 255.0).round() as u8);
+        }
+        for half in 0..=510 {
+            let value = half as f64 / 2.0;
+            assert_eq!(round_u8_f64(value), value.clamp(0.0, 255.0).round() as u8);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_blend() {
+        let mut state = 5u64;
+        let px: Vec<(Color, Color)> = (0..2_000_000)
+            .map(|_| {
+                (
+                    Color {
+                        r: lcg(&mut state),
+                        g: lcg(&mut state),
+                        b: lcg(&mut state),
+                        alpha: 100 + lcg(&mut state) % 100,
+                    },
+                    Color {
+                        r: lcg(&mut state),
+                        g: lcg(&mut state),
+                        b: lcg(&mut state),
+                        alpha: 100 + lcg(&mut state) % 100,
+                    },
+                )
+            })
+            .collect();
+        for blend in [
+            Blend::Over,
+            Blend::Multiply,
+            Blend::SoftLight,
+            Blend::Screen,
+        ] {
+            let t = std::time::Instant::now();
+            let mut acc = 0u32;
+            for &(d, s) in &px {
+                let c = blend_pixel(d, s, blend, false);
+                acc = acc.wrapping_add(c.r as u32 + c.g as u32 + c.b as u32 + c.alpha as u32);
+            }
+            println!(
+                "{blend:?}: {:.1} ns/px ({acc})",
+                t.elapsed().as_nanos() as f64 / px.len() as f64
+            );
+        }
+    }
+
+    /// The straightforward implementation (before the table lookups and monomorphised
+    /// separable modes), kept as the reference the optimised code must reproduce exactly.
+    fn reference_blend(d: Color, s: Color, blend: Blend, src_premultiplied: bool) -> Color {
+        if blend == Blend::Clear {
+            return Color::TRANSPARENT;
+        }
+        if blend == Blend::Source {
+            return s;
+        }
+        if blend == Blend::Dest {
+            return d;
+        }
+
+        let sa = s.alpha as f64 / 255.0;
+        let da = d.alpha as f64 / 255.0;
+        // Premultiplied overlay colour (`A'`): with `premultiplied: true` the stored values are
+        // used as-is, even where they exceed the alpha (libvips does not clamp them).
+        let sp = [s.r, s.g, s.b].map(|c| {
+            let c = c as f64 / 255.0;
+            if src_premultiplied {
+                c
+            } else {
+                c * sa
+            }
+        });
+        let dst = [d.r as f64 / 255.0, d.g as f64 / 255.0, d.b as f64 / 255.0];
+
+        let separable = |mode: Blend, cb: f64, cs: f64| -> f64 {
+            match mode {
+                Blend::Multiply => cb * cs,
+                Blend::Screen => cb + cs - cb * cs,
+                Blend::Overlay => {
+                    if cb <= 0.5 {
+                        2.0 * cb * cs
+                    } else {
+                        1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
+                    }
+                }
+                Blend::Darken => cb.min(cs),
+                Blend::Lighten => cb.max(cs),
+                Blend::Difference => (cb - cs).abs(),
+                Blend::Exclusion => cb + cs - 2.0 * cb * cs,
+                Blend::HardLight => {
+                    if cs <= 0.5 {
+                        2.0 * cb * cs
+                    } else {
+                        1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
+                    }
+                }
+                Blend::SoftLight => {
+                    let d = if cb <= 0.25 {
+                        ((16.0 * cb - 12.0) * cb + 4.0) * cb
+                    } else {
+                        cb.sqrt()
+                    };
+                    if cs <= 0.5 {
+                        cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
+                    } else {
+                        cb + (2.0 * cs - 1.0) * (d - cb)
+                    }
+                }
+                Blend::ColourDodge | Blend::ColorDodge => {
+                    if cs >= 1.0 {
+                        1.0
+                    } else if cb <= 0.0 {
+                        0.0
+                    } else {
+                        (cb / (1.0 - cs)).min(1.0)
+                    }
+                }
+                Blend::ColourBurn | Blend::ColorBurn => {
+                    if cs <= 0.0 {
+                        0.0
+                    } else if cb >= 1.0 {
+                        1.0
+                    } else {
+                        1.0 - ((1.0 - cb) / cs).min(1.0)
+                    }
+                }
+                _ => cs,
+            }
+        };
+
+        // (output alpha, premultiplied output colour)
+        let (out_a, premult): (f64, [f64; 3]) = match blend {
+            Blend::Atop => (da, [0, 1, 2].map(|i| sp[i] + (1.0 - sa) * da * dst[i])),
+            Blend::DestAtop => (sa, [0, 1, 2].map(|i| (1.0 - da) * sp[i] + da * dst[i])),
+            Blend::Add => ((sa + da).min(1.0), [0, 1, 2].map(|i| sp[i] + da * dst[i])),
+            Blend::Saturate => (
+                (sa + da).min(1.0),
+                [0, 1, 2].map(|i| sa.min(1.0 - da) * sp[i] + da * dst[i]),
+            ),
+            Blend::Over
+            | Blend::In
+            | Blend::Out
+            | Blend::DestOver
+            | Blend::DestIn
+            | Blend::DestOut
+            | Blend::Xor => {
+                let (fa, fb) = match blend {
+                    Blend::In => (da, 0.0),
+                    Blend::Out => (1.0 - da, 0.0),
+                    Blend::DestOver => (1.0 - da, 1.0),
+                    Blend::DestIn => (0.0, sa),
+                    Blend::DestOut => (0.0, 1.0 - sa),
+                    Blend::Xor => (1.0 - da, 1.0 - sa),
+                    _ => (1.0, 1.0 - sa),
+                };
+                (
+                    sa * fa + da * fb,
+                    [0, 1, 2].map(|i| fa * sp[i] + da * fb * dst[i]),
+                )
+            }
+            _ => (
+                sa + da - sa * da,
+                [0, 1, 2].map(|i| {
+                    let a = sp[i];
+                    let b = da * dst[i];
+                    (1.0 - da) * a + (1.0 - sa) * b + sa * da * separable(blend, b, a)
+                }),
+            ),
+        };
+
+        let channel = |index: usize| -> u8 {
+            if out_a <= 0.0 {
+                return 0;
+            }
+            (premult[index] / out_a * 255.0).clamp(0.0, 255.0).round() as u8
+        };
+
+        Color {
+            r: channel(0),
+            g: channel(1),
+            b: channel(2),
+            alpha: (out_a * 255.0).round() as u8,
+        }
+    }
+
+    #[test]
+    fn optimised_blends_match_reference() {
+        let blends = [
+            Blend::Clear,
+            Blend::Source,
+            Blend::Over,
+            Blend::In,
+            Blend::Out,
+            Blend::Atop,
+            Blend::Dest,
+            Blend::DestOver,
+            Blend::DestIn,
+            Blend::DestOut,
+            Blend::DestAtop,
+            Blend::Xor,
+            Blend::Add,
+            Blend::Saturate,
+            Blend::Multiply,
+            Blend::Screen,
+            Blend::Overlay,
+            Blend::Darken,
+            Blend::Lighten,
+            Blend::ColourDodge,
+            Blend::ColourBurn,
+            Blend::HardLight,
+            Blend::SoftLight,
+            Blend::Difference,
+            Blend::Exclusion,
+        ];
+        let mut state = 1234u64;
+        for blend in blends {
+            for premultiplied in [false, true] {
+                for round in 0..400_000 {
+                    // Mix fully random pixels with extreme alphas and colours.
+                    let pick = |state: &mut u64| match round % 7 {
+                        0 => [0u8, 255][(lcg(state) & 1) as usize],
+                        _ => lcg(state),
+                    };
+                    let d = Color {
+                        r: pick(&mut state),
+                        g: pick(&mut state),
+                        b: pick(&mut state),
+                        alpha: pick(&mut state),
+                    };
+                    let s = Color {
+                        r: pick(&mut state),
+                        g: pick(&mut state),
+                        b: pick(&mut state),
+                        alpha: pick(&mut state),
+                    };
+                    assert_eq!(
+                        blend_pixel(d, s, blend, premultiplied),
+                        reference_blend(d, s, blend, premultiplied),
+                        "{blend:?} {d:?} {s:?} premultiplied {premultiplied}"
+                    );
+                }
+            }
+        }
     }
 }
