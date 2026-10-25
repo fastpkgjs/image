@@ -134,6 +134,10 @@ await image('input.png')
 // layouts: dz, google, zoomify, iiif, iiif3; .zip/.szi writes a zip archive
 ```
 
+### TypeScript
+
+The typings mirror sharp's, name for name (`sharp.Metadata`, `sharp.OutputInfo`, `sharp.ResizeOptions`, `sharp.JpegOptions`, ...), for `import`, `require` and `import x = require()`, so swapping the module specifier is enough. `npm run test:types` compiles the same sources against both packages under every `module`/`moduleResolution` mode.
+
 ## Formats
 
 | Format | Decode | Encode | Notes |
@@ -202,6 +206,10 @@ Also included: `gradientMap`, `gradientRecolor`, `fill`, `paletteSwap`, `alphaFr
 - The JS API produces one `PipelineSpec`; Rust executes the whole plan on a dedicated worker thread.
 - Resize uses `fast_image_resize` SIMD kernels (AVX2/SSE4.1/NEON) and rayon tiling. AVIF/JXL/PNG/JPEG codecs use their own internal threading where available.
 - JPEG targets are DCT-scaled during decode when a resize hint is present.
+
+### Memory on glibc Linux
+
+glibc raises its mmap threshold every time a large mmapped block is freed, so after a few iterations megabyte-sized pixel buffers are served from per-thread arenas and are never returned to the OS; a long-running service decoding and encoding 1024x1024 RGBA images then settles at about twice the memory it needs. On `linux-*-gnu` the addon pins the threshold at 4 MiB when it loads (`mallopt(M_MMAP_THRESHOLD)`), which turns the dynamic behaviour off for the whole process. musl, macOS and Windows do not have this behaviour and are left alone. Set `FASTPKG_MALLOC_TUNING=0` to skip it; an explicit `MALLOC_MMAP_THRESHOLD_`, `MALLOC_TOP_PAD_` or `GLIBC_TUNABLES` in the environment also takes precedence. `node bench/mem.mjs` measures steady-state RSS against sharp.
 
 ## Parallel JPEG encoding (opt-in)
 
