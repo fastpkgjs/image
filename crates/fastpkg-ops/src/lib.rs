@@ -873,61 +873,135 @@ fn trim(
     margin: u32,
 ) -> Result<Image> {
     let (w, h) = (image.width as usize, image.height as usize);
+    // Alpha-premultiplied ("flattened") colour of a pixel, in float.
     let flat = |px: &[u8]| -> [f32; 3] {
-        let a = px[3] as f32 / 255.0;
+        let a = ALPHA_FACTOR[px[3] as usize];
         [px[0] as f32 * a, px[1] as f32 * a, px[2] as f32 * a]
     };
-    let mut values: Vec<[f32; 3]> = image.data.chunks_exact(4).map(flat).collect();
-    if !line_art && w > 1 && h > 1 {
-        let source = values.clone();
-        values.par_iter_mut().enumerate().for_each(|(index, out)| {
-            let (x, y) = ((index % w) as isize, (index / w) as isize);
-            for (c, slot) in out.iter_mut().enumerate() {
-                let mut window = [0f32; 9];
-                let mut n = 0;
-                for dy in -1..=1isize {
-                    for dx in -1..=1isize {
-                        let sx = (x + dx).clamp(0, w as isize - 1) as usize;
-                        let sy = (y + dy).clamp(0, h as isize - 1) as usize;
-                        window[n] = source[sy * w + sx][c];
-                        n += 1;
-                    }
-                }
-                window.sort_by(|a, b| a.total_cmp(b));
-                *slot = window[4];
+    // libvips trim runs a 3x3 median over the flattened image first (not for line art).
+    let median_filter = !line_art && w > 1 && h > 1;
+    // Planar flattened rows, one extra replicated pixel on each side: [channel][x + 1].
+    let plane = w + 2;
+    let flat_row = |y: usize, out: &mut [f32]| {
+        for (x, px) in image.data[y * w * 4..(y + 1) * w * 4]
+            .chunks_exact(4)
+            .enumerate()
+        {
+            let value = flat(px);
+            for c in 0..3 {
+                out[c * plane + x + 1] = value[c];
             }
-        });
-    }
+        }
+        for c in 0..3 {
+            out[c * plane] = out[c * plane + 1];
+            out[c * plane + w + 1] = out[c * plane + w];
+        }
+    };
     let bg = match background {
         Some(text) => {
             let color = Color::parse(text)
                 .ok_or_else(|| FastpkgError::InvalidOptions(format!("invalid color {text}")))?;
             flat(&[color.r, color.g, color.b, color.alpha])
         }
-        None => values.first().copied().unwrap_or([0.0; 3]),
+        None if w == 0 || h == 0 => [0.0; 3],
+        None if !median_filter => flat(&image.data[..4]),
+        None => {
+            // The first (top-left) filtered pixel: rows -1 and 0 are both row 0.
+            let mut row0 = vec![0f32; 3 * plane];
+            let mut row1 = vec![0f32; 3 * plane];
+            flat_row(0, &mut row0);
+            flat_row(1, &mut row1);
+            [0, 1, 2].map(|c| {
+                let at = |row: &[f32], dx: usize| row[c * plane + dx];
+                median9([
+                    at(&row0, 0),
+                    at(&row0, 1),
+                    at(&row0, 2),
+                    at(&row0, 0),
+                    at(&row0, 1),
+                    at(&row0, 2),
+                    at(&row1, 0),
+                    at(&row1, 1),
+                    at(&row1, 2),
+                ])
+            })
+        }
     };
-    let mut left = w;
-    let mut top = h;
-    let mut right = 0usize;
-    let mut bottom = 0usize;
-    let mut found = false;
-    for (index, v) in values.iter().enumerate() {
+    let differs = |v: [f32; 3]| -> bool {
         let diff = (v[0] - bg[0])
             .abs()
             .max((v[1] - bg[1]).abs())
             .max((v[2] - bg[2]).abs());
-        if f64::from(diff) > threshold {
-            let (x, y) = (index % w, index / w);
-            left = left.min(x);
-            top = top.min(y);
-            right = right.max(x);
-            bottom = bottom.max(y);
-            found = true;
-        }
-    }
-    if !found {
+        f64::from(diff) > threshold
+    };
+    // Per block of rows: (first row with a differing pixel, last such row, left, right).
+    const BLOCK: usize = 32;
+    let blocks: Vec<usize> = (0..h).step_by(BLOCK).collect();
+    let bounds = blocks
+        .par_iter()
+        .map(|&y0| {
+            let y1 = (y0 + BLOCK).min(h);
+            let lo = if median_filter {
+                y0.saturating_sub(1)
+            } else {
+                y0
+            };
+            let hi = if median_filter { y1.min(h - 1) } else { y1 - 1 };
+            let mut rows = vec![0f32; (hi - lo + 1) * 3 * plane];
+            for (i, row) in rows.chunks_exact_mut(3 * plane).enumerate() {
+                flat_row(lo + i, row);
+            }
+            let row_at = |y: usize| &rows[(y - lo) * 3 * plane..(y - lo + 1) * 3 * plane];
+            let mut found: Option<(usize, usize, usize, usize)> = None;
+            let mut filtered = vec![0f32; 3 * w];
+            for y in y0..y1 {
+                if median_filter {
+                    let triple = [
+                        row_at(y.saturating_sub(1)),
+                        row_at(y),
+                        row_at((y + 1).min(h - 1)),
+                    ];
+                    for c in 0..3 {
+                        median_row(
+                            [
+                                &triple[0][c * plane..(c + 1) * plane],
+                                &triple[1][c * plane..(c + 1) * plane],
+                                &triple[2][c * plane..(c + 1) * plane],
+                            ],
+                            &mut filtered[c * w..(c + 1) * w],
+                        );
+                    }
+                } else {
+                    let row = row_at(y);
+                    for c in 0..3 {
+                        filtered[c * w..(c + 1) * w]
+                            .copy_from_slice(&row[c * plane + 1..c * plane + 1 + w]);
+                    }
+                }
+                let at = |x: usize| [filtered[x], filtered[w + x], filtered[2 * w + x]];
+                let first = (0..w).find(|&x| differs(at(x)));
+                if let Some(first) = first {
+                    let last = (first..w).rev().find(|&x| differs(at(x))).unwrap_or(first);
+                    found = Some(match found {
+                        None => (y, y, first, last),
+                        Some((top, _, left, right)) => (top, y, left.min(first), right.max(last)),
+                    });
+                }
+            }
+            found
+        })
+        .reduce(
+            || None,
+            |a, b| match (a, b) {
+                (None, other) | (other, None) => other,
+                (Some((t1, b1, l1, r1)), Some((t2, b2, l2, r2))) => {
+                    Some((t1.min(t2), b1.max(b2), l1.min(l2), r1.max(r2)))
+                }
+            },
+        );
+    let Some((top, bottom, left, right)) = bounds else {
         return Ok(image);
-    }
+    };
     let margin = margin as usize;
     let left = left.saturating_sub(margin);
     let top = top.saturating_sub(margin);
@@ -941,6 +1015,76 @@ fn trim(
         (bottom - top + 1) as u32,
     )
 }
+
+/// Median of nine values through a sorting network (exact: no arithmetic is involved).
+#[inline]
+fn median9(mut p: [f32; 9]) -> f32 {
+    #[inline(always)]
+    fn sort(p: &mut [f32; 9], a: usize, b: usize) {
+        if p[a] > p[b] {
+            p.swap(a, b);
+        }
+    }
+    for (a, b) in MEDIAN9_NETWORK {
+        sort(&mut p, a, b);
+    }
+    p[4]
+}
+
+/// 3x3 median of one channel for a whole row. `rows` are the three source rows (each with one
+/// replicated pixel on both sides, so `rows[r][x..x + 3]` is the window of output `x`).
+fn median_row(rows: [&[f32]; 3], out: &mut [f32]) {
+    const L: usize = 8;
+    #[inline(always)]
+    fn sort(p: &mut [[f32; L]; 9], a: usize, b: usize) {
+        for i in 0..L {
+            let (x, y) = (p[a][i], p[b][i]);
+            p[a][i] = x.min(y);
+            p[b][i] = x.max(y);
+        }
+    }
+    let w = out.len();
+    let mut x = 0;
+    while x < w {
+        let n = L.min(w - x);
+        let mut p = [[0f32; L]; 9];
+        for (r, row) in rows.iter().enumerate() {
+            for d in 0..3 {
+                for i in 0..L {
+                    // Lanes past the end repeat the last pixel; their results are discarded.
+                    p[r * 3 + d][i] = row[(x + i).min(w - 1) + d];
+                }
+            }
+        }
+        for (a, b) in MEDIAN9_NETWORK {
+            sort(&mut p, a, b);
+        }
+        out[x..x + n].copy_from_slice(&p[4][..n]);
+        x += n;
+    }
+}
+
+const MEDIAN9_NETWORK: [(usize, usize); 19] = [
+    (1, 2),
+    (4, 5),
+    (7, 8),
+    (0, 1),
+    (3, 4),
+    (6, 7),
+    (1, 2),
+    (4, 5),
+    (7, 8),
+    (0, 3),
+    (5, 8),
+    (4, 7),
+    (3, 6),
+    (1, 4),
+    (2, 5),
+    (4, 7),
+    (4, 2),
+    (6, 4),
+    (4, 2),
+];
 
 fn flip(mut image: Image, flip: bool) -> Result<Image> {
     if !flip {
@@ -1642,48 +1786,122 @@ fn median(image: Image, size: u32) -> Result<Image> {
     Ok(out_image)
 }
 
+/// `dst[i] = max(dst[i], src[i])` (or `min`), which compiles to `pmaxub`/`pminub`.
+#[inline(always)]
+fn fold_extreme(dst: &mut [u8], src: &[u8], dilate: bool) {
+    if dilate {
+        for (a, &b) in dst.iter_mut().zip(src) {
+            *a = (*a).max(b);
+        }
+    } else {
+        for (a, &b) in dst.iter_mut().zip(src) {
+            *a = (*a).min(b);
+        }
+    }
+}
+
+/// Copies the alpha byte of every RGBA pixel from `source` into `target`.
+#[inline(always)]
+fn restore_alpha(target: &mut [u8], source: &[u8]) {
+    for (t, s) in target.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+        let word = (u32::from_le_bytes([t[0], t[1], t[2], t[3]]) & 0x00FF_FFFF)
+            | (u32::from_le_bytes([s[0], s[1], s[2], s[3]]) & 0xFF00_0000);
+        t.copy_from_slice(&word.to_le_bytes());
+    }
+}
+
+/// `dst[i] = extreme of padded[i + k * stride]` for `k` in `0..count`. Wide windows use
+/// power-of-two partial results so the cost grows with `log(count)`.
+fn window_extreme(
+    dst: &mut [u8],
+    padded: &[u8],
+    count: usize,
+    stride: usize,
+    dilate: bool,
+    scratch: &mut [Vec<u8>; 2],
+) {
+    let n = dst.len();
+    if count <= 16 {
+        dst.copy_from_slice(&padded[..n]);
+        for k in 1..count {
+            fold_extreme(dst, &padded[k * stride..k * stride + n], dilate);
+        }
+        return;
+    }
+    let mut span = 1;
+    let mut len = padded.len();
+    scratch[0].clear();
+    scratch[0].extend_from_slice(padded);
+    let mut current = 0;
+    while span * 2 <= count {
+        let shift = span * stride;
+        len -= shift;
+        let (head, tail) = scratch.split_at_mut(1);
+        let (source, target) = if current == 0 {
+            (&head[0], &mut tail[0])
+        } else {
+            (&tail[0], &mut head[0])
+        };
+        target.clear();
+        target.extend_from_slice(&source[..len]);
+        fold_extreme(target, &source[shift..shift + len], dilate);
+        current ^= 1;
+        span *= 2;
+    }
+    let source = &scratch[current];
+    dst.copy_from_slice(&source[..n]);
+    let offset = (count - span) * stride;
+    fold_extreme(dst, &source[offset..offset + n], dilate);
+}
+
 fn morphology(image: Image, width: u32, dilate: bool) -> Result<Image> {
-    let radius = width.max(1) as i32;
+    let radius = width.max(1) as usize;
     let w = image.width as usize;
     let h = image.height as usize;
-    let mut horizontal = vec![0u8; image.data.len()];
+    let row_len = w * 4;
+    let mut image = image;
+    if w == 0 || h == 0 {
+        return Ok(image);
+    }
+    let mut data = std::mem::take(&mut image.data);
+    let mut horizontal = vec![0u8; data.len()];
+    // Horizontal pass: a window of 2 * radius + 1 pixels with the edge pixels replicated. All four
+    // bytes are folded together; alpha is put back from the source afterwards.
     horizontal
-        .par_chunks_exact_mut(w * 4)
-        .enumerate()
-        .for_each(|(y, row)| {
-            for x in 0..w {
-                for c in 0..3 {
-                    let mut value = if dilate { 0u8 } else { 255u8 };
-                    for dx in -radius..=radius {
-                        let sx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
-                        let v = image.data[(y * w + sx) * 4 + c];
-                        value = if dilate { value.max(v) } else { value.min(v) };
-                    }
-                    row[x * 4 + c] = value;
+        .par_chunks_exact_mut(row_len)
+        .zip(data.par_chunks_exact(row_len))
+        .for_each_init(
+            || (Vec::<u8>::new(), [Vec::<u8>::new(), Vec::<u8>::new()]),
+            |(padded, scratch), (dst, src)| {
+                padded.clear();
+                for _ in 0..radius {
+                    padded.extend_from_slice(&src[..4]);
                 }
-                row[x * 4 + 3] = image.data[(y * w + x) * 4 + 3];
-            }
-        });
-    let mut out = horizontal.clone();
-    out.par_chunks_exact_mut(w * 4)
-        .enumerate()
-        .for_each(|(y, row)| {
-            for x in 0..w {
-                for c in 0..3 {
-                    let mut value = if dilate { 0u8 } else { 255u8 };
-                    for dy in -radius..=radius {
-                        let sy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
-                        let v = horizontal[(sy * w + x) * 4 + c];
-                        value = if dilate { value.max(v) } else { value.min(v) };
-                    }
-                    row[x * 4 + c] = value;
+                padded.extend_from_slice(src);
+                for _ in 0..radius {
+                    padded.extend_from_slice(&src[row_len - 4..]);
                 }
+                window_extreme(dst, padded, 2 * radius + 1, 4, dilate, scratch);
+                restore_alpha(dst, src);
+            },
+        );
+    // Vertical pass, written over the source buffer.
+    data.par_chunks_exact_mut(row_len)
+        .enumerate()
+        .for_each(|(y, dst)| {
+            let row = |d: usize| {
+                let sy = (y + d).saturating_sub(radius).min(h - 1);
+                &horizontal[sy * row_len..(sy + 1) * row_len]
+            };
+            dst.copy_from_slice(row(0));
+            for d in 1..=2 * radius {
+                fold_extreme(dst, row(d), dilate);
             }
+            restore_alpha(dst, &horizontal[y * row_len..(y + 1) * row_len]);
         });
-    let mut out_image = Image::from_rgba(image.width, image.height, out)?;
-    out_image.format = image.format;
-    out_image.has_alpha = image.has_alpha;
-    Ok(out_image)
+    image.data = data;
+    image.wide = None;
+    Ok(image)
 }
 
 fn flatten(mut image: Image, background: &str) -> Result<Image> {
@@ -1906,6 +2124,18 @@ fn clahe(image: Image, width: u32, height: u32, max_slope: f64) -> Result<Image>
     Ok(result)
 }
 
+/// `x.clamp(0.0, 255.0) as u8` (truncation; NaN becomes 0) in a form that vectorises: the
+/// saturating float-to-int cast does not, so the integer part is read from the mantissa after
+/// adding 2^23.
+#[inline(always)]
+fn trunc_u8(x: f32) -> u8 {
+    const MAGIC: f32 = 8_388_608.0;
+    let x = x.max(0.0).min(255.0);
+    let nearest = (x + MAGIC) - MAGIC;
+    let floor = nearest - f32::from(u8::from(nearest > x));
+    (floor + MAGIC).to_bits() as u8
+}
+
 fn convolve(
     image: Image,
     width: u32,
@@ -1918,82 +2148,138 @@ fn convolve(
     let h = image.height as usize;
     let kw = width as usize;
     let kh = height as usize;
-    let cx = kw as i32 / 2;
-    let cy = kh as i32 / 2;
+    let cx = kw / 2;
+    let cy = kh / 2;
     let scale = scale.unwrap_or_else(|| kernel.iter().sum::<f64>());
     let scale = if scale.abs() < 1e-12 { 1.0 } else { scale } as f32;
     let weights = kernel.iter().map(|value| *value as f32).collect::<Vec<_>>();
+    let offset = offset as f32;
     // sharp premultiplies RGBA input before convolving (and unpremultiplies afterwards), and
     // convolves the alpha band as well.
-    let premultiply = image.has_alpha;
-    let source: Vec<u8> = if premultiply {
-        image
-            .data
-            .chunks_exact(4)
-            .flat_map(|px| {
-                let a = px[3] as u32;
-                [
-                    (px[0] as u32 * a / 255) as u8,
-                    (px[1] as u32 * a / 255) as u8,
-                    (px[2] as u32 * a / 255) as u8,
-                    px[3],
-                ]
-            })
-            .collect()
+    let premultiplied = image.has_alpha;
+    let mut image = image;
+    let original = std::mem::take(&mut image.data);
+    let source: Vec<u8> = if premultiplied {
+        let mut copy = original.clone();
+        premultiply(&mut copy);
+        copy
     } else {
-        image.data.clone()
+        Vec::new()
     };
-    // Accumulate in float without clamping: sharp unpremultiplies the raw convolution result,
-    // so negative sums (e.g. a laplacian) still divide by a negative alpha.
-    let mut sums = vec![0f32; w * h * 4];
-    sums.par_chunks_exact_mut(w * 4)
+    let source: &[u8] = if premultiplied { &source } else { &original };
+    let row_len = w * 4;
+    let padded_len = (w + kw - 1) * 4;
+    let mut out = original.clone();
+    const BLOCK_ROWS: usize = 16;
+    out.par_chunks_mut(BLOCK_ROWS * row_len)
         .enumerate()
-        .for_each(|(y, row)| {
-            for x in 0..w {
-                for c in 0..4 {
-                    if c == 3 && !premultiply {
-                        continue;
+        .for_each_init(
+            || (Vec::<f32>::new(), vec![0f32; row_len]),
+            |(padded, acc), (block, chunk)| {
+                let y0 = block * BLOCK_ROWS;
+                let rows = chunk.len() / row_len;
+                // f32 copies of the source rows this block reads, edges replicated by the
+                // kernel's reach so every tap is a plain slice.
+                let lo = y0.saturating_sub(cy);
+                let hi = (y0 + rows - 1 + (kh - 1 - cy)).min(h - 1);
+                padded.clear();
+                padded.resize((hi - lo + 1) * padded_len, 0.0);
+                for (i, line) in padded.chunks_exact_mut(padded_len).enumerate() {
+                    let row = &source[(lo + i) * row_len..(lo + i + 1) * row_len];
+                    let lead = cx * 4;
+                    for (d, &v) in line[lead..lead + row_len].iter_mut().zip(row) {
+                        *d = v as f32;
                     }
-                    let mut acc = 0.0f32;
-                    for ky in 0..kh {
-                        let sy = (y as i32 + ky as i32 - cy).clamp(0, h as i32 - 1) as usize;
-                        let source_row = sy * w;
-                        for kx in 0..kw {
-                            let sx = (x as i32 + kx as i32 - cx).clamp(0, w as i32 - 1) as usize;
-                            acc += source[(source_row + sx) * 4 + c] as f32 * weights[ky * kw + kx];
+                    let first = [row[0], row[1], row[2], row[3]].map(|v| v as f32);
+                    let last = [
+                        row[row_len - 4],
+                        row[row_len - 3],
+                        row[row_len - 2],
+                        row[row_len - 1],
+                    ]
+                    .map(|v| v as f32);
+                    for px in line[..lead].chunks_exact_mut(4) {
+                        px.copy_from_slice(&first);
+                    }
+                    for px in line[lead + row_len..].chunks_exact_mut(4) {
+                        px.copy_from_slice(&last);
+                    }
+                }
+                for r in 0..rows {
+                    let y = y0 + r;
+                    // Taps in the order the kernel is applied: row by row, left to right.
+                    let taps: Vec<(&[f32], f32)> = (0..kh)
+                        .flat_map(|ky| {
+                            let sy = (y + ky).saturating_sub(cy).min(h - 1) - lo;
+                            let line = &padded[sy * padded_len..(sy + 1) * padded_len];
+                            let weights = &weights;
+                            (0..kw).map(move |kx| {
+                                (&line[kx * 4..kx * 4 + row_len], weights[ky * kw + kx])
+                            })
+                        })
+                        .collect();
+                    convolve_row(acc, &taps, scale, offset);
+                    let dst = &mut chunk[r * row_len..(r + 1) * row_len];
+                    if premultiplied {
+                        for (px, sum) in dst.chunks_exact_mut(4).zip(acc.chunks_exact(4)) {
+                            let alpha = sum[3];
+                            for c in 0..3 {
+                                // Negative sums divide by a negative alpha (no clamping); alpha 0
+                                // gives 0.
+                                let value = if alpha != 0.0 {
+                                    (sum[c] as f64 * 255.0 / alpha as f64) as f32
+                                } else {
+                                    0.0
+                                };
+                                px[c] = value.clamp(0.0, 255.0) as u8;
+                            }
+                            px[3] = alpha.clamp(0.0, 255.0) as u8;
+                        }
+                    } else {
+                        for (px, sum) in dst.chunks_exact_mut(4).zip(acc.chunks_exact(4)) {
+                            px[0] = trunc_u8(sum[0]);
+                            px[1] = trunc_u8(sum[1]);
+                            px[2] = trunc_u8(sum[2]);
                         }
                     }
-                    // No clamping or rounding here: sharp unpremultiplies the raw float result.
-                    row[x * 4 + c] = acc / scale + offset as f32;
                 }
-            }
-        });
-    let mut out = image.data.clone();
-    out.par_chunks_exact_mut(4)
-        .zip(sums.par_chunks_exact(4))
-        .for_each(|(px, sum)| {
-            if premultiply {
-                let alpha = sum[3];
-                for c in 0..3 {
-                    // Negative sums divide by a negative alpha (no clamping); alpha 0 gives 0.
-                    let value = if alpha != 0.0 {
-                        (sum[c] as f64 * 255.0 / alpha as f64) as f32
-                    } else {
-                        0.0
-                    };
-                    px[c] = value.clamp(0.0, 255.0) as u8;
-                }
-                px[3] = alpha.clamp(0.0, 255.0) as u8;
-            } else {
-                for c in 0..3 {
-                    px[c] = sum[c].clamp(0.0, 255.0) as u8;
-                }
-            }
-        });
+            },
+        );
+    // Keep the metadata-free result the previous implementation returned.
     let mut out_image = Image::from_rgba(image.width, image.height, out)?;
     out_image.format = image.format;
     out_image.has_alpha = image.has_alpha;
     Ok(out_image)
+}
+
+/// `acc[i] = (sum over taps in order of taps[k].0[i] * taps[k].1) / scale + offset`, with the
+/// taps of a register block accumulated in order so each lane sees the same f32 operations as a
+/// per-pixel loop would.
+#[inline(always)]
+fn convolve_row(acc: &mut [f32], taps: &[(&[f32], f32)], scale: f32, offset: f32) {
+    const LANES: usize = 32;
+    let split = acc.len() / LANES * LANES;
+    let (head, tail) = acc.split_at_mut(split);
+    for (block, chunk) in head.chunks_exact_mut(LANES).enumerate() {
+        let base = block * LANES;
+        let mut sum = [0f32; LANES];
+        for &(line, weight) in taps {
+            let src = &line[base..base + LANES];
+            for i in 0..LANES {
+                sum[i] += src[i] * weight;
+            }
+        }
+        for (out, &v) in chunk.iter_mut().zip(&sum) {
+            *out = v / scale + offset;
+        }
+    }
+    for (i, out) in tail.iter_mut().enumerate() {
+        let mut sum = 0f32;
+        for &(line, weight) in taps {
+            sum += line[split + i] * weight;
+        }
+        *out = sum / scale + offset;
+    }
 }
 
 /// sharp `threshold`: with `grayscale` the image is first converted to `B_W`; every band
@@ -3940,6 +4226,62 @@ mod tests {
                     "{d:?} {s:?} premultiplied {premultiplied}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn morphology_matches_naive_window() {
+        let mut state = 5u64;
+        for (w, h, radius, dilate) in [
+            (13usize, 9usize, 1u32, true),
+            (13, 9, 3, false),
+            (40, 11, 9, true),
+            (7, 30, 25, false),
+            (3, 3, 80, true),
+            (64, 64, 8, false),
+        ] {
+            let data: Vec<u8> = (0..w * h * 4).map(|_| lcg(&mut state)).collect();
+            let image = Image::from_rgba(w as u32, h as u32, data.clone()).unwrap();
+            let out = morphology(image, radius, dilate).unwrap().data;
+            let r = radius as i64;
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..4 {
+                        let mut value = if dilate { 0u8 } else { 255u8 };
+                        if c == 3 {
+                            value = data[(y * w + x) * 4 + 3];
+                        } else {
+                            for dy in -r..=r {
+                                for dx in -r..=r {
+                                    let sx = (x as i64 + dx).clamp(0, w as i64 - 1) as usize;
+                                    let sy = (y as i64 + dy).clamp(0, h as i64 - 1) as usize;
+                                    let v = data[(sy * w + sx) * 4 + c];
+                                    value = if dilate { value.max(v) } else { value.min(v) };
+                                }
+                            }
+                        }
+                        assert_eq!(
+                            out[(y * w + x) * 4 + c],
+                            value,
+                            "{w}x{h} r{radius} ({x},{y},{c})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn median9_matches_sorting() {
+        let mut state = 17u64;
+        for _ in 0..200_000 {
+            let mut values = [0f32; 9];
+            for v in &mut values {
+                *v = (lcg(&mut state) % 7) as f32 * 0.25 + (lcg(&mut state) % 2) as f32;
+            }
+            let mut sorted = values;
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            assert_eq!(median9(values), sorted[4], "{values:?}");
         }
     }
 
