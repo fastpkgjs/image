@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/fastpkgjs/image"
@@ -19,7 +19,7 @@ rust-version = "1.99"
 [workspace.dependencies]
 bytemuck = "1.23"
 crc32fast = "1.5"
-flate2 = "1"
+flate2 = { version = "1", features = ["zlib-rs"] }
 gamut-core = "3.0"
 gamut-jxl = { version = "0.4", default-features = false, features = ["encode"] }
 fast_image_resize = { version = "6.1", features = ["rayon"] }
@@ -42,7 +42,8 @@ kamadak-exif = "0.6"
 exif = { package = "kamadak-exif", version = "0.6" }
 memmap2 = "0.9"
 mozjpeg = { version = "0.10.13", features = ["with_simd"] }
-oxideav-webp = { version = "0.3", default-features = false }
+mozjpeg-sys = { version = "2.2.3", default-features = false }
+libwebp-sys = "0.9"
 napi = { version = "3.14", features = ["napi9", "async", "serde-json"] }
 napi-build = "2.6"
 napi-derive = "3.6"
@@ -55,6 +56,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync"] }
+
+# rav1d 1.1.0 with a one-line fix: its frame-decode error path unwrapped an already released
+# frame header inside an `extern "C"` fn, turning corrupt AVIF input into a process abort.
+# See vendor/rav1d/src/decode.rs ("fastpkg patch").
+[patch.crates-io]
+rav1d = { path = "vendor/rav1d" }
 
 [profile.release]
 lto = "fat"

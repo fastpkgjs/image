@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "fastpkg-codecs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "avif-decode",
  "base64 0.22.1",
@@ -493,8 +493,9 @@ dependencies = [
  "jpeg-encoder",
  "jxl-oxide",
  "kamadak-exif",
+ "libwebp-sys",
  "mozjpeg",
- "oxideav-webp",
+ "mozjpeg-sys",
  "png",
  "qoi",
  "rayon",
@@ -504,9 +505,10 @@ dependencies = [
 
 [[package]]
 name = "fastpkg-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "imagesize",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror",
@@ -514,9 +516,10 @@ dependencies = [
 
 [[package]]
 name = "fastpkg-meta"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fastpkg-core",
+ "flate2",
  "kamadak-exif",
  "serde",
  "serde_json",
@@ -524,8 +527,9 @@ dependencies = [
 
 [[package]]
 name = "fastpkg-napi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "fastpkg-codecs",
  "fastpkg-core",
  "fastpkg-stream",
  "napi",
@@ -538,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "fastpkg-ops"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "fast_image_resize",
@@ -550,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "fastpkg-stream"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "fastpkg-codecs",
@@ -789,6 +793,12 @@ dependencies = [
  "color_quant 1.1.0",
  "weezl",
 ]
+
+[[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "half"
@@ -1171,6 +1181,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libwebp-sys"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54cd30df7c7165ce74a456e4ca9732c603e8dc5e60784558c1c6dc047f876733"
+dependencies = [
+ "cc",
+ "glob",
+]
+
+[[package]]
 name = "litrs"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1460,21 +1480,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "oxideav-vp8"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "506f2495a728488c2fee1ee54bc7f819ca934dc3246369b4100c83848f057852"
-
-[[package]]
-name = "oxideav-webp"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f165f68743f086d7349770ed9e9ae5a9acc622a87fc44fe5af5f892f74abf556"
-dependencies = [
- "oxideav-vp8",
-]
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1677,8 +1682,6 @@ dependencies = [
 [[package]]
 name = "rav1d"
 version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1932f060d5e7bd49dc9f8b272c1dc5e9ce0ffe141c28be900265d3989b36c9ed"
 dependencies = [
  "assert_matches",
  "atomig",
