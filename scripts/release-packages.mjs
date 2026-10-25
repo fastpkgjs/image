@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,6 +28,13 @@ const targets = [
     binary: 'image.win32-x64-msvc.node',
     os: ['win32'],
     cpu: ['x64'],
+  },
+  {
+    package: '@fastpkg/image-win32-arm64',
+    directory: 'image-win32-arm64',
+    binary: 'image.win32-arm64-msvc.node',
+    os: ['win32'],
+    cpu: ['arm64'],
   },
   {
     package: '@fastpkg/image-darwin-x64',
@@ -57,6 +66,22 @@ const targets = [
     cpu: ['arm64'],
     libc: ['glibc'],
   },
+  {
+    package: '@fastpkg/image-linux-x64-musl',
+    directory: 'image-linux-x64-musl',
+    binary: 'image.linux-x64-musl.node',
+    os: ['linux'],
+    cpu: ['x64'],
+    libc: ['musl'],
+  },
+  {
+    package: '@fastpkg/image-linux-arm64-musl',
+    directory: 'image-linux-arm64-musl',
+    binary: 'image.linux-arm64-musl.node',
+    os: ['linux'],
+    cpu: ['arm64'],
+    libc: ['musl'],
+  },
 ];
 
 if (!fs.existsSync(artifacts)) {
@@ -78,7 +103,7 @@ for (const target of targets) {
   const manifest = {
     name: target.package,
     version,
-    description: `Native binary for @fastpkg/image on ${target.os[0]}-${target.cpu[0]}`,
+    description: `Native binary for @fastpkg/image on ${target.package.slice('@fastpkg/image-'.length)}`,
     license: rootPackage.license,
     repository: rootPackage.repository,
     main: target.binary,
@@ -128,3 +153,97 @@ fs.writeFileSync(
   `${JSON.stringify(mainManifest, null, 2)}\n`,
 );
 console.log(`staged ${rootPackage.name}@${version}`);
+
+// ---------------------------------------------------------------------------
+// Self-check: fail the release if the staged output is inconsistent.
+// ---------------------------------------------------------------------------
+const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
+const problems = [];
+const check = (condition, message) => {
+  if (!condition) problems.push(message);
+};
+
+const loader = fs.readFileSync(path.join(root, 'packages', 'image', 'lib.cjs'), 'utf8');
+const loaderBlock = loader.match(/const PLATFORM_PACKAGES = \{([\s\S]*?)\};/);
+check(loaderBlock, 'could not find PLATFORM_PACKAGES in packages/image/lib.cjs');
+const loaderPackages = new Set(
+  loaderBlock ? [...loaderBlock[1].matchAll(/'(@fastpkg\/[^']+)'/g)].map((m) => m[1]) : [],
+);
+const stagedPackages = new Set(targets.map((target) => target.package));
+for (const name of stagedPackages) check(loaderPackages.has(name), `lib.cjs PLATFORM_PACKAGES lacks ${name}`);
+for (const name of loaderPackages) check(stagedPackages.has(name), `lib.cjs references unstaged package ${name}`);
+
+const stagedMain = readJson(path.join(mainDirectory, 'package.json'));
+check(stagedMain.version === version, `main version ${stagedMain.version} != ${version}`);
+const optionalNames = Object.keys(stagedMain.optionalDependencies || {}).sort();
+check(
+  JSON.stringify(optionalNames) === JSON.stringify([...stagedPackages].sort()),
+  `main optionalDependencies ${optionalNames.join(',')} do not match staged platform packages`,
+);
+for (const [name, range] of Object.entries(stagedMain.optionalDependencies || {})) {
+  check(range === version, `optionalDependency ${name} pinned to ${range}, expected ${version}`);
+}
+const napiTargets = (rootPackage.napi && rootPackage.napi.targets) || [];
+check(
+  napiTargets.length === targets.length,
+  `package.json napi.targets has ${napiTargets.length} entries, release has ${targets.length}`,
+);
+
+for (const target of targets) {
+  const directory = path.join(output, target.directory);
+  const manifestPath = path.join(directory, 'package.json');
+  check(fs.existsSync(manifestPath), `${target.directory}: package.json missing`);
+  if (!fs.existsSync(manifestPath)) continue;
+  const manifest = readJson(manifestPath);
+  check(manifest.name === target.package, `${target.directory}: name ${manifest.name}`);
+  check(manifest.version === version, `${target.directory}: version ${manifest.version} != ${version}`);
+  check(manifest.main === target.binary, `${target.directory}: main ${manifest.main}`);
+  check(fs.existsSync(path.join(directory, manifest.main)), `${target.directory}: binary ${manifest.main} missing`);
+  check(
+    JSON.stringify(manifest.libc || null) === JSON.stringify(target.libc || null),
+    `${target.directory}: libc field mismatch`,
+  );
+  // The loader looks up `${platform}-${arch}[-libc]`; make sure the key maps to this package.
+  const libcSuffix = target.libc ? (target.libc[0] === 'musl' ? '-musl' : '-gnu') : '';
+  const key = `${target.os[0]}-${target.cpu[0]}${libcSuffix}`;
+  check(
+    new RegExp(`'${key}':\\s*'${target.package}'`).test(loader),
+    `lib.cjs maps ${key} to a different package than ${target.package}`,
+  );
+}
+
+const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const pack = spawnSync(npmBin, ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+  cwd: mainDirectory,
+  encoding: 'utf8',
+  env: { ...process.env, npm_config_cache: process.env.npm_config_cache || path.join(os.tmpdir(), 'fastpkg-npm-cache') },
+  shell: process.platform === 'win32',
+});
+if (pack.status !== 0) {
+  problems.push(`npm pack --dry-run failed: ${pack.stderr || pack.stdout}`);
+} else {
+  try {
+    const files = JSON.parse(pack.stdout)[0].files.map((entry) => entry.path);
+    for (const required of [
+      'packages/image/index.js',
+      'packages/image/index.cjs',
+      'packages/image/index.d.ts',
+      'packages/image/lib.cjs',
+      'README.md',
+      'LICENSE',
+      'package.json',
+    ]) {
+      check(files.includes(required), `npm pack of main package is missing ${required}`);
+    }
+    check(!files.some((file) => file.endsWith('.node')), 'main package unexpectedly contains a .node binary');
+  } catch (error) {
+    problems.push(`could not parse npm pack output: ${error.message}`);
+  }
+}
+
+if (problems.length) {
+  console.error('release self-check failed:');
+  for (const problem of problems) console.error(`  - ${problem}`);
+  process.exit(1);
+}
+console.log(`self-check ok: ${targets.length} platform packages + main package at ${version}`);

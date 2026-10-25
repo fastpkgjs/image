@@ -25,6 +25,7 @@ Status: **Supported**, **Partial**, **Unsupported**.
 | `toBuffer`, `toUint8Array`, `toFile` | Supported | Promise and callback forms; `resolveWithObject` |
 | `toFormat` | Supported | |
 | `jpeg`, `png`, `webp`, `avif`, `gif`, `qoi` | Supported | WebP supports lossy and lossless; GIF is single-frame |
+| `jpeg({ parallel: true })` | Extension | Not a sharp option. Opt-in banded baseline encode for images of 1 MP or more (restart markers join the bands; decoded pixels equal a single-pass `optimiseCoding: false` encode). Ignores `optimiseCoding`, throws a `TypeError` with `progressive`/`mozjpeg`/`optimiseScans`, falls back to the normal encoder for small images or a single thread. See the README. |
 | `jxl` | Optional | Decode always; encode requires the `jxl-encode` feature |
 | `raw` | Supported | RGBA/RGB output; `depth: 'ushort'` emits 16-bit samples |
 | `tile` | Partial | `dz`, `google`, `zoomify`, `iiif`, `iiif3`; filesystem or zip archive |
@@ -39,7 +40,9 @@ Status: **Supported**, **Partial**, **Unsupported**.
 
 ## Resize and geometry
 
-`resize`, `extend`, `extract`, `trim`, `rotate`, `autoOrient`, `flip`, `flop`, `affine` are supported. `fastShrinkOnLoad` is honoured for JPEG DCT-scaled decode. `affine` uses bilinear sampling and supports a 2x2 or 2x3 matrix. Approximate kernels: `lanczos2` and `mks2013`/`mks2021` map to Lanczos3.
+`resize`, `extend`, `extract`, `trim`, `rotate`, `autoOrient`, `flip`, `flop`, `affine` are supported.
+
+Operations run in sharp's fixed pipeline order, not call order (`packages/image/lib.cjs`, `normalizeOperations`): `rotate`/`flip`/`flop` run before `resize` only when `rotate(angle)` was called before `resize()`/`trim()`/`extract()` (sharp's `rotateBefore`), otherwise after it; `extract()` called before `resize()` is a pre-resize crop, after it a post-resize crop; `extend`, `affine`, `blur`, `sharpen`, `composite`, `negate`, ... always run after `resize` in sharp's order. The `cover` crop and `contain` padding happen after the flips/quarter turns that follow the resize, as in libvips. `withoutEnlargement`/`withoutReduction` clamp each axis' shrink factor (when both are set only `withoutReduction` applies), `fit: 'fill'` with one dimension keeps the other axis, and `fit: 'contain'` pads to the requested size with `background` (adding alpha for translucent backgrounds). `position` accepts names, `sharp.gravity` numbers, and `sharp.strategy.entropy`/`attention`; the content-aware strategies currently crop around the centre. `rotate(angle)` and `affine` size and place the output like libvips (rounded bounding box, bilinear sampling). `rotate()`/`autoOrient()` reset a retained EXIF Orientation to 1, and `withMetadata({ orientation, density })` overrides the retained EXIF/JFIF values. `fastShrinkOnLoad` is honoured for JPEG DCT-scaled decode. `affine` uses bilinear sampling and supports a 2x2 or 2x3 matrix. Approximate kernels: `lanczos2` and `mks2013`/`mks2021` map to Lanczos3.
 
 ## Operations
 
@@ -87,3 +90,8 @@ Status: **Supported**, **Partial**, **Unsupported**.
 ## Explicitly excluded formats
 
 TIFF, JPEG 2000/JP2, HEIC/HEIF, PDF. These are rejected with `UnsupportedFormatError` or a JavaScript error. AVIF is supported because it is a modern AV1-based format.
+
+## Untrusted input
+
+- **AVIF decode** uses `rav1d`, which reports some corrupt streams from inside `extern "C"` entry points; a Rust panic there cannot unwind and would abort the process. The workspace therefore builds a patched copy of `rav1d 1.1.0` (`vendor/rav1d`, wired in through `[patch.crates-io]`; the one-line fix is marked `fastpkg patch` in `src/decode.rs`) whose frame-decode error path returns an error instead of unwrapping an already released frame header. Corrupt AVIFs now reject with an `Error`. Residual risk: any other panic inside rav1d's C-ABI functions would still abort; mutation fuzzing of an AVIF (400 mutated files, plus the robustness suite) found none after the fix. rav1d also logs `Error parsing OBU data` to stderr for such files. Drop the vendored copy once an upstream release contains the fix.
+- **SVG** input is limited to 257 levels of element nesting (libxml2/librsvg refuses deeper documents too), is parsed and rendered on a worker thread with a 64 MiB stack, and rejects `feMorphology radius > 256`, `feConvolveMatrix order > 32` and `feTurbulence numOctaves > 32` up front because those cost minutes of CPU per render. Other CPU-heavy but legal constructs (for example a very large `feGaussianBlur` on a multi-megapixel canvas, which takes tens of seconds) are bounded only by `limitInputPixels` and the `timeout()` checks between pipeline stages.

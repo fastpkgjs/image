@@ -5,7 +5,6 @@
     clippy::unnecessary_unwrap
 )]
 
-use std::cmp::min;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
@@ -18,8 +17,9 @@ use fastpkg_core::options::{
 };
 use fastpkg_core::{Color, FastpkgError, Format, Image, Result, Stats};
 use image::imageops::FilterType as ImageFilter;
-use image::RgbaImage;
 use rayon::prelude::*;
+
+mod vips;
 
 pub fn apply(mut image: Image, operations: &[Operation]) -> Result<Image> {
     for op in operations {
@@ -29,9 +29,31 @@ pub fn apply(mut image: Image, operations: &[Operation]) -> Result<Image> {
 }
 
 pub fn apply_one(mut image: Image, op: &Operation) -> Result<Image> {
+    // Many operations rebuild the image buffer from scratch; carry per-image
+    // metadata across so EXIF/ICC/XMP and the single-channel hint survive them.
+    let gray = image.gray;
+    let icc = image.icc.take();
+    let exif = image.exif.take();
+    let xmp = image.xmp.take();
+    let mut out = apply_op(image, op)?;
+    out.gray |= gray;
+    out.icc = out.icc.or(icc);
+    out.exif = out.exif.or(exif);
+    out.xmp = out.xmp.or(xmp);
+    if matches!(op, Operation::AutoOrient) {
+        // Pixels are upright now: retained EXIF must say so, or viewers rotate them twice.
+        if let Some(exif) = out.exif.as_mut() {
+            fastpkg_core::exif::set_orientation(exif, 1);
+        }
+    }
+    Ok(out)
+}
+
+fn apply_op(mut image: Image, op: &Operation) -> Result<Image> {
     let preserves_wide = matches!(
         op,
         Operation::Resize { .. }
+            | Operation::Canvas { .. }
             | Operation::Extend { .. }
             | Operation::Extract { .. }
             | Operation::Rotate { .. }
@@ -53,6 +75,7 @@ pub fn apply_one(mut image: Image, op: &Operation) -> Result<Image> {
             kernel,
             without_enlargement,
             without_reduction,
+            defer_canvas,
             ..
         } => resize(
             image,
@@ -64,14 +87,34 @@ pub fn apply_one(mut image: Image, op: &Operation) -> Result<Image> {
             *kernel,
             *without_enlargement,
             *without_reduction,
+            *defer_canvas,
         ),
+        Operation::Canvas {
+            width,
+            height,
+            fit,
+            position,
+            background,
+        } => finish_canvas(image, *fit, *width, *height, position, background),
         Operation::Extend {
             width,
             height,
             background,
             position,
             extend_with,
-        } => extend(image, *width, *height, background, position, *extend_with),
+            top,
+            left,
+            bottom,
+            right,
+        } => extend(
+            image,
+            *width,
+            *height,
+            [*top, *left, *bottom, *right],
+            background,
+            position,
+            *extend_with,
+        ),
         Operation::Extract {
             left,
             top,
@@ -82,7 +125,8 @@ pub fn apply_one(mut image: Image, op: &Operation) -> Result<Image> {
             background,
             threshold,
             line_art,
-        } => trim(image, background, *threshold, *line_art),
+            margin,
+        } => trim(image, background.as_deref(), *threshold, *line_art, *margin),
         Operation::Rotate { angle, background } => rotate(image, *angle, background),
         Operation::AutoOrient => auto_orient(image),
         Operation::Flip { flip: value } => flip(image, *value),
@@ -267,25 +311,95 @@ pub fn apply_one(mut image: Image, op: &Operation) -> Result<Image> {
             top,
             left,
             tile,
-            ..
-        } => composite(image, input, *blend, gravity, *top, *left, *tile),
+            density,
+            premultiplied,
+            source,
+        } => composite(
+            image,
+            input,
+            *blend,
+            gravity,
+            *top,
+            *left,
+            *tile,
+            *density,
+            *premultiplied,
+            source.as_deref(),
+        ),
     }
 }
 
-fn to_rgba_image(image: &Image) -> Result<RgbaImage> {
-    RgbaImage::from_raw(image.width, image.height, image.data.clone())
-        .ok_or_else(|| FastpkgError::Operation("invalid RGBA buffer".into()))
+/// Pure data-movement transforms on the RGBA8 buffer, parallelised over output rows.
+#[derive(Clone, Copy)]
+enum Remap {
+    FlipVertical,
+    FlipHorizontal,
+    Rotate90,
+    Rotate180,
+    Rotate270,
 }
 
-fn from_rgba_image(mut image: Image, rgba: RgbaImage) -> Image {
-    image.width = rgba.width();
-    image.height = rgba.height();
-    image.data = rgba.into_raw();
+fn remap_pixels(mut image: Image, remap: Remap) -> Image {
+    let w = image.width as usize;
+    let h = image.height as usize;
+    if w == 0 || h == 0 {
+        return image;
+    }
+    let src = std::mem::take(&mut image.data);
+    let mut out = vec![0u8; src.len()];
+    match remap {
+        Remap::FlipVertical => {
+            out.par_chunks_exact_mut(w * 4)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    let from = (h - 1 - y) * w * 4;
+                    row.copy_from_slice(&src[from..from + w * 4]);
+                });
+        }
+        Remap::FlipHorizontal | Remap::Rotate180 => {
+            let vertical = matches!(remap, Remap::Rotate180);
+            out.par_chunks_exact_mut(w * 4)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    let sy = if vertical { h - 1 - y } else { y };
+                    let from = &src[sy * w * 4..(sy + 1) * w * 4];
+                    for (dst, px) in row.chunks_exact_mut(4).zip(from.chunks_exact(4).rev()) {
+                        dst.copy_from_slice(px);
+                    }
+                });
+        }
+        Remap::Rotate90 | Remap::Rotate270 => {
+            // Output is h wide and w tall. Work in bands of output rows so each source
+            // row segment read is a few cache lines instead of one pixel.
+            const BAND: usize = 16;
+            let clockwise = matches!(remap, Remap::Rotate90);
+            out.par_chunks_mut(BAND * h * 4)
+                .enumerate()
+                .for_each(|(band, chunk)| {
+                    let first = band * BAND;
+                    let rows = chunk.len() / (h * 4);
+                    for c in 0..h {
+                        // Source row feeding output column `c`.
+                        let sy = if clockwise { h - 1 - c } else { c };
+                        for r in 0..rows {
+                            let out_row = first + r;
+                            let sx = if clockwise { out_row } else { w - 1 - out_row };
+                            let from = (sy * w + sx) * 4;
+                            let to = (r * h + c) * 4;
+                            chunk[to..to + 4].copy_from_slice(&src[from..from + 4]);
+                        }
+                    }
+                });
+            image.width = h as u32;
+            image.height = w as u32;
+        }
+    }
+    image.data = out;
     image
 }
 
 fn resize(
-    image: Image,
+    mut image: Image,
     width: Option<u32>,
     height: Option<u32>,
     fit: Fit,
@@ -294,59 +408,120 @@ fn resize(
     kernel: Kernel,
     without_enlargement: bool,
     without_reduction: bool,
+    defer_canvas: bool,
 ) -> Result<Image> {
+    let (source_width, source_height) = image
+        .pre_shrink
+        .take()
+        .unwrap_or((image.width, image.height));
     if width.is_none() && height.is_none() {
         return Ok(image);
     }
-    let (mut tw, mut th) = fastpkg_core::pipeline::compute_target(
-        image.width,
-        image.height,
+    let (rw, rh) = fastpkg_core::pipeline::compute_target(
+        source_width,
+        source_height,
         width,
         height,
         fit,
-        without_enlargement || fit == Fit::Inside,
+        without_enlargement,
         without_reduction,
     );
-    if fit == Fit::Cover && width.is_some() && height.is_some() {
-        let source_has_alpha = image.has_alpha;
-        let centering = (
-            alignment_fraction(horizontal(position)),
-            alignment_fraction(vertical(position)),
-        );
-        let mut resized = resize_raw_opts(
-            image,
-            width.unwrap(),
-            height.unwrap(),
-            kernel,
-            Some(centering),
-        )?;
-        resized.has_alpha = source_has_alpha || resized.has_transparency();
+    let resized = resize_plain(image, rw, rh, kernel)?;
+    if defer_canvas {
         return Ok(resized);
     }
-    if fit == Fit::Contain || fit == Fit::Inside {
-        let scale = (tw as f64 / image.width as f64).min(th as f64 / image.height as f64);
-        tw = (image.width as f64 * scale).round().max(1.0) as u32;
-        th = (image.height as f64 * scale).round().max(1.0) as u32;
+    finish_canvas(resized, fit, width, height, position, background)
+}
+
+/// sharp's crop (`cover`) / embed (`contain`) step, applied to the already resampled image.
+/// It runs after any flip/flop/rotate-by-90 that follows the resize in sharp's pipeline, which
+/// is why it can be requested separately (`Operation::Canvas`).
+fn finish_canvas(
+    resized: Image,
+    fit: Fit,
+    width: Option<u32>,
+    height: Option<u32>,
+    position: &str,
+    background: &str,
+) -> Result<Image> {
+    match fit {
+        Fit::Cover => {
+            let crop_w = width.map_or(resized.width, |w| resized.width.min(w));
+            let crop_h = height.map_or(resized.height, |h| resized.height.min(h));
+            if (crop_w, crop_h) == (resized.width, resized.height) {
+                return Ok(resized);
+            }
+            let left = match horizontal(position) {
+                Align::Start => 0,
+                Align::Center => (resized.width - crop_w).div_ceil(2),
+                Align::End => resized.width - crop_w,
+            };
+            let top = match vertical(position) {
+                Align::Start => 0,
+                Align::Center => (resized.height - crop_h).div_ceil(2),
+                Align::End => resized.height - crop_h,
+            };
+            extract(resized, left, top, crop_w, crop_h)
+        }
+        Fit::Contain => {
+            let canvas_w = width.map_or(resized.width, |w| resized.width.max(w));
+            let canvas_h = height.map_or(resized.height, |h| resized.height.max(h));
+            // sharp aligns the resized image against the *requested* size, so with
+            // `withoutReduction` (resized image larger than the target) the offset is
+            // negative and the image is cropped. Offsets use C integer division.
+            let offset = |align: Align, target: Option<u32>, size: u32| -> i64 {
+                let target = target.map_or(size as i64, i64::from);
+                match align {
+                    Align::Start => 0,
+                    Align::Center => (target - size as i64) / 2,
+                    Align::End => target - size as i64,
+                }
+            };
+            let dx = offset(horizontal(position), width, resized.width);
+            let dy = offset(vertical(position), height, resized.height);
+            if (canvas_w, canvas_h) == (resized.width, resized.height) && dx == 0 && dy == 0 {
+                return Ok(resized);
+            }
+            let (mut resized, mut dx, mut dy) = (resized, dx, dy);
+            if dx < 0
+                || dy < 0
+                || dx + resized.width as i64 > canvas_w as i64
+                || dy + resized.height as i64 > canvas_h as i64
+            {
+                let crop_left = (-dx).max(0) as u32;
+                let crop_top = (-dy).max(0) as u32;
+                let visible_w =
+                    (resized.width - crop_left).min((canvas_w as i64 - dx.max(0)).max(1) as u32);
+                let visible_h =
+                    (resized.height - crop_top).min((canvas_h as i64 - dy.max(0)).max(1) as u32);
+                resized = extract(resized, crop_left, crop_top, visible_w, visible_h)?;
+                dx = dx.max(0);
+                dy = dy.max(0);
+            }
+            let left = dx as u32;
+            let top = dy as u32;
+            let right = canvas_w.saturating_sub(left + resized.width);
+            let bottom = canvas_h.saturating_sub(top + resized.height);
+            extend(
+                resized,
+                None,
+                None,
+                [Some(top), Some(left), Some(bottom), Some(right)],
+                background,
+                position,
+                ExtendWith::Background,
+            )
+        }
+        _ => Ok(resized),
     }
-    if fit == Fit::Outside {
-        let scale = (tw as f64 / image.width as f64).max(th as f64 / image.height as f64);
-        tw = (image.width as f64 * scale).round().max(1.0) as u32;
-        th = (image.height as f64 * scale).round().max(1.0) as u32;
-    }
-    tw = tw.max(1);
-    th = th.max(1);
-    if tw == image.width && th == image.height {
+}
+
+fn resize_plain(image: Image, width: u32, height: u32, kernel: Kernel) -> Result<Image> {
+    if width == image.width && height == image.height {
         return Ok(image);
     }
-    if fit == Fit::Fill && width.is_some() && height.is_some() {
-        let source_has_alpha = image.has_alpha;
-        let mut out = resize_raw(image, tw, th, kernel)?;
-        let _ = background;
-        out.has_alpha = source_has_alpha || out.has_transparency();
-        return Ok(out);
-    }
     let source_has_alpha = image.has_alpha;
-    let mut out = resize_raw(image, tw, th, kernel)?;
+    let mut out = resize_raw(image, width, height, kernel)?;
     out.has_alpha = source_has_alpha || out.has_transparency();
     Ok(out)
 }
@@ -428,14 +603,6 @@ fn resize_options(kernel: Kernel, has_alpha: bool) -> ResizeOptions {
         .use_alpha(has_alpha)
 }
 
-fn alignment_fraction(align: Align) -> f64 {
-    match align {
-        Align::Start => 0.0,
-        Align::Center => 0.5,
-        Align::End => 1.0,
-    }
-}
-
 #[derive(Clone, Copy)]
 enum Align {
     Start,
@@ -471,13 +638,13 @@ fn extract(mut image: Image, left: u32, top: u32, width: u32, height: u32) -> Re
             "extract size must be non-zero".into(),
         ));
     }
-    if left >= image.width || top >= image.height {
+    if left as u64 + width as u64 > image.width as u64
+        || top as u64 + height as u64 > image.height as u64
+    {
         return Err(FastpkgError::InvalidOptions(
-            "extract region starts outside the image".into(),
+            "extract_area: bad extract area".into(),
         ));
     }
-    let width = min(width, image.width - left);
-    let height = min(height, image.height - top);
     if image.has_wide() {
         let wide = image.to_rgba16();
         let mut out = Vec::with_capacity(width as usize * height as usize * 4);
@@ -504,17 +671,58 @@ fn extend(
     mut image: Image,
     width: Option<u32>,
     height: Option<u32>,
+    padding: [Option<u32>; 4],
     background: &str,
     position: &str,
     extend_with: ExtendWith,
 ) -> Result<Image> {
-    let width = width.unwrap_or(image.width).max(image.width);
-    let height = height.unwrap_or(image.height).max(image.height);
+    let [top, left, bottom, right] = padding;
+    let padded = padding.iter().any(Option::is_some);
+    let (width, height) = if padded {
+        let grow = |edge: Option<u32>| edge.unwrap_or(0) as u64;
+        let w = image.width as u64 + grow(left) + grow(right);
+        let h = image.height as u64 + grow(top) + grow(bottom);
+        if w > u32::MAX as u64 || h > u32::MAX as u64 {
+            return Err(FastpkgError::InvalidOptions(
+                "extend dimensions are too large".into(),
+            ));
+        }
+        (w as u32, h as u32)
+    } else {
+        (
+            width.unwrap_or(image.width).max(image.width),
+            height.unwrap_or(image.height).max(image.height),
+        )
+    };
     if width == image.width && height == image.height {
         return Ok(image);
     }
-    let color = Color::parse(background)
+    // Explicit edges pin the image at (left, top); otherwise `position` aligns it.
+    let x = if padded {
+        left.unwrap_or(0)
+    } else {
+        match horizontal(position) {
+            Align::Start => 0,
+            Align::Center => (width - image.width) / 2,
+            Align::End => width - image.width,
+        }
+    };
+    let y = if padded {
+        top.unwrap_or(0)
+    } else {
+        match vertical(position) {
+            Align::Start => 0,
+            Align::Center => (height - image.height) / 2,
+            Align::End => height - image.height,
+        }
+    };
+    let mut color = Color::parse(background)
         .ok_or_else(|| FastpkgError::InvalidOptions(format!("invalid color {background}")))?;
+    if image.gray {
+        // A single-channel image can only be extended with a grey background.
+        let lum = luminance(color.r, color.g, color.b);
+        (color.r, color.g, color.b) = (lum, lum, lum);
+    }
     if image.has_wide() {
         let wide = image.to_rgba16();
         let fill = [
@@ -527,16 +735,6 @@ fn extend(
         for px in out.chunks_exact_mut(4) {
             px.copy_from_slice(&fill);
         }
-        let x = match horizontal(position) {
-            Align::Start => 0,
-            Align::Center => (width - image.width) / 2,
-            Align::End => width - image.width,
-        };
-        let y = match vertical(position) {
-            Align::Start => 0,
-            Align::Center => (height - image.height) / 2,
-            Align::End => height - image.height,
-        };
         if matches!(extend_with, ExtendWith::Background) {
             for row in 0..image.height {
                 let src = row as usize * image.width as usize * 4;
@@ -570,57 +768,53 @@ fn extend(
             }
         }
         image.set_wide_rgba(width, height, out)?;
+        image.has_alpha = image.has_alpha || color.alpha < 255;
         return Ok(image);
     }
     let mut data = vec![0u8; width as usize * height as usize * 4];
-    for px in data.chunks_exact_mut(4) {
-        px.copy_from_slice(&[color.r, color.g, color.b, color.alpha]);
-    }
-    let x = match horizontal(position) {
-        Align::Start => 0,
-        Align::Center => (width - image.width) / 2,
-        Align::End => width - image.width,
-    };
-    let y = match vertical(position) {
-        Align::Start => 0,
-        Align::Center => (height - image.height) / 2,
-        Align::End => height - image.height,
-    };
+    let fill = [color.r, color.g, color.b, color.alpha];
+    let src_stride = image.width as usize * 4;
+    let (x, y) = (x as usize, y as usize);
     if matches!(extend_with, ExtendWith::Background) {
-        for row in 0..image.height {
-            let src = row as usize * image.width as usize * 4;
-            let dst = ((y + row) as usize * width as usize + x as usize) * 4;
-            data[dst..dst + image.width as usize * 4]
-                .copy_from_slice(&image.data[src..src + image.width as usize * 4]);
-        }
+        data.par_chunks_exact_mut(width as usize * 4)
+            .enumerate()
+            .for_each(|(row_index, row)| {
+                let inside = row_index >= y && row_index < y + image.height as usize;
+                for px in row.chunks_exact_mut(4) {
+                    px.copy_from_slice(&fill);
+                }
+                if inside {
+                    let src = (row_index - y) * src_stride;
+                    row[x * 4..x * 4 + src_stride]
+                        .copy_from_slice(&image.data[src..src + src_stride]);
+                }
+            });
     } else {
-        for row in 0..height {
-            for col in 0..width {
-                let rx = col as i64 - x as i64;
-                let ry = row as i64 - y as i64;
-                let (sx, sy) = match extend_with {
-                    ExtendWith::Copy => (
-                        rx.clamp(0, image.width as i64 - 1) as u32,
-                        ry.clamp(0, image.height as i64 - 1) as u32,
-                    ),
-                    ExtendWith::Mirror => (
-                        mirror_index(rx, image.width),
-                        mirror_index(ry, image.height),
-                    ),
-                    _ => (
-                        rx.rem_euclid(image.width as i64) as u32,
-                        ry.rem_euclid(image.height as i64) as u32,
-                    ),
-                };
-                let src = (sy as usize * image.width as usize + sx as usize) * 4;
-                let dst = (row as usize * width as usize + col as usize) * 4;
-                data[dst..dst + 4].copy_from_slice(&image.data[src..src + 4]);
+        let map = |index: i64, len: u32| -> usize {
+            match extend_with {
+                ExtendWith::Copy => index.clamp(0, len as i64 - 1) as usize,
+                ExtendWith::Mirror => mirror_index(index, len) as usize,
+                _ => index.rem_euclid(len as i64) as usize,
             }
-        }
+        };
+        let columns = (0..width as i64)
+            .map(|col| map(col - x as i64, image.width))
+            .collect::<Vec<_>>();
+        data.par_chunks_exact_mut(width as usize * 4)
+            .enumerate()
+            .for_each(|(row_index, row)| {
+                let sy = map(row_index as i64 - y as i64, image.height);
+                let src_row = &image.data[sy * src_stride..(sy + 1) * src_stride];
+                for (px, &sx) in row.chunks_exact_mut(4).zip(&columns) {
+                    px.copy_from_slice(&src_row[sx * 4..sx * 4 + 4]);
+                }
+            });
     }
     let mut out = Image::from_rgba(width, height, data)?;
     out.format = image.format;
-    out.has_alpha = image.has_alpha;
+    // A translucent background adds an alpha channel to an opaque image (sharp: 4 channels).
+    out.has_alpha =
+        image.has_alpha || (matches!(extend_with, ExtendWith::Background) && color.alpha < 255);
     Ok(out)
 }
 
@@ -638,43 +832,85 @@ fn mirror_index(index: i64, len: u32) -> u32 {
     }
 }
 
-fn trim(image: Image, background: &str, threshold: f64, line_art: bool) -> Result<Image> {
-    let bg = if background == "#000000" {
-        image.get(0, 0)
-    } else {
-        Color::parse(background)
-            .ok_or_else(|| FastpkgError::InvalidOptions(format!("invalid color {background}")))?
+/// sharp `trim` (libvips `find_trim`): the image is flattened onto black, smoothed with a 3x3
+/// median (unless `line_art`), and a pixel is content when any band differs from the background
+/// by more than `threshold`. Nothing to trim (uniform image, threshold too high) returns the
+/// image unchanged.
+fn trim(
+    image: Image,
+    background: Option<&str>,
+    threshold: f64,
+    line_art: bool,
+    margin: u32,
+) -> Result<Image> {
+    let (w, h) = (image.width as usize, image.height as usize);
+    let flat = |px: &[u8]| -> [f32; 3] {
+        let a = px[3] as f32 / 255.0;
+        [px[0] as f32 * a, px[1] as f32 * a, px[2] as f32 * a]
     };
-    let threshold = if threshold > 0.0 {
-        threshold
-    } else if line_art {
-        0.1
-    } else {
-        10.0
-    };
-    let mut left = image.width;
-    let mut top = image.height;
-    let mut right = 0;
-    let mut bottom = 0;
-    for y in 0..image.height {
-        for x in 0..image.width {
-            let px = image.get(x, y);
-            let diff = (px.r as f64 - bg.r as f64).abs()
-                + (px.g as f64 - bg.g as f64).abs()
-                + (px.b as f64 - bg.b as f64).abs()
-                + (px.alpha as f64 - bg.alpha as f64).abs();
-            if diff > threshold {
-                left = left.min(x);
-                top = top.min(y);
-                right = right.max(x);
-                bottom = bottom.max(y);
+    let mut values: Vec<[f32; 3]> = image.data.chunks_exact(4).map(flat).collect();
+    if !line_art && w > 1 && h > 1 {
+        let source = values.clone();
+        values.par_iter_mut().enumerate().for_each(|(index, out)| {
+            let (x, y) = ((index % w) as isize, (index / w) as isize);
+            for (c, slot) in out.iter_mut().enumerate() {
+                let mut window = [0f32; 9];
+                let mut n = 0;
+                for dy in -1..=1isize {
+                    for dx in -1..=1isize {
+                        let sx = (x + dx).clamp(0, w as isize - 1) as usize;
+                        let sy = (y + dy).clamp(0, h as isize - 1) as usize;
+                        window[n] = source[sy * w + sx][c];
+                        n += 1;
+                    }
+                }
+                window.sort_by(|a, b| a.total_cmp(b));
+                *slot = window[4];
             }
+        });
+    }
+    let bg = match background {
+        Some(text) => {
+            let color = Color::parse(text)
+                .ok_or_else(|| FastpkgError::InvalidOptions(format!("invalid color {text}")))?;
+            flat(&[color.r, color.g, color.b, color.alpha])
+        }
+        None => values.first().copied().unwrap_or([0.0; 3]),
+    };
+    let mut left = w;
+    let mut top = h;
+    let mut right = 0usize;
+    let mut bottom = 0usize;
+    let mut found = false;
+    for (index, v) in values.iter().enumerate() {
+        let diff = (v[0] - bg[0])
+            .abs()
+            .max((v[1] - bg[1]).abs())
+            .max((v[2] - bg[2]).abs());
+        if f64::from(diff) > threshold {
+            let (x, y) = (index % w, index / w);
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x);
+            bottom = bottom.max(y);
+            found = true;
         }
     }
-    if right < left || bottom < top {
-        return Err(FastpkgError::Operation("trim found no content".into()));
+    if !found {
+        return Ok(image);
     }
-    extract(image, left, top, right - left + 1, bottom - top + 1)
+    let margin = margin as usize;
+    let left = left.saturating_sub(margin);
+    let top = top.saturating_sub(margin);
+    let right = (right + margin).min(w - 1);
+    let bottom = (bottom + margin).min(h - 1);
+    extract(
+        image,
+        left as u32,
+        top as u32,
+        (right - left + 1) as u32,
+        (bottom - top + 1) as u32,
+    )
 }
 
 fn flip(mut image: Image, flip: bool) -> Result<Image> {
@@ -693,9 +929,7 @@ fn flip(mut image: Image, flip: bool) -> Result<Image> {
         image.set_wide_rgba(image.width, image.height, out)?;
         return Ok(image);
     }
-    let rgba = to_rgba_image(&image)?;
-    let flipped = image::imageops::flip_vertical(&rgba);
-    Ok(from_rgba_image(image, flipped))
+    Ok(remap_pixels(image, Remap::FlipVertical))
 }
 
 fn flop(mut image: Image, flop: bool) -> Result<Image> {
@@ -716,9 +950,7 @@ fn flop(mut image: Image, flop: bool) -> Result<Image> {
         image.set_wide_rgba(image.width, image.height, out)?;
         return Ok(image);
     }
-    let rgba = to_rgba_image(&image)?;
-    let flipped = image::imageops::flip_horizontal(&rgba);
-    Ok(from_rgba_image(image, flipped))
+    Ok(remap_pixels(image, Remap::FlipHorizontal))
 }
 
 fn rotate(image: Image, angle: f64, background: &str) -> Result<Image> {
@@ -733,41 +965,51 @@ fn rotate(image: Image, angle: f64, background: &str) -> Result<Image> {
         return rotate_wide(image, angle, background);
     }
     if (angle - 90.0).abs() < f64::EPSILON {
-        let rgba = to_rgba_image(&image)?;
-        return Ok(from_rgba_image(image, image::imageops::rotate90(&rgba)));
+        return Ok(remap_pixels(image, Remap::Rotate90));
     }
     if (angle - 180.0).abs() < f64::EPSILON {
-        let rgba = to_rgba_image(&image)?;
-        return Ok(from_rgba_image(image, image::imageops::rotate180(&rgba)));
+        return Ok(remap_pixels(image, Remap::Rotate180));
     }
     if (angle - 270.0).abs() < f64::EPSILON {
-        let rgba = to_rgba_image(&image)?;
-        return Ok(from_rgba_image(image, image::imageops::rotate270(&rgba)));
+        return Ok(remap_pixels(image, Remap::Rotate270));
     }
     let bg = Color::parse(background).unwrap_or(Color::BLACK);
-    let theta = angle.to_radians();
-    let cos = theta.cos();
-    let sin = theta.sin();
-    let new_w = (image.width as f64 * cos.abs() + image.height as f64 * sin.abs()).ceil() as u32;
-    let new_h = (image.width as f64 * sin.abs() + image.height as f64 * cos.abs()).ceil() as u32;
-    let cx = image.width as f64 / 2.0;
-    let cy = image.height as f64 / 2.0;
-    let ncx = new_w as f64 / 2.0;
-    let ncy = new_h as f64 / 2.0;
+    let (cos, sin, new_w, new_h, left, top) = rotation_frame(image.width, image.height, angle);
     let mut out = Image::from_rgba(new_w, new_h, vec![0u8; new_w as usize * new_h as usize * 4])?;
-    out.has_alpha = true;
-    for y in 0..new_h {
-        for x in 0..new_w {
-            let dx = x as f64 + 0.5 - ncx;
-            let dy = y as f64 + 0.5 - ncy;
-            let sx = cos * dx + sin * dy + cx;
-            let sy = -sin * dx + cos * dy + cy;
-            let color = sample_bilinear(&image, sx, sy, bg);
-            out.set(x, y, color);
-        }
-    }
+    out.has_alpha = image.has_alpha || bg.alpha < 255;
+    out.data
+        .par_chunks_exact_mut(new_w as usize * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, dst) in row.chunks_exact_mut(4).enumerate() {
+                let (sx, sy) = rotation_source(cos, sin, left, top, x as u32, y as u32);
+                let color = sample_bilinear(&image, sx, sy, bg);
+                dst.copy_from_slice(&[color.r, color.g, color.b, color.alpha]);
+            }
+        });
     out.format = image.format;
     Ok(out)
+}
+
+/// Output frame of an arbitrary-angle rotation, following libvips: the size is the rounded
+/// extent of the rotated source rectangle and its origin is the rounded top-left corner of
+/// that rectangle. Returns `(cos, sin, width, height, left, top)`.
+fn rotation_frame(width: u32, height: u32, angle: f64) -> (f64, f64, u32, u32, f64, f64) {
+    let (sin, cos) = angle.to_radians().sin_cos();
+    let (w, h) = (width as f64, height as f64);
+    let xs = [0.0, w * cos, -h * sin, w * cos - h * sin];
+    let ys = [0.0, w * sin, h * cos, w * sin + h * cos];
+    let min = |values: &[f64; 4]| values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = |values: &[f64; 4]| values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let new_w = ((max(&xs) - min(&xs)).round() as u32).max(1);
+    let new_h = ((max(&ys) - min(&ys)).round() as u32).max(1);
+    (cos, sin, new_w, new_h, min(&xs).round(), min(&ys).round())
+}
+
+/// Source coordinate (pixel-index space) sampled by output pixel `(x, y)`.
+fn rotation_source(cos: f64, sin: f64, left: f64, top: f64, x: u32, y: u32) -> (f64, f64) {
+    let (ox, oy) = (x as f64 + left, y as f64 + top);
+    (cos * ox + sin * oy, -sin * ox + cos * oy)
 }
 
 fn rotate_wide(mut image: Image, angle: f64, background: &str) -> Result<Image> {
@@ -817,29 +1059,18 @@ fn rotate_wide(mut image: Image, angle: f64, background: &str) -> Result<Image> 
         bg.b as u16 * 257,
         bg.alpha as u16 * 257,
     ];
-    let theta = angle.to_radians();
-    let cos = theta.cos();
-    let sin = theta.sin();
-    let new_w = (width as f64 * cos.abs() + height as f64 * sin.abs()).ceil() as u32;
-    let new_h = (width as f64 * sin.abs() + height as f64 * cos.abs()).ceil() as u32;
-    let cx = width as f64 / 2.0;
-    let cy = height as f64 / 2.0;
-    let ncx = new_w as f64 / 2.0;
-    let ncy = new_h as f64 / 2.0;
+    let (cos, sin, new_w, new_h, left, top) = rotation_frame(image.width, image.height, angle);
     let mut out = vec![0u16; new_w as usize * new_h as usize * 4];
     for y in 0..new_h {
         for x in 0..new_w {
-            let dx = x as f64 + 0.5 - ncx;
-            let dy = y as f64 + 0.5 - ncy;
-            let sx = cos * dx + sin * dy + cx;
-            let sy = -sin * dx + cos * dy + cy;
+            let (sx, sy) = rotation_source(cos, sin, left, top, x, y);
             let pixel = sample_bilinear_wide(&wide, width, height, sx, sy, fallback);
             let dst = (y as usize * new_w as usize + x as usize) * 4;
             out[dst..dst + 4].copy_from_slice(&pixel);
         }
     }
     image.set_wide_rgba(new_w, new_h, out)?;
-    image.has_alpha = true;
+    image.has_alpha = image.has_alpha || bg.alpha < 255;
     Ok(image)
 }
 
@@ -920,14 +1151,16 @@ fn auto_orient(image: Image) -> Result<Image> {
         2 => flop(image, true)?,
         3 => rotate(image, 180.0, "#000000")?,
         4 => flip(image, true)?,
+        // 5 = transpose (mirror over the main diagonal): rotate 90 clockwise, then flop.
         5 => {
-            let image = flop(image, true)?;
-            rotate(image, 90.0, "#000000")?
+            let image = rotate(image, 90.0, "#000000")?;
+            flop(image, true)?
         }
         6 => rotate(image, 90.0, "#000000")?,
+        // 7 = transverse (mirror over the anti-diagonal): rotate 90 clockwise, then flip.
         7 => {
-            let image = flop(image, true)?;
-            rotate(image, 270.0, "#000000")?
+            let image = rotate(image, 90.0, "#000000")?;
+            flip(image, true)?
         }
         8 => rotate(image, 270.0, "#000000")?,
         _ => image,
@@ -972,15 +1205,19 @@ fn affine(
     let mut max_x = f64::NEG_INFINITY;
     let mut max_y = f64::NEG_INFINITY;
     for (x, y) in corners {
-        let ox = a * (x + idx) + b * (y + idy) + odx;
-        let oy = c * (x + idx) + d * (y + idy) + ody;
+        // The output frame ignores the offsets: they move the content within it.
+        let ox = a * x + b * y;
+        let oy = c * x + d * y;
         min_x = min_x.min(ox);
         min_y = min_y.min(oy);
         max_x = max_x.max(ox);
         max_y = max_y.max(oy);
     }
-    let width = (max_x - min_x).ceil().max(1.0) as u32;
-    let height = (max_y - min_y).ceil().max(1.0) as u32;
+    // libvips sizes the output as the rounded extent of the transformed bounding box.
+    let width = (max_x - min_x).round().max(1.0) as u32;
+    let height = (max_y - min_y).round().max(1.0) as u32;
+    // libvips places the output origin on the rounded top-left corner of the bounding box.
+    let (origin_x, origin_y) = (min_x.round(), min_y.round());
     let bg = Color::parse(background).unwrap_or(Color::BLACK);
     if image.has_wide() {
         let wide = image.to_rgba16();
@@ -993,8 +1230,8 @@ fn affine(
         let mut out = vec![0u16; width as usize * height as usize * 4];
         for y in 0..height {
             for x in 0..width {
-                let ox = x as f64 + min_x;
-                let oy = y as f64 + min_y;
+                let ox = x as f64 + origin_x;
+                let oy = y as f64 + origin_y;
                 let dx = ox - odx;
                 let dy = oy - ody;
                 let sx = inv_a * dx + inv_b * dy - idx;
@@ -1012,7 +1249,7 @@ fn affine(
             }
         }
         image.set_wide_rgba(width, height, out)?;
-        image.has_alpha = true;
+        image.has_alpha = image.has_alpha || bg.alpha < 255;
         return Ok(image);
     }
     let mut out = Image::from_rgba(
@@ -1020,18 +1257,22 @@ fn affine(
         height,
         vec![0u8; width as usize * height as usize * 4],
     )?;
-    out.has_alpha = true;
-    for y in 0..height {
-        for x in 0..width {
-            let ox = x as f64 + min_x;
-            let oy = y as f64 + min_y;
-            let dx = ox - odx;
-            let dy = oy - ody;
-            let sx = inv_a * dx + inv_b * dy - idx;
-            let sy = inv_c * dx + inv_d * dy - idy;
-            out.set(x, y, sample_bilinear(&image, sx, sy, bg));
-        }
-    }
+    out.has_alpha = image.has_alpha || bg.alpha < 255;
+    out.data
+        .par_chunks_exact_mut(width as usize * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, dst) in row.chunks_exact_mut(4).enumerate() {
+                let ox = x as f64 + origin_x;
+                let oy = y as f64 + origin_y;
+                let dx = ox - odx;
+                let dy = oy - ody;
+                let sx = inv_a * dx + inv_b * dy - idx;
+                let sy = inv_c * dx + inv_d * dy - idy;
+                let color = sample_bilinear(&image, sx, sy, bg);
+                dst.copy_from_slice(&[color.r, color.g, color.b, color.alpha]);
+            }
+        });
     out.format = image.format;
     Ok(out)
 }
@@ -1059,18 +1300,21 @@ fn sharpen(
     let bright_limit = if simple { 1.0 } else { (y2 / 255.0).max(0.0) };
     let dark_limit = if simple { 1.0 } else { (y3 / 255.0).max(0.0) };
     let mut out = image;
+    let row_bytes = (out.width as usize * 4).max(4);
     out.data
-        .par_chunks_exact_mut(4)
-        .zip(blurred.par_chunks_exact(4))
-        .for_each(|(dst, blur_px)| {
-            let original_lum = luminance(dst[0], dst[1], dst[2]) as f64;
-            let blurred_lum = luminance(blur_px[0], blur_px[1], blur_px[2]) as f64;
-            let diff = original_lum - blurred_lum;
-            let contrast = diff.abs();
-            let amount = if contrast < x1 { m1 } else { m2 } * 0.5;
-            let boost = (diff * amount).clamp(-dark_limit * 255.0, bright_limit * 255.0);
-            for channel in 0..3 {
-                dst[channel] = (dst[channel] as f64 + boost).clamp(0.0, 255.0) as u8;
+        .par_chunks_mut(row_bytes)
+        .zip(blurred.par_chunks(row_bytes))
+        .for_each(|(dst_row, blur_row)| {
+            for (dst, blur_px) in dst_row.chunks_exact_mut(4).zip(blur_row.chunks_exact(4)) {
+                let original_lum = luminance(dst[0], dst[1], dst[2]) as f64;
+                let blurred_lum = luminance(blur_px[0], blur_px[1], blur_px[2]) as f64;
+                let diff = original_lum - blurred_lum;
+                let contrast = diff.abs();
+                let amount = if contrast < x1 { m1 } else { m2 } * 0.5;
+                let boost = (diff * amount).clamp(-dark_limit * 255.0, bright_limit * 255.0);
+                for channel in 0..3 {
+                    dst[channel] = (dst[channel] as f64 + boost).clamp(0.0, 255.0) as u8;
+                }
             }
         });
     Ok(out)
@@ -1089,15 +1333,53 @@ fn blur(image: Image, sigma: f64) -> Result<Image> {
     Ok(out_image)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse4.1")]
-fn blur_pixels_sse41(data: &[u8], width: usize, height: usize, sigma: f64) -> Vec<u8> {
-    use std::arch::x86_64::*;
+/// `dst[i] = sum_k kernel[k] * srcs[k][i]`, accumulated in tap order. Columns are processed in
+/// blocks so the accumulator stays in registers across all taps.
+#[inline(always)]
+fn mac_rows(dst: &mut [f32], kernel: &[f32], srcs: &[&[f32]]) {
+    const LANES: usize = 16;
+    let split = dst.len() / LANES * LANES;
+    let (head, tail) = dst.split_at_mut(split);
+    for (block, chunk) in head.chunks_exact_mut(LANES).enumerate() {
+        let base = block * LANES;
+        let mut acc = [0.0f32; LANES];
+        for (&weight, src) in kernel.iter().zip(srcs) {
+            for (a, &value) in acc.iter_mut().zip(&src[base..base + LANES]) {
+                *a += value * weight;
+            }
+        }
+        chunk.copy_from_slice(&acc);
+    }
+    for (i, out) in tail.iter_mut().enumerate() {
+        let mut acc = 0.0f32;
+        for (&weight, src) in kernel.iter().zip(srcs) {
+            acc += src[split + i] * weight;
+        }
+        *out = acc;
+    }
+}
+
+/// Exactly `value.clamp(0.0, 255.0).round() as u8` (ties away from zero), written with an
+/// integer truncation so it vectorises instead of calling `roundf` per sample.
+#[inline(always)]
+fn round_u8(value: f32) -> u8 {
+    let value = value.clamp(0.0, 255.0);
+    let whole = value as i32;
+    (whole + i32::from(value - whole as f32 >= 0.5)) as u8
+}
+
+/// Separable Gaussian blur on RGBA8. Both passes accumulate whole rows (`acc[i] += w * src[i]`)
+/// in tap order, so the compiler vectorises them without any architecture-specific code and
+/// the f32 result is identical to a per-pixel multiply-accumulate over the same taps.
+fn blur_pixels(data: &[u8], width: usize, height: usize, sigma: f64) -> Vec<u8> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
     let sigma = sigma.max(0.1) as f32;
-    let radius = (sigma * 3.0).ceil() as i32;
-    let mut kernel = Vec::with_capacity((radius * 2 + 1) as usize);
+    let radius = (sigma * 3.0).ceil() as usize;
+    let mut kernel = Vec::with_capacity(radius * 2 + 1);
     let mut sum = 0.0f32;
-    for i in -radius..=radius {
+    for i in -(radius as i32)..=(radius as i32) {
         let value = (-(i * i) as f32 / (2.0 * sigma * sigma)).exp();
         kernel.push(value);
         sum += value;
@@ -1106,186 +1388,111 @@ fn blur_pixels_sse41(data: &[u8], width: usize, height: usize, sigma: f64) -> Ve
         *value /= sum;
     }
 
+    let row_len = width * 4;
     let mut horizontal = vec![0.0f32; data.len()];
     horizontal
-        .par_chunks_mut(width * 4)
-        .enumerate()
-        .for_each(|(y, row)| unsafe {
-            for x in 0..width {
-                let mut acc = _mm_setzero_ps();
-                let start = x as i32 - radius;
-                let end = x as i32 + radius;
-                if start >= 0 && end < width as i32 {
-                    for (k, weight) in kernel.iter().enumerate() {
-                        let source = (y * width + (x as i32 + k as i32 - radius) as usize) * 4;
-                        let packed =
-                            std::ptr::read_unaligned(data.as_ptr().add(source) as *const i32);
-                        let values = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128(packed)));
-                        acc = _mm_add_ps(acc, _mm_mul_ps(values, _mm_set1_ps(*weight)));
-                    }
-                } else {
-                    for (k, weight) in kernel.iter().enumerate() {
-                        let sx = (x as i32 + k as i32 - radius).clamp(0, width as i32 - 1) as usize;
-                        let source = (y * width + sx) * 4;
-                        let packed =
-                            std::ptr::read_unaligned(data.as_ptr().add(source) as *const i32);
-                        let values = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128(packed)));
-                        acc = _mm_add_ps(acc, _mm_mul_ps(values, _mm_set1_ps(*weight)));
+        .par_chunks_exact_mut(row_len)
+        .zip(data.par_chunks_exact(row_len))
+        .for_each_init(
+            || vec![0.0f32; (width + 2 * radius) * 4],
+            |padded, (row, source)| {
+                // Edge-clamped copy of the source row as f32: padded[j] = source[clamp(j - radius)].
+                for (j, dst) in padded.chunks_exact_mut(4).enumerate() {
+                    let sx = j.saturating_sub(radius).min(width - 1);
+                    for (d, &v) in dst.iter_mut().zip(&source[sx * 4..sx * 4 + 4]) {
+                        *d = v as f32;
                     }
                 }
-                _mm_storeu_ps(row.as_mut_ptr().add(x * 4), acc);
-            }
-        });
+                let taps: Vec<&[f32]> = (0..kernel.len())
+                    .map(|k| &padded[k * 4..k * 4 + row_len])
+                    .collect();
+                mac_rows(row, &kernel, &taps);
+            },
+        );
 
     let mut out = vec![0u8; data.len()];
-    out.par_chunks_mut(width * 4)
-        .enumerate()
-        .for_each(|(y, row)| unsafe {
-            for x in 0..width {
-                let mut acc = _mm_setzero_ps();
-                let start = y as i32 - radius;
-                let end = y as i32 + radius;
-                if start >= 0 && end < height as i32 {
-                    for (k, weight) in kernel.iter().enumerate() {
-                        let source = ((y as i32 + k as i32 - radius) as usize * width + x) * 4;
-                        let values = _mm_loadu_ps(horizontal.as_ptr().add(source));
-                        acc = _mm_add_ps(acc, _mm_mul_ps(values, _mm_set1_ps(*weight)));
-                    }
-                } else {
-                    for (k, weight) in kernel.iter().enumerate() {
-                        let sy =
-                            (y as i32 + k as i32 - radius).clamp(0, height as i32 - 1) as usize;
-                        let source = (sy * width + x) * 4;
-                        let values = _mm_loadu_ps(horizontal.as_ptr().add(source));
-                        acc = _mm_add_ps(acc, _mm_mul_ps(values, _mm_set1_ps(*weight)));
-                    }
-                }
-                let mut values = [0.0f32; 4];
-                _mm_storeu_ps(values.as_mut_ptr(), acc);
-                for c in 0..4 {
-                    row[x * 4 + c] = values[c].clamp(0.0, 255.0).round() as u8;
-                }
+    out.par_chunks_exact_mut(row_len).enumerate().for_each_init(
+        || vec![0.0f32; row_len],
+        |acc, (y, row)| {
+            let taps: Vec<&[f32]> = (0..kernel.len())
+                .map(|k| {
+                    let sy = (y + k).saturating_sub(radius).min(height - 1);
+                    &horizontal[sy * row_len..(sy + 1) * row_len]
+                })
+                .collect();
+            mac_rows(acc, &kernel, &taps);
+            for (dst, &value) in row.iter_mut().zip(acc.iter()) {
+                *dst = round_u8(value);
             }
-        });
-    out
-}
-
-fn blur_pixels(data: &[u8], width: usize, height: usize, sigma: f64) -> Vec<u8> {
-    if width == 0 || height == 0 {
-        return Vec::new();
-    }
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("sse4.1") {
-        return unsafe { blur_pixels_sse41(data, width, height, sigma) };
-    }
-    let sigma = sigma.max(0.1);
-    let radius = (sigma * 3.0).ceil() as i32;
-    let mut kernel = Vec::with_capacity((radius * 2 + 1) as usize);
-    let mut sum = 0.0f32;
-    for i in -radius..=radius {
-        let value = (-(i * i) as f32 / (2.0 * sigma as f32 * sigma as f32)).exp();
-        kernel.push(value);
-        sum += value;
-    }
-    for value in &mut kernel {
-        *value /= sum;
-    }
-
-    let mut horizontal = vec![0.0f32; data.len()];
-    horizontal
-        .par_chunks_mut(width * 4)
-        .enumerate()
-        .for_each(|(y, row)| {
-            let base = y * width * 4;
-            for x in 0..width {
-                let mut acc = [0.0f32; 4];
-                let start = x as i32 - radius;
-                let end = x as i32 + radius;
-                if start >= 0 && end < width as i32 {
-                    for (k, weight) in kernel.iter().enumerate() {
-                        let source = base + (x as i32 + k as i32 - radius) as usize * 4;
-                        for c in 0..4 {
-                            acc[c] += data[source + c] as f32 * weight;
-                        }
-                    }
-                } else {
-                    for (k, weight) in kernel.iter().enumerate() {
-                        let sx = (x as i32 + k as i32 - radius).clamp(0, width as i32 - 1) as usize;
-                        let source = base + sx * 4;
-                        for c in 0..4 {
-                            acc[c] += data[source + c] as f32 * weight;
-                        }
-                    }
-                }
-                row[x * 4..x * 4 + 4].copy_from_slice(&acc);
-            }
-        });
-
-    let mut out = vec![0u8; data.len()];
-    out.par_chunks_mut(width * 4)
-        .enumerate()
-        .for_each(|(y, row)| {
-            for x in 0..width {
-                let mut acc = [0.0f32; 4];
-                let start = y as i32 - radius;
-                let end = y as i32 + radius;
-                if start >= 0 && end < height as i32 {
-                    for (k, weight) in kernel.iter().enumerate() {
-                        let source = ((y as i32 + k as i32 - radius) as usize * width + x) * 4;
-                        for c in 0..4 {
-                            acc[c] += horizontal[source + c] * weight;
-                        }
-                    }
-                } else {
-                    for (k, weight) in kernel.iter().enumerate() {
-                        let sy =
-                            (y as i32 + k as i32 - radius).clamp(0, height as i32 - 1) as usize;
-                        let source = (sy * width + x) * 4;
-                        for c in 0..4 {
-                            acc[c] += horizontal[source + c] * weight;
-                        }
-                    }
-                }
-                for c in 0..4 {
-                    row[x * 4 + c] = acc[c].clamp(0.0, 255.0).round() as u8;
-                }
-            }
-        });
+        },
+    );
     out
 }
 
 fn median(image: Image, size: u32) -> Result<Image> {
     let size = size.max(1);
+    if size > image.width || size > image.height {
+        return Err(FastpkgError::Operation("rank: window too large".into()));
+    }
     if size == 1 {
         return Ok(image);
     }
     let radius = (size / 2) as i32;
-    let w = image.width as i32;
+    let w = image.width as usize;
     let h = image.height as i32;
-    let window = (size * size) as usize;
-    let mut out = image.data.clone();
-    out.par_chunks_exact_mut(4)
+    let side = (2 * radius + 1) as usize;
+    // Rank of the median in the sorted window (window includes edge-clamped duplicates).
+    let rank = (side * side / 2) as u32;
+    let mut out = vec![0u8; image.data.len()];
+    // Sliding-window histogram per row and channel: O(window side) per pixel instead of
+    // gathering and sorting the whole window. A 16-bin coarse histogram speeds up the rank scan.
+    out.par_chunks_exact_mut(w * 4)
         .enumerate()
-        .map_init(
-            || Vec::with_capacity(window),
-            |values, (idx, px)| {
-                let x = (idx as i32) % w;
-                let y = (idx as i32) / w;
-                for c in 0..4 {
-                    values.clear();
-                    for dy in -radius..=radius {
-                        for dx in -radius..=radius {
-                            let sx = (x + dx).clamp(0, w - 1) as usize;
-                            let sy = (y + dy).clamp(0, h - 1) as usize;
-                            values.push(image.data[(sy * w as usize + sx) * 4 + c]);
-                        }
+        .for_each(|(y, out_row)| {
+            let rows: Vec<&[u8]> = (-radius..=radius)
+                .map(|dy| {
+                    let sy = (y as i32 + dy).clamp(0, h - 1) as usize;
+                    &image.data[sy * w * 4..(sy + 1) * w * 4]
+                })
+                .collect();
+            for c in 0..4 {
+                let mut fine = [0u32; 256];
+                let mut coarse = [0u32; 16];
+                let column = |x: i32| (x.clamp(0, w as i32 - 1) as usize) * 4 + c;
+                for dx in -radius..=radius {
+                    let at = column(dx);
+                    for row in &rows {
+                        let v = row[at] as usize;
+                        fine[v] += 1;
+                        coarse[v >> 4] += 1;
                     }
-                    values.sort_unstable();
-                    px[c] = values[values.len() / 2];
                 }
-            },
-        )
-        .for_each(|_| {});
+                for x in 0..w {
+                    let mut seen = 0u32;
+                    let mut bucket = 0usize;
+                    while seen + coarse[bucket] <= rank {
+                        seen += coarse[bucket];
+                        bucket += 1;
+                    }
+                    let mut v = bucket << 4;
+                    while seen + fine[v] <= rank {
+                        seen += fine[v];
+                        v += 1;
+                    }
+                    out_row[x * 4 + c] = v as u8;
+                    let leaving = column(x as i32 - radius);
+                    let entering = column(x as i32 + radius + 1);
+                    for row in &rows {
+                        let old = row[leaving] as usize;
+                        fine[old] -= 1;
+                        coarse[old >> 4] -= 1;
+                        let new = row[entering] as usize;
+                        fine[new] += 1;
+                        coarse[new >> 4] += 1;
+                    }
+                }
+            }
+        });
     let mut out_image = Image::from_rgba(image.width, image.height, out)?;
     out_image.format = image.format;
     out_image.has_alpha = image.has_alpha;
@@ -1354,13 +1561,20 @@ fn unflatten(mut image: Image) -> Result<Image> {
     Ok(image)
 }
 
+/// libvips `gamma` quantises to 8 bits twice: sharp applies `x^gamma` first and
+/// `x^(1/gammaOut)` last (both truncating, with the float32 scale libvips uses), so even
+/// `gamma(g)` with the default `gammaOut` is visibly lossy.
 fn gamma(mut image: Image, gamma: f64, gamma_out: Option<f64>) -> Result<Image> {
     let gamma = gamma.clamp(1.0, 3.0);
     let gamma_out = gamma_out.unwrap_or(gamma).clamp(1.0, 3.0);
-    let exponent = gamma / gamma_out;
+    let stage = |v: f64, p: f64| -> f64 {
+        let scale = (255.0 / 255f64.powf(p)) as f32;
+        (v.powf(p) * scale as f64) as f32 as f64
+    };
     let mut lut = [0u8; 256];
-    for (i, v) in lut.iter_mut().enumerate() {
-        *v = ((i as f64 / 255.0).powf(exponent) * 255.0).clamp(0.0, 255.0) as u8;
+    for (i, out) in lut.iter_mut().enumerate() {
+        let first = stage(i as f64, gamma).trunc().clamp(0.0, 255.0);
+        *out = stage(first, 1.0 / gamma_out).trunc().clamp(0.0, 255.0) as u8;
     }
     image.data.par_chunks_exact_mut(4).for_each(|px| {
         px[0] = lut[px[0] as usize];
@@ -1417,138 +1631,136 @@ unsafe fn negate_avx2(data: &mut [u8], alpha: bool) {
     }
 }
 
+/// sharp `normalise`: stretches the CIELAB lightness between two percentiles to 0..100 and
+/// leaves chroma and alpha alone. The percentiles follow libvips `percent`: a histogram of the
+/// integer part of L with `max(L) + 1` bins, cumulated and scaled to `bins - 1`, and the first
+/// bin above `percent / 100 * bins` (or `bins` when none is).
 fn normalise(mut image: Image, lower: f64, upper: f64) -> Result<Image> {
-    let mut histogram = [0u64; 256];
-    for px in image.data.chunks_exact(4) {
-        histogram[luminance(px[0], px[1], px[2]) as usize] += 1;
-    }
-    let total: u64 = histogram.iter().sum();
+    let total = image.data.len() as u64 / 4;
     if total == 0 {
         return Ok(image);
     }
-    let low_target = (total as f64 * lower / 100.0) as u64;
-    let high_target = (total as f64 * upper / 100.0) as u64;
-    let mut cumulative = 0u64;
-    let mut low = 0u8;
-    let mut high = 255u8;
-    for (i, count) in histogram.iter().enumerate() {
-        cumulative += count;
-        if cumulative >= low_target {
-            low = i as u8;
-            break;
-        }
+    let mut histogram = [0u64; 256];
+    let mut max_bin = 0usize;
+    for px in image.data.chunks_exact(4) {
+        let l = vips::srgb_to_lab(px[0], px[1], px[2])[0];
+        let bin = (l.max(0.0) as usize).min(255);
+        histogram[bin] += 1;
+        max_bin = max_bin.max(bin);
     }
-    cumulative = 0;
-    for (i, count) in histogram.iter().enumerate() {
-        cumulative += count;
-        if cumulative >= high_target {
-            high = i as u8;
-            break;
+    let bins = max_bin + 1;
+    let min_bin = histogram.iter().position(|&count| count > 0).unwrap_or(0);
+    let percent = |p: f64| -> f64 {
+        // 0 and 100 select the extremes of the histogram.
+        if p <= 0.0 {
+            return min_bin as f64;
         }
-    }
+        if p >= 100.0 {
+            return max_bin as f64;
+        }
+        let limit = p / 100.0 * bins as f64;
+        let mut cumulative = 0u64;
+        for (i, count) in histogram.iter().take(bins).enumerate() {
+            cumulative += count;
+            if ((cumulative * (bins as u64 - 1)) / total) as f64 > limit {
+                return i as f64;
+            }
+        }
+        bins as f64
+    };
+    let low = percent(lower);
+    let high = percent(upper);
     if high <= low {
         return Ok(image);
     }
-    let scale = 255.0 / (high - low) as f64;
-    let mut lut = [0u8; 256];
-    for (i, value) in lut.iter_mut().enumerate() {
-        *value = (((i as f64 - low as f64) * scale).clamp(0.0, 255.0)) as u8;
-    }
+    let factor = (100.0 / (high - low)) as f32;
+    let offset = -(low as f32) * factor;
     image.data.par_chunks_exact_mut(4).for_each(|px| {
-        px[0] = lut[px[0] as usize];
-        px[1] = lut[px[1] as usize];
-        px[2] = lut[px[2] as usize];
+        let [l, a, b] = vips::srgb_to_lab(px[0], px[1], px[2]);
+        let rgb = vips::lab_to_srgb(l * factor + offset, a, b);
+        px[0] = rgb[0];
+        px[1] = rgb[1];
+        px[2] = rgb[2];
     });
     Ok(image)
 }
 
+/// sharp `clahe` (libvips `hist_local`): every band (alpha included) is mapped pixel by pixel
+/// through the equalised histogram of the `width` x `height` window around it. Bin counts are
+/// capped at `max_slope` (a count, whatever the window area), the clipped excess is spread
+/// evenly over the 256 bins, and edges are mirrored. `max_slope == 0` disables the clipping.
 fn clahe(image: Image, width: u32, height: u32, max_slope: f64) -> Result<Image> {
     let w = image.width as usize;
     let h = image.height as usize;
     if w == 0 || h == 0 {
         return Ok(image);
     }
-    let tile_w = (width as usize).clamp(1, w);
-    let tile_h = (height as usize).clamp(1, h);
-    let tiles_x = w.div_ceil(tile_w);
-    let tiles_y = h.div_ceil(tile_h);
-    let tile_count = tiles_x * tiles_y;
-    let mut histograms = vec![[0u64; 256]; tile_count];
-    for y in 0..h {
-        let ty = y / tile_h;
-        for x in 0..w {
-            let tx = x / tile_w;
-            let px = (y * w + x) * 4;
-            let lum = luminance(image.data[px], image.data[px + 1], image.data[px + 2]);
-            histograms[ty * tiles_x + tx][lum as usize] += 1;
-        }
+    if width as usize > w || height as usize > h {
+        return Err(FastpkgError::Operation(
+            "hist_local: window too large".into(),
+        ));
     }
-    let clip_limit = if max_slope > 0.0 {
-        (max_slope * (tile_w * tile_h) as f64 / 256.0).max(1.0)
-    } else {
-        f64::MAX
+    let (win_w, win_h) = (width.max(1) as usize, height.max(1) as usize);
+    let area = (win_w * win_h) as f64;
+    let limit = if max_slope > 0.0 { max_slope } else { f64::MAX };
+    let channels = if image.has_alpha { 4 } else { 3 };
+    let mirror = |v: isize, len: usize| -> usize {
+        let len = len as isize;
+        let v = if v < 0 {
+            -v - 1
+        } else if v >= len {
+            2 * len - v - 1
+        } else {
+            v
+        };
+        v.clamp(0, len - 1) as usize
     };
-    let mut luts = vec![[0u8; 256]; tile_count];
-    for (tile_index, histogram) in histograms.iter_mut().enumerate() {
-        let mut excess = 0u64;
-        for count in histogram.iter_mut() {
-            if *count as f64 > clip_limit {
-                excess += *count - clip_limit as u64;
-                *count = clip_limit as u64;
-            }
-        }
-        if excess > 0 {
-            let share = excess / 256;
-            let remainder = excess % 256;
-            for (i, count) in histogram.iter_mut().enumerate() {
-                *count += share + u64::from((i as u64) < remainder);
-            }
-        }
-        let total: u64 = histogram.iter().sum();
-        let mut cumulative = 0u64;
-        let mut lut = [0u8; 256];
-        for (i, value) in lut.iter_mut().enumerate() {
-            cumulative += histogram[i];
-            *value = if total == 0 {
-                i as u8
-            } else {
-                ((cumulative as f64 / total as f64) * 255.0).round() as u8
-            };
-        }
-        luts[tile_index] = lut;
-    }
-    let mut out = image;
-    out.data
-        .par_chunks_exact_mut(4)
+    let (off_x, off_y) = ((win_w / 2) as isize, (win_h / 2) as isize);
+    let src = &image.data;
+    let mut out = image.data.clone();
+    out.par_chunks_exact_mut(w * 4)
         .enumerate()
-        .for_each(|(index, px)| {
-            let x = index % w;
-            let y = index / w;
-            let lum = luminance(px[0], px[1], px[2]);
-            let fx = (x as f64 + 0.5) / tile_w as f64 - 0.5;
-            let fy = (y as f64 + 0.5) / tile_h as f64 - 0.5;
-            let x0 = fx.floor().max(0.0) as usize;
-            let y0 = fy.floor().max(0.0) as usize;
-            let x1 = (x0 + 1).min(tiles_x - 1);
-            let y1 = (y0 + 1).min(tiles_y - 1);
-            let tx = (fx - x0 as f64).clamp(0.0, 1.0);
-            let ty = (fy - y0 as f64).clamp(0.0, 1.0);
-            let sample = |x: usize, y: usize| -> f64 { luts[y * tiles_x + x][lum as usize] as f64 };
-            let top = sample(x0, y0) + (sample(x1, y0) - sample(x0, y0)) * tx;
-            let bottom = sample(x0, y1) + (sample(x1, y1) - sample(x0, y1)) * tx;
-            let new_lum = top + (bottom - top) * ty;
-            if lum > 0 {
-                let scale = new_lum / lum as f64;
-                px[0] = (px[0] as f64 * scale).clamp(0.0, 255.0) as u8;
-                px[1] = (px[1] as f64 * scale).clamp(0.0, 255.0) as u8;
-                px[2] = (px[2] as f64 * scale).clamp(0.0, 255.0) as u8;
-            } else {
-                px[0] = new_lum.clamp(0.0, 255.0) as u8;
-                px[1] = px[0];
-                px[2] = px[0];
+        .for_each(|(y, row)| {
+            let rows: Vec<usize> = (0..win_h as isize)
+                .map(|wy| mirror(y as isize - off_y + wy, h) * w)
+                .collect();
+            let cols: Vec<usize> = (0..w as isize + win_w as isize)
+                .map(|i| mirror(i - off_x, w))
+                .collect();
+            for c in 0..channels {
+                let mut hist = [0u32; 256];
+                for &col in &cols[0..win_w] {
+                    for &r in &rows {
+                        hist[src[(r + col) * 4 + c] as usize] += 1;
+                    }
+                }
+                for x in 0..w {
+                    if x > 0 {
+                        let (remove, add) = (cols[x - 1], cols[x + win_w - 1]);
+                        for &r in &rows {
+                            hist[src[(r + remove) * 4 + c] as usize] -= 1;
+                            hist[src[(r + add) * 4 + c] as usize] += 1;
+                        }
+                    }
+                    let value = row[x * 4 + c] as usize;
+                    let mut excess = 0.0f64;
+                    let mut below = 0.0f64;
+                    for (i, &count) in hist.iter().enumerate() {
+                        let count = count as f64;
+                        let kept = count.min(limit);
+                        excess += count - kept;
+                        if i <= value {
+                            below += kept;
+                        }
+                    }
+                    let cdf = below + (((value as f64 + 1.0) * excess) / 256.0).floor();
+                    row[x * 4 + c] = ((cdf * 255.0 / area).floor()).clamp(0.0, 255.0) as u8;
+                }
             }
         });
-    Ok(out)
+    let mut result = image;
+    result.data = out;
+    Ok(result)
 }
 
 fn convolve(
@@ -1568,23 +1780,70 @@ fn convolve(
     let scale = scale.unwrap_or_else(|| kernel.iter().sum::<f64>());
     let scale = if scale.abs() < 1e-12 { 1.0 } else { scale } as f32;
     let weights = kernel.iter().map(|value| *value as f32).collect::<Vec<_>>();
-    let mut out = image.data.clone();
-    out.par_chunks_exact_mut(w * 4)
+    // sharp premultiplies RGBA input before convolving (and unpremultiplies afterwards), and
+    // convolves the alpha band as well.
+    let premultiply = image.has_alpha;
+    let source: Vec<u8> = if premultiply {
+        image
+            .data
+            .chunks_exact(4)
+            .flat_map(|px| {
+                let a = px[3] as u32;
+                [
+                    (px[0] as u32 * a / 255) as u8,
+                    (px[1] as u32 * a / 255) as u8,
+                    (px[2] as u32 * a / 255) as u8,
+                    px[3],
+                ]
+            })
+            .collect()
+    } else {
+        image.data.clone()
+    };
+    // Accumulate in float without clamping: sharp unpremultiplies the raw convolution result,
+    // so negative sums (e.g. a laplacian) still divide by a negative alpha.
+    let mut sums = vec![0f32; w * h * 4];
+    sums.par_chunks_exact_mut(w * 4)
         .enumerate()
         .for_each(|(y, row)| {
             for x in 0..w {
-                for c in 0..3 {
+                for c in 0..4 {
+                    if c == 3 && !premultiply {
+                        continue;
+                    }
                     let mut acc = 0.0f32;
                     for ky in 0..kh {
                         let sy = (y as i32 + ky as i32 - cy).clamp(0, h as i32 - 1) as usize;
                         let source_row = sy * w;
                         for kx in 0..kw {
                             let sx = (x as i32 + kx as i32 - cx).clamp(0, w as i32 - 1) as usize;
-                            acc += image.data[(source_row + sx) * 4 + c] as f32
-                                * weights[ky * kw + kx];
+                            acc += source[(source_row + sx) * 4 + c] as f32 * weights[ky * kw + kx];
                         }
                     }
-                    row[x * 4 + c] = (acc / scale + offset as f32).clamp(0.0, 255.0) as u8;
+                    // No clamping or rounding here: sharp unpremultiplies the raw float result.
+                    row[x * 4 + c] = acc / scale + offset as f32;
+                }
+            }
+        });
+    let mut out = image.data.clone();
+    out.par_chunks_exact_mut(4)
+        .zip(sums.par_chunks_exact(4))
+        .for_each(|(px, sum)| {
+            if premultiply {
+                let alpha = sum[3];
+                for c in 0..3 {
+                    // Negative sums divide by a negative alpha (no clamping); alpha 0 gives 0.
+                    let value = if alpha != 0.0 {
+                        (sum[c] as f64 * 255.0 / alpha as f64) as f32
+                    } else {
+                        0.0
+                    };
+                    px[c] = value.clamp(0.0, 255.0) as u8;
+                }
+                px[3] = alpha.clamp(0.0, 255.0) as u8;
+            } else {
+                for c in 0..3 {
+                    px[c] = sum[c].clamp(0.0, 255.0) as u8;
                 }
             }
         });
@@ -1594,26 +1853,27 @@ fn convolve(
     Ok(out_image)
 }
 
+/// sharp `threshold`: with `grayscale` the image is first converted to `B_W`; every band
+/// (alpha included) is then compared with `>= threshold` and set to 0 or 255. A threshold of 0
+/// leaves the image untouched.
 fn threshold(mut image: Image, threshold: u8, grayscale: bool) -> Result<Image> {
+    if threshold == 0 {
+        return Ok(image);
+    }
+    let test = move |v: u8| if v >= threshold { 255 } else { 0 };
     image.data.par_chunks_exact_mut(4).for_each(|px| {
-        let lum = luminance(px[0], px[1], px[2]);
-        let value = if lum >= threshold { 255 } else { 0 };
         if grayscale {
+            let value = test(vips::bw(px[0], px[1], px[2]));
             px[0] = value;
             px[1] = value;
             px[2] = value;
-            px[3] = 255;
-        } else if value == 255 {
-            px[0] = 255;
-            px[1] = 255;
-            px[2] = 255;
         } else {
-            px[0] = 0;
-            px[1] = 0;
-            px[2] = 0;
+            px[0] = test(px[0]);
+            px[1] = test(px[1]);
+            px[2] = test(px[2]);
         }
+        px[3] = test(px[3]);
     });
-    image.has_alpha = false;
     Ok(image)
 }
 
@@ -1638,15 +1898,26 @@ fn boolean(
     } else {
         fastpkg_codecs::decode(&bytes, Format::from_magic(&bytes), &Default::default())?
     };
-    if overlay.width != image.width || overlay.height != image.height {
-        return Err(FastpkgError::Operation(
-            "boolean operand dimensions must match image".into(),
-        ));
-    }
-    let mut out = image;
-    out.data
-        .par_chunks_exact_mut(4)
-        .zip(overlay.data.par_chunks_exact(4))
+    // libvips pads the smaller of the two images with zeros (top-left aligned).
+    let (width, height) = (
+        image.width.max(overlay.width),
+        image.height.max(overlay.height),
+    );
+    let pad = |source: &Image| -> Vec<u8> {
+        let mut data = vec![0u8; width as usize * height as usize * 4];
+        for y in 0..source.height as usize {
+            let src = y * source.width as usize * 4;
+            let dst = y * width as usize * 4;
+            let len = source.width as usize * 4;
+            data[dst..dst + len].copy_from_slice(&source.data[src..src + len]);
+        }
+        data
+    };
+    let has_alpha = image.has_alpha;
+    let mut data = pad(&image);
+    let other = pad(&overlay);
+    data.par_chunks_exact_mut(4)
+        .zip(other.par_chunks_exact(4))
         .for_each(|(a, b)| {
             for i in 0..4 {
                 a[i] = match operator {
@@ -1656,11 +1927,24 @@ fn boolean(
                     _ => a[i],
                 };
             }
+            if !has_alpha {
+                a[3] = 255;
+            }
         });
+    let mut out = Image::from_rgba(width, height, data)?;
+    out.format = image.format;
+    out.has_alpha = has_alpha;
     Ok(out)
 }
 
 fn linear(mut image: Image, a: Option<&NumberOrArray>, b: Option<&NumberOrArray>) -> Result<Image> {
+    // sharp leaves the alpha band alone unless `a` has an entry for every band.
+    let bands = if image.has_alpha { 4 } else { 3 };
+    let len = match a {
+        Some(NumberOrArray::Array(values)) => values.len(),
+        _ => 1,
+    };
+    let touch_alpha = image.has_alpha && len == bands;
     let mut lut = [[0u8; 256]; 4];
     for c in 0..4 {
         let av = a.map(|v| v.value(c)).unwrap_or(1.0);
@@ -1670,8 +1954,11 @@ fn linear(mut image: Image, a: Option<&NumberOrArray>, b: Option<&NumberOrArray>
         }
     }
     image.data.par_chunks_exact_mut(4).for_each(|px| {
-        for c in 0..4 {
+        for c in 0..3 {
             px[c] = lut[c][px[c] as usize];
+        }
+        if touch_alpha {
+            px[3] = lut[3][px[3] as usize];
         }
     });
     Ok(image)
@@ -1679,6 +1966,11 @@ fn linear(mut image: Image, a: Option<&NumberOrArray>, b: Option<&NumberOrArray>
 
 fn recomb(mut image: Image, matrix: &[Vec<f64>]) -> Result<Image> {
     let n = matrix.len().min(4);
+    if n == 4 && !image.has_alpha {
+        return Err(FastpkgError::Operation(
+            "recomb: bands in must equal matrix width".into(),
+        ));
+    }
     let mut coefficients = [[0.0f32; 4]; 4];
     for (row, values) in matrix.iter().take(n).enumerate() {
         for (col, value) in values.iter().take(4).enumerate() {
@@ -1698,6 +1990,8 @@ fn recomb(mut image: Image, matrix: &[Vec<f64>]) -> Result<Image> {
     Ok(image)
 }
 
+/// sharp `modulate`: colours go through LCh; lightness is scaled by `brightness` and shifted by
+/// `lightness`, chroma is scaled by `saturation` and the hue angle is rotated by `hue` degrees.
 fn modulate(
     mut image: Image,
     brightness: f64,
@@ -1705,50 +1999,62 @@ fn modulate(
     hue: f64,
     lightness: f64,
 ) -> Result<Image> {
-    let hue = hue.to_radians() as f32;
-    let cos_h = hue.cos();
-    let sin_h = hue.sin();
-    let brightness = brightness as f32;
-    let saturation = saturation as f32;
-    let lightness = lightness as f32 / 255.0;
+    if brightness == 1.0 && saturation == 1.0 && hue == 0.0 && lightness == 0.0 {
+        return Ok(image);
+    }
+    let (brightness, saturation, lightness) =
+        (brightness as f32, saturation as f32, lightness as f32);
     image.data.par_chunks_exact_mut(4).for_each(|px| {
-        let mut r = px[0] as f32 / 255.0;
-        let mut g = px[1] as f32 / 255.0;
-        let mut b = px[2] as f32 / 255.0;
-        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        r = (lum + (r - lum) * saturation) * brightness;
-        g = (lum + (g - lum) * saturation) * brightness;
-        b = (lum + (b - lum) * saturation) * brightness;
-        let nr = r * cos_h - g * sin_h;
-        let ng = r * sin_h + g * cos_h;
-        r = nr;
-        g = ng;
-        px[0] = ((r + lightness) * 255.0).clamp(0.0, 255.0) as u8;
-        px[1] = ((g + lightness) * 255.0).clamp(0.0, 255.0) as u8;
-        px[2] = ((b + lightness) * 255.0).clamp(0.0, 255.0) as u8;
+        let [l, a, b] = vips::srgb_to_lab(px[0], px[1], px[2]);
+        let chroma = (a * a + b * b).sqrt();
+        let mut angle = b.atan2(a).to_degrees();
+        if angle < 0.0 {
+            angle += 360.0;
+        }
+        let l = l * brightness + lightness;
+        let chroma = chroma * saturation;
+        let angle = (angle + hue as f32).to_radians();
+        let rgb = vips::lab_to_srgb(l, chroma * angle.cos(), chroma * angle.sin());
+        px[0] = rgb[0];
+        px[1] = rgb[1];
+        px[2] = rgb[2];
     });
     Ok(image)
 }
 
+/// sharp `tint`: a lookup table indexed by the `B_W` grey level; each entry keeps the lightness
+/// of that grey in CIELAB and takes the tint colour's a/b scaled by a parabola that fades the
+/// tint out towards black and white.
 fn tint(mut image: Image, tint: &str) -> Result<Image> {
     let color = Color::parse(tint)
         .ok_or_else(|| FastpkgError::InvalidOptions(format!("invalid tint color {tint}")))?;
+    let [_, tint_a, tint_b] = vips::srgb_to_lab(color.r, color.g, color.b);
+    let mut lut = [[0u8; 3]; 256];
+    for (g, entry) in lut.iter_mut().enumerate() {
+        let l = vips::srgb_to_lab(g as u8, g as u8, g as u8)[0];
+        let unit = l / 100.0;
+        let weight = 1.0 - 4.0 * (unit - 0.5) * (unit - 0.5);
+        *entry = vips::lab_to_srgb(l, weight * tint_a, weight * tint_b);
+    }
     image.data.par_chunks_exact_mut(4).for_each(|px| {
-        let lum = luminance(px[0], px[1], px[2]);
-        px[0] = (lum as u16 * color.r as u16 / 255) as u8;
-        px[1] = (lum as u16 * color.g as u16 / 255) as u8;
-        px[2] = (lum as u16 * color.b as u16 / 255) as u8;
+        let rgb = lut[vips::bw(px[0], px[1], px[2]) as usize];
+        px[0] = rgb[0];
+        px[1] = rgb[1];
+        px[2] = rgb[2];
     });
     Ok(image)
 }
 
 fn greyscale(mut image: Image) -> Result<Image> {
-    image.data.par_chunks_exact_mut(4).for_each(|px| {
-        let lum = luminance(px[0], px[1], px[2]);
-        px[0] = lum;
-        px[1] = lum;
-        px[2] = lum;
-    });
+    // Whole runs per task (not one rayon item per pixel); tiny images stay on this thread.
+    if image.data.len() >= 1 << 20 {
+        image
+            .data
+            .par_chunks_mut(1 << 17)
+            .for_each(vips::bw_rgba_run);
+    } else {
+        vips::bw_rgba_run(&mut image.data);
+    }
     Ok(image)
 }
 
@@ -1767,17 +2073,21 @@ fn extract_channel(mut image: Image, selector: &ChannelSelector) -> Result<Image
             }
         },
     }
-    .min(3);
-    let mut out = image.data.clone();
-    out.par_chunks_exact_mut(4)
-        .zip(image.data.par_chunks_exact(4))
-        .for_each(|(dst, src)| {
-            dst[0] = src[channel];
-            dst[1] = src[channel];
-            dst[2] = src[channel];
-            dst[3] = 255;
-        });
-    image.data = out;
+    .min(4);
+    let channels = if image.has_alpha { 4 } else { 3 };
+    if channel >= channels {
+        return Err(FastpkgError::Operation(format!(
+            "Cannot extract channel {channel} from image with channels 0-{}",
+            channels - 1
+        )));
+    }
+    image.data.par_chunks_exact_mut(4).for_each(|px| {
+        let value = px[channel];
+        px[0] = value;
+        px[1] = value;
+        px[2] = value;
+        px[3] = 255;
+    });
     image.gray = true;
     image.has_alpha = false;
     Ok(image)
@@ -2658,22 +2968,89 @@ fn composite(
     top: Option<i32>,
     left: Option<i32>,
     tile: bool,
+    density: Option<u32>,
+    premultiplied: bool,
+    source: Option<&fastpkg_core::options::InputOptions>,
 ) -> Result<Image> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(input)
         .map_err(|e| FastpkgError::InvalidOptions(format!("invalid composite base64: {e}")))?;
-    let overlay = fastpkg_codecs::decode(&bytes, Format::from_magic(&bytes), &Default::default())?;
+    let mut input_options = source.cloned().unwrap_or_default();
+    if let Some(density) = density {
+        input_options.density = density;
+    }
+    let format = if input_options.raw.is_some()
+        || input_options.create.is_some()
+        || input_options.text.is_some()
+    {
+        Format::Raw
+    } else {
+        Format::from_magic(&bytes)
+    };
+    let overlay = fastpkg_codecs::decode(&bytes, format, &input_options)?;
+    if overlay.width == 0 || overlay.height == 0 {
+        return Err(FastpkgError::InvalidOptions(
+            "composite overlay has no pixels".into(),
+        ));
+    }
     let mut out = image;
     out.ensure_alpha(255);
+    // Operators whose result is not `dest` where the overlay is transparent (clear, source, in,
+    // out, dest-in, dest-atop) act on the whole canvas: sharp pads the overlay to canvas size.
+    let global = matches!(
+        blend,
+        Blend::Clear | Blend::Source | Blend::In | Blend::Out | Blend::DestIn | Blend::DestAtop
+    );
     if tile {
-        let mut y = 0;
-        while y < out.height {
-            let mut x = 0;
-            while x < out.width {
-                blend_at(&mut out, &overlay, x as i32, y as i32, blend);
-                x += overlay.width;
+        // With gravity one tile is placed like a plain overlay and the grid continues in both
+        // directions; an explicit top/left instead crops the replicated grid at that offset
+        // (clamped to the grid).
+        let (ow, oh) = (overlay.width as i32, overlay.height as i32);
+        let (cw, ch) = (out.width as i32, out.height as i32);
+        // sharp replicates an odd number of tiles per axis (at least enough to cover the canvas).
+        let odd_tiles = |canvas: i32, tile: i32| -> i32 {
+            let count = (canvas + tile - 1) / tile;
+            if count % 2 == 0 {
+                count + 1
+            } else {
+                count
             }
-            y += overlay.height;
+        };
+        let (tw, th) = (odd_tiles(cw, ow) * ow, odd_tiles(ch, oh) * oh);
+        let (x0, y0) = match (left, top) {
+            // Explicit offsets pick the crop of the replicated grid (clamped to its size).
+            (Some(l), Some(t)) => {
+                if l < 0 || t < 0 {
+                    return Err(FastpkgError::Operation(
+                        "extract_area: bad extract area".into(),
+                    ));
+                }
+                (-l.min(tw - cw), -t.min(th - ch))
+            }
+            // Gravity places one tile like a plain overlay; the grid continues from there.
+            _ => {
+                let place = |align: Align, canvas: i32, tile: i32| -> i32 {
+                    let origin = match align {
+                        Align::Start => 0,
+                        Align::Center => (canvas - tile).div_euclid(2),
+                        Align::End => canvas - tile,
+                    };
+                    origin.rem_euclid(tile) - tile
+                };
+                (
+                    place(horizontal(gravity), cw, ow),
+                    place(vertical(gravity), ch, oh),
+                )
+            }
+        };
+        let mut y = y0;
+        while y < ch {
+            let mut x = x0;
+            while x < cw {
+                blend_at(&mut out, &overlay, x, y, blend, premultiplied);
+                x += ow;
+            }
+            y += oh;
         }
         return Ok(out);
     }
@@ -2687,11 +3064,31 @@ fn composite(
         Align::Center => (out.height as i32 - overlay.height as i32) / 2,
         Align::End => out.height as i32 - overlay.height as i32,
     });
-    blend_at(&mut out, &overlay, x, y, blend);
+    if global {
+        let (ow, oh) = (overlay.width as i32, overlay.height as i32);
+        for dy in 0..out.height as i32 {
+            for dx in 0..out.width as i32 {
+                let (sx, sy) = (dx - x, dy - y);
+                let s = if sx >= 0 && sy >= 0 && sx < ow && sy < oh {
+                    overlay.get(sx as u32, sy as u32)
+                } else {
+                    Color::TRANSPARENT
+                };
+                let d = out.get(dx as u32, dy as u32);
+                out.set(
+                    dx as u32,
+                    dy as u32,
+                    blend_pixel(d, s, blend, premultiplied),
+                );
+            }
+        }
+        return Ok(out);
+    }
+    blend_at(&mut out, &overlay, x, y, blend, premultiplied);
     Ok(out)
 }
 
-fn blend_at(dst: &mut Image, src: &Image, ox: i32, oy: i32, blend: Blend) {
+fn blend_at(dst: &mut Image, src: &Image, ox: i32, oy: i32, blend: Blend, premult: bool) {
     for sy in 0..src.height {
         for sx in 0..src.width {
             let dx = ox + sx as i32;
@@ -2701,13 +3098,19 @@ fn blend_at(dst: &mut Image, src: &Image, ox: i32, oy: i32, blend: Blend) {
             }
             let s = src.get(sx, sy);
             let d = dst.get(dx as u32, dy as u32);
-            let color = blend_pixel(d, s, blend);
+            let color = blend_pixel(d, s, blend, premult);
             dst.set(dx as u32, dy as u32, color);
         }
     }
 }
 
-fn blend_pixel(d: Color, s: Color, blend: Blend) -> Color {
+/// Blends one overlay pixel `s` onto the backdrop pixel `d`.
+///
+/// The arithmetic follows libvips' `composite` (what sharp uses), which differs from the
+/// textbook W3C formulas in a few places: separable blend functions are evaluated on
+/// *premultiplied* colours, `atop`/`dest-atop` take their colour weights from `over`/`dest-over`
+/// while keeping the Porter-Duff alpha, and `saturate`/`add` are additive operators.
+fn blend_pixel(d: Color, s: Color, blend: Blend, src_premultiplied: bool) -> Color {
     if blend == Blend::Clear {
         return Color::TRANSPARENT;
     }
@@ -2720,8 +3123,17 @@ fn blend_pixel(d: Color, s: Color, blend: Blend) -> Color {
 
     let sa = s.alpha as f64 / 255.0;
     let da = d.alpha as f64 / 255.0;
-    let source = [s.r as f64 / 255.0, s.g as f64 / 255.0, s.b as f64 / 255.0];
-    let backdrop = [d.r as f64 / 255.0, d.g as f64 / 255.0, d.b as f64 / 255.0];
+    // Premultiplied overlay colour (`A'`): with `premultiplied: true` the stored values are
+    // used as-is, even where they exceed the alpha (libvips does not clamp them).
+    let sp = [s.r, s.g, s.b].map(|c| {
+        let c = c as f64 / 255.0;
+        if src_premultiplied {
+            c
+        } else {
+            c * sa
+        }
+    });
+    let dst = [d.r as f64 / 255.0, d.g as f64 / 255.0, d.b as f64 / 255.0];
 
     let separable = |mode: Blend, cb: f64, cs: f64| -> f64 {
         match mode {
@@ -2738,7 +3150,6 @@ fn blend_pixel(d: Color, s: Color, blend: Blend) -> Color {
             Blend::Lighten => cb.max(cs),
             Blend::Difference => (cb - cs).abs(),
             Blend::Exclusion => cb + cs - 2.0 * cb * cs,
-            Blend::Add => (cb + cs).min(1.0),
             Blend::HardLight => {
                 if cs <= 0.5 {
                     2.0 * cb * cs
@@ -2780,46 +3191,51 @@ fn blend_pixel(d: Color, s: Color, blend: Blend) -> Color {
         }
     };
 
-    let blended = if blend == Blend::Saturate {
-        set_saturation(backdrop, source)
-    } else {
-        [
-            separable(blend, backdrop[0], source[0]),
-            separable(blend, backdrop[1], source[1]),
-            separable(blend, backdrop[2], source[2]),
-        ]
+    // (output alpha, premultiplied output colour)
+    let (out_a, premult): (f64, [f64; 3]) = match blend {
+        Blend::Atop => (da, [0, 1, 2].map(|i| sp[i] + (1.0 - sa) * da * dst[i])),
+        Blend::DestAtop => (sa, [0, 1, 2].map(|i| (1.0 - da) * sp[i] + da * dst[i])),
+        Blend::Add => ((sa + da).min(1.0), [0, 1, 2].map(|i| sp[i] + da * dst[i])),
+        Blend::Saturate => (
+            (sa + da).min(1.0),
+            [0, 1, 2].map(|i| sa.min(1.0 - da) * sp[i] + da * dst[i]),
+        ),
+        Blend::Over
+        | Blend::In
+        | Blend::Out
+        | Blend::DestOver
+        | Blend::DestIn
+        | Blend::DestOut
+        | Blend::Xor => {
+            let (fa, fb) = match blend {
+                Blend::In => (da, 0.0),
+                Blend::Out => (1.0 - da, 0.0),
+                Blend::DestOver => (1.0 - da, 1.0),
+                Blend::DestIn => (0.0, sa),
+                Blend::DestOut => (0.0, 1.0 - sa),
+                Blend::Xor => (1.0 - da, 1.0 - sa),
+                _ => (1.0, 1.0 - sa),
+            };
+            (
+                sa * fa + da * fb,
+                [0, 1, 2].map(|i| fa * sp[i] + da * fb * dst[i]),
+            )
+        }
+        _ => (
+            sa + da - sa * da,
+            [0, 1, 2].map(|i| {
+                let a = sp[i];
+                let b = da * dst[i];
+                (1.0 - da) * a + (1.0 - sa) * b + sa * da * separable(blend, b, a)
+            }),
+        ),
     };
 
-    let (fa, fb, use_blend) = match blend {
-        Blend::Over => (1.0, 1.0 - sa, true),
-        Blend::In => (da, 0.0, false),
-        Blend::Out => (1.0 - da, 0.0, false),
-        Blend::Atop => (da, 1.0 - sa, false),
-        Blend::DestOver => (1.0 - da, 1.0, false),
-        Blend::DestIn => (0.0, sa, false),
-        Blend::DestOut => (0.0, 1.0 - sa, false),
-        Blend::DestAtop => (1.0 - da, sa, false),
-        Blend::Xor => (1.0 - da, 1.0 - sa, false),
-        _ => (1.0, 1.0 - sa, true),
-    };
-
-    let out_a = if use_blend {
-        sa + da * (1.0 - sa)
-    } else {
-        sa * fa + da * fb
-    };
     let channel = |index: usize| -> u8 {
         if out_a <= 0.0 {
             return 0;
         }
-        let value = if use_blend {
-            sa * da * blended[index]
-                + sa * (1.0 - da) * source[index]
-                + (1.0 - sa) * da * backdrop[index]
-        } else {
-            sa * fa * source[index] + da * fb * backdrop[index]
-        };
-        (value / out_a * 255.0).clamp(0.0, 255.0).round() as u8
+        (premult[index] / out_a * 255.0).clamp(0.0, 255.0).round() as u8
     };
 
     Color {
@@ -2828,70 +3244,6 @@ fn blend_pixel(d: Color, s: Color, blend: Blend) -> Color {
         b: channel(2),
         alpha: (out_a * 255.0).round() as u8,
     }
-}
-
-fn rgb_to_hsl(rgb: [f64; 3]) -> [f64; 3] {
-    let max = rgb[0].max(rgb[1]).max(rgb[2]);
-    let min = rgb[0].min(rgb[1]).min(rgb[2]);
-    let l = (max + min) * 0.5;
-    if (max - min).abs() < 1e-9 {
-        return [0.0, 0.0, l];
-    }
-    let d = max - min;
-    let s = if l > 0.5 {
-        d / (2.0 - max - min)
-    } else {
-        d / (max + min)
-    };
-    let h = if max == rgb[0] {
-        (rgb[1] - rgb[2]) / d + if rgb[1] < rgb[2] { 6.0 } else { 0.0 }
-    } else if max == rgb[1] {
-        (rgb[2] - rgb[0]) / d + 2.0
-    } else {
-        (rgb[0] - rgb[1]) / d + 4.0
-    };
-    [h / 6.0, s, l]
-}
-
-fn hsl_to_rgb(hsl: [f64; 3]) -> [f64; 3] {
-    if hsl[1] <= 0.0 {
-        return [hsl[2], hsl[2], hsl[2]];
-    }
-    let q = if hsl[2] < 0.5 {
-        hsl[2] * (1.0 + hsl[1])
-    } else {
-        hsl[2] + hsl[1] - hsl[2] * hsl[1]
-    };
-    let p = 2.0 * hsl[2] - q;
-    let hue = |mut t: f64| -> f64 {
-        if t < 0.0 {
-            t += 1.0;
-        }
-        if t > 1.0 {
-            t -= 1.0;
-        }
-        if t < 1.0 / 6.0 {
-            p + (q - p) * 6.0 * t
-        } else if t < 0.5 {
-            q
-        } else if t < 2.0 / 3.0 {
-            p + (q - p) * (2.0 / 3.0 - t) * 6.0
-        } else {
-            p
-        }
-    };
-    [
-        hue(hsl[0] + 1.0 / 3.0),
-        hue(hsl[0]),
-        hue(hsl[0] - 1.0 / 3.0),
-    ]
-}
-
-fn set_saturation(backdrop: [f64; 3], source: [f64; 3]) -> [f64; 3] {
-    let mut hsl = rgb_to_hsl(backdrop);
-    let source_hsl = rgb_to_hsl(source);
-    hsl[1] = source_hsl[1];
-    hsl_to_rgb(hsl)
 }
 
 struct StatsAccum {
@@ -3043,6 +3395,45 @@ pub fn stats(image: &Image) -> Stats {
         });
     }
 
+    // 16-bit images report their statistics on the full 0..65535 range (sharp/libvips).
+    if let Some(wide) = image
+        .wide
+        .as_ref()
+        .filter(|w| w.len() == width * height * 4)
+    {
+        let mut min = [u32::MAX; 4];
+        let mut max = [0u32; 4];
+        let mut positions = [[(0u32, 0u32); 2]; 4];
+        let mut sum = [0u64; 4];
+        let mut sum_sq = [0f64; 4];
+        for (index, px) in wide.chunks_exact(4).enumerate() {
+            let (x, y) = ((index % width) as u32, (index / width) as u32);
+            for c in 0..channels {
+                let value = px[c] as u32;
+                if value < min[c] {
+                    min[c] = value;
+                    positions[c][0] = (x, y);
+                }
+                if value > max[c] {
+                    max[c] = value;
+                    positions[c][1] = (x, y);
+                }
+                sum[c] += value as u64;
+                sum_sq[c] += value as f64 * value as f64;
+            }
+        }
+        for (c, stat) in channel_stats.iter_mut().enumerate() {
+            let mean = sum[c] as f64 / count;
+            stat.min = min[c];
+            stat.max = max[c];
+            stat.sum = sum[c];
+            stat.mean = mean;
+            stat.stdev = (sum_sq[c] / count - mean * mean).max(0.0).sqrt();
+            (stat.min_x, stat.min_y) = positions[c][0];
+            (stat.max_x, stat.max_y) = positions[c][1];
+        }
+    }
+
     let entropy = accum
         .hist
         .iter()
@@ -3155,7 +3546,7 @@ pub fn apply_output_colourspace(image: &mut Image, space: &str) -> Result<()> {
         "grey16" | "gray16" => {
             image.discard_wide();
             image.data.par_chunks_exact_mut(4).for_each(|px| {
-                let lum = luminance(px[0], px[1], px[2]);
+                let lum = vips::bw(px[0], px[1], px[2]);
                 px[0] = lum;
                 px[1] = lum;
                 px[2] = lum;
@@ -3167,16 +3558,15 @@ pub fn apply_output_colourspace(image: &mut Image, space: &str) -> Result<()> {
             Ok(())
         }
         "b-w" | "bw" | "grey" | "gray" => {
+            // Alpha survives the conversion: sharp reports 2 channels for LA output.
             image.discard_wide();
             image.data.par_chunks_exact_mut(4).for_each(|px| {
-                let lum = luminance(px[0], px[1], px[2]);
+                let lum = vips::bw(px[0], px[1], px[2]);
                 px[0] = lum;
                 px[1] = lum;
                 px[2] = lum;
-                px[3] = 255;
             });
             image.gray = true;
-            image.has_alpha = false;
             Ok(())
         }
         other => Err(FastpkgError::UnsupportedOutput(format!(

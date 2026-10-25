@@ -10,3 +10,4 @@ tools/nasm-*/
 .DS_Store
 dist/
 artifacts/
+bench/.cache/

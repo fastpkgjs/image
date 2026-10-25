@@ -15,105 +15,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: build ${{ matrix.target }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: image-win32-x64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            artifact: image-darwin-x64
-          - os: macos-15
-            target: aarch64-apple-darwin
-            artifact: image-darwin-arm64
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: image-linux-x64-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact: image-linux-arm64-gnu
-    runs-on: ${{ matrix.os }}
+  # Fail fast: the tag must match package.json, the Cargo workspace and Cargo.lock.
+  verify-version:
+    name: verify version
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.99.1
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      - name: Configure MSVC
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-      - name: Pin MSVC linker
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          $link = Get-ChildItem (Join-Path $vsPath 'VC\Tools\MSVC') -Recurse -Filter link.exe |
-            Where-Object { $_.FullName -match 'Hostx64\\x64\\link.exe$' } |
-            Select-Object -First 1 -ExpandProperty FullName
-          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$link" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - name: Install NASM (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          choco install nasm -y
-          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
-      - name: Install NASM (Linux x64)
-        if: runner.os == 'Linux' && matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources
-          sudo apt-get update
-          sudo apt-get install -y nasm
-      - name: Install NASM (macOS)
-        if: runner.os == 'macOS'
-        run: brew install nasm
-      - run: npm ci
-      - name: Build native addon (Linux arm64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        env:
-          RUSTFLAGS: -C link-arg=-Wl,-Bsymbolic
-        run: >
-          npx napi build
-          --platform
-          --release
-          --target ${{ matrix.target }}
-          --use-napi-cross
-          --no-js
-          --dts native.d.ts
-          --manifest-path crates/fastpkg-napi/Cargo.toml
-          --output-dir artifacts
-      - name: Build native addon
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
-        env:
-          RUSTFLAGS: ${{ runner.os == 'Linux' && '-C link-arg=-Wl,-Bsymbolic' || '' }}
-        run: >
-          npx napi build
-          --platform
-          --release
-          --target ${{ matrix.target }}
-          --no-js
-          --dts native.d.ts
-          --manifest-path crates/fastpkg-napi/Cargo.toml
-          --output-dir artifacts
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: artifacts/*.node
-          if-no-files-found: error
+      - run: node scripts/check-version.mjs "$GITHUB_REF_NAME"
+
+  # Builds every platform binary and runs `npm test` + tests/smoke.mjs against
+  # each built binary on its target OS (Node 22/24/26), including Alpine/musl.
+  # See ci.yml. Publishing below is gated on all of it passing.
+  ci:
+    name: build and test
+    uses: ./.github/workflows/ci.yml
 
   publish:
     name: publish
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [verify-version, ci]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -123,21 +47,50 @@ jobs:
           registry-url: https://registry.npmjs.org
       - uses: actions/download-artifact@v4
         with:
+          pattern: bindings-*
           path: artifacts
           merge-multiple: true
+      - run: ls -l artifacts
       - name: Stage packages
         run: node scripts/release-packages.mjs --version "${GITHUB_REF_NAME#v}" --artifacts artifacts --output dist/npm
       - name: Publish platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
           for directory in dist/npm/image-*; do
-            npm publish "$directory" --access public --provenance
+            name="$(node -p "require('./$directory/package.json').name")"
+            if out="$(npm view "$name@$version" version 2>&1)"; then
+              echo "skip $name@$version (already published)"
+            elif grep -q 'E404' <<<"$out"; then
+              npm publish "$directory" --access public --provenance
+            else
+              echo "npm view failed for $name@$version:" >&2
+              echo "$out" >&2
+              exit 1
+            fi
           done
-      - name: Publish main package
+      - name: Publish main package (last)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish dist/npm/image --access public --provenance
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # Every platform package must exist on the registry before the main package goes out.
+          for directory in dist/npm/image-*; do
+            name="$(node -p "require('./$directory/package.json').name")"
+            npm view "$name@$version" version >/dev/null
+          done
+          if out="$(npm view "@fastpkg/image@$version" version 2>&1)"; then
+            echo "skip @fastpkg/image@$version (already published)"
+          elif grep -q 'E404' <<<"$out"; then
+            npm publish dist/npm/image --access public --provenance
+          else
+            echo "npm view failed for @fastpkg/image@$version:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -148,8 +101,3 @@ jobs:
             gh release create "$GITHUB_REF_NAME" artifacts/*.node \
               --title "$GITHUB_REF_NAME" --generate-notes
           fi
-
-
-
-
-

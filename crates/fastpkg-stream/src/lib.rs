@@ -111,8 +111,17 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
 
     let (mut header, mut extras) = probe_bytes(bytes, spec)?;
     check_deadline(deadline)?;
-    let resize = spec.operations.iter().find_map(|op| match op {
-        Operation::Resize {
+    // Shrink-on-load is only safe when the resize is the first operation, so the
+    // decoder-space target can be derived from the header alone. The final size is
+    // still computed from the full-resolution dimensions inside the resize op.
+    let swaps_axes = spec.input.auto_orient && matches!(header.orientation, Some(5..=8));
+    let (oriented_width, oriented_height) = if swaps_axes {
+        (header.height, header.width)
+    } else {
+        (header.width, header.height)
+    };
+    let (hint, fast_shrink) = match spec.operations.first() {
+        Some(Operation::Resize {
             width,
             height,
             fit,
@@ -120,23 +129,20 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
             without_reduction,
             fast_shrink_on_load,
             ..
-        } => Some((
-            fastpkg_core::pipeline::compute_target(
-                header.width,
-                header.height,
+        }) => {
+            let (tw, th) = fastpkg_core::pipeline::compute_target(
+                oriented_width,
+                oriented_height,
                 *width,
                 *height,
                 *fit,
                 *without_enlargement,
                 *without_reduction,
-            ),
-            *fast_shrink_on_load,
-        )),
-        _ => None,
-    });
-    let (hint, fast_shrink) = match resize {
-        Some((hint, fast)) => (Some(hint), fast),
-        None => (None, false),
+            );
+            let hint = if swaps_axes { (th, tw) } else { (tw, th) };
+            (Some(hint), *fast_shrink_on_load)
+        }
+        _ => (None, false),
     };
     let mut image = decode_with_hint(bytes, header.format, &spec.input, hint, fast_shrink)?;
     check_deadline(deadline)?;
@@ -155,7 +161,9 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
     }
     image.orientation = header.orientation;
     if spec.input.auto_orient {
+        let shrunk = image.pre_shrink.take();
         image = apply(image, &[Operation::AutoOrient])?;
+        image.pre_shrink = shrunk.map(|(w, h)| if swaps_axes { (h, w) } else { (w, h) });
     }
 
     let linear_pipeline = match spec.pipeline_colourspace.as_deref() {
@@ -175,28 +183,42 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
         apply_output_colourspace(&mut image, space)?;
     }
     check_deadline(deadline)?;
+    // The gray flag is an intent; only use a single-channel layout if no later
+    // operation introduced colour.
+    if image.gray && !image.is_neutral() {
+        image.gray = false;
+    }
+    // libvips emits plain luma for `greyscale()`/`b-w` followed by raw output, dropping alpha.
+    let greyed = spec
+        .operations
+        .iter()
+        .any(|op| matches!(op, Operation::Greyscale | Operation::Grayscale))
+        || matches!(
+            spec.output
+                .colourspace
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("b-w" | "bw" | "grey" | "gray")
+        );
+    if greyed && spec.output.resolved_format(header.format) == Format::Raw && image.is_neutral() {
+        image.gray = true;
+        image.has_alpha = false;
+    }
     let (data, format) = encode(&image, &spec.output, header.format)?;
     check_deadline(deadline)?;
 
-    let gray_output = image.gray && matches!(format, Format::Png | Format::Jpeg);
-    let output_has_alpha = if gray_output {
-        false
-    } else if format == Format::Raw {
-        image.has_alpha
-    } else {
-        image.has_alpha && format.supports_alpha()
+    // Which formats keep a single-channel (gray) layout, and which keep alpha.
+    let gray_output = image.gray;
+    let output_has_alpha = match format {
+        Format::Raw | Format::Png => image.has_alpha,
+        other => image.has_alpha && other.supports_alpha(),
     };
     let info = OutputInfo {
         format,
         width: image.width,
         height: image.height,
-        channels: if gray_output {
-            1
-        } else if output_has_alpha {
-            4
-        } else {
-            3
-        },
+        channels: u8::from(output_has_alpha) + if gray_output { 1 } else { 3 },
         size: data.len(),
         space: image.space.clone(),
         depth: if matches!(format, Format::Png | Format::Raw) && output_is_16(&spec.output) {

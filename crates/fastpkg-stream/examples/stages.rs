@@ -43,6 +43,7 @@ fn main() {
             without_enlargement: false,
             without_reduction: false,
             fast_shrink_on_load: true,
+            defer_canvas: false,
         }],
     )
     .unwrap();

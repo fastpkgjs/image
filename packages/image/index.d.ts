@@ -57,7 +57,7 @@ export interface ResizeOptions {
   width?: number | null;
   height?: number | null;
   fit?: Fit;
-  position?: string | { left?: number; top?: number };
+  position?: string | number | { left?: number; top?: number };
   background?: string;
   kernel?: Kernel;
   withoutEnlargement?: boolean;
@@ -73,6 +73,7 @@ export interface OutputOptions {
   compressionLevel?: number;
   palette?: boolean;
   colors?: number;
+  colours?: number;
   dither?: number;
   loop?: number;
   delay?: number | number[];
@@ -85,8 +86,20 @@ export interface OutputOptions {
   overshootDeringing?: boolean;
   optimiseScans?: boolean;
   optimiseCoding?: boolean;
+  /**
+   * JPEG only, opt-in (default false). Encodes large images (>= 1 megapixel) as independent
+   * horizontal bands on the thread pool and joins them into one baseline JPEG with restart
+   * markers. Decoded pixels are identical to a single-pass baseline encode with the same
+   * quality; the file is typically 5-10% larger because the standard Huffman tables are used
+   * (`optimiseCoding` is ignored). Smaller images, or a pool with a single thread, use the
+   * normal encoder. Cannot be combined with `progressive`, `mozjpeg` or `optimiseScans`
+   * (throws a TypeError).
+   */
+  parallel?: boolean;
   smartSubsample?: boolean;
   nearLossless?: boolean;
+  /** WebP: keep the colour values under fully transparent pixels. */
+  exact?: boolean;
   preset?: string;
   timeout?: number;
   resolveWithObject?: boolean;
@@ -105,8 +118,16 @@ export interface OutputInfo {
 }
 
 export interface Metadata extends OutputInfo {
-  pages: number;
-  pageHeight: number;
+  /** Present for multi-page containers (and always for GIF). */
+  pages?: number;
+  pageHeight?: number;
+  /** Animation loop count and per-frame delays (ms) of GIF / animated WebP. */
+  loop?: number;
+  delay?: number[];
+  /** JPEG chroma subsampling, e.g. `4:2:0`. */
+  chromaSubsampling?: string;
+  isProgressive?: boolean;
+  isPalette?: boolean;
   orientation?: number;
   density?: number;
   hasProfile: boolean;
@@ -248,7 +269,7 @@ export class Gradient {
 export interface CompositeOptions {
   input: Input;
   blend?: string;
-  gravity?: string;
+  gravity?: string | number;
   top?: number;
   left?: number;
   tile?: boolean;
@@ -269,7 +290,7 @@ export class Sharp extends Duplex {
   clone(): Sharp;
 
   resize(width?: number | null | ResizeOptions, height?: number | null, options?: ResizeOptions): this;
-  extend(options: { width?: number; height?: number; background?: string; position?: string; extendWith?: 'background' | 'copy' | 'repeat' | 'mirror' }): this;
+  extend(options: number | { top?: number; left?: number; bottom?: number; right?: number; width?: number; height?: number; background?: string; position?: string; extendWith?: 'background' | 'copy' | 'repeat' | 'mirror' }): this;
   extract(options: { left: number; top: number; width: number; height: number }): this;
   trim(options?: { background?: string; threshold?: number; lineArt?: boolean }): this;
   rotate(angle?: number, options?: { background?: string }): this;
@@ -363,7 +384,7 @@ export class Sharp extends Duplex {
   toBuffer(options: OutputOptions & { resolveWithObject: true }): Promise<{ data: Buffer; info: OutputInfo }>;
   toBuffer(callback: (error: Error | null, data: Buffer, info: OutputInfo) => void): Promise<undefined>;
   toBuffer(options: OutputOptions, callback: (error: Error | null, data: Buffer, info: OutputInfo) => void): Promise<undefined>;
-  toUint8Array(options?: OutputOptions): Promise<Uint8Array>;
+  toUint8Array(options?: OutputOptions): Promise<{ data: Uint8Array; info: OutputInfo }>;
   toFile(path: string, options?: OutputOptions): Promise<OutputInfo>;
   toFile(path: string, callback: (error: Error | null, info: OutputInfo) => void): Promise<undefined>;
   toStream(): Readable;
@@ -382,6 +403,17 @@ declare namespace image {
   export const format: Record<string, Record<string, boolean>>;
   export const versions: Record<string, string>;
   export const interpolators: Record<string, string>;
+  /** sharp-compatible constant tables. */
+  export const gravity: Record<'center' | 'centre' | 'north' | 'east' | 'south' | 'west' | 'northeast' | 'southeast' | 'southwest' | 'northwest', number>;
+  export const strategy: Record<'entropy' | 'attention', number>;
+  export const position: Record<'top' | 'right' | 'bottom' | 'left' | 'right top' | 'right bottom' | 'left bottom' | 'left top', number>;
+  export const kernel: Record<'nearest' | 'linear' | 'cubic' | 'mitchell' | 'lanczos2' | 'lanczos3' | 'mks2013' | 'mks2021', string>;
+  export const fit: Record<'contain' | 'cover' | 'fill' | 'inside' | 'outside', string>;
+  export const blend: Record<string, string>;
+  export const bool: Record<'and' | 'or' | 'eor', string>;
+  export const colourspace: Record<string, string>;
+  export const colorspace: Record<string, string>;
+  export const align: Record<string, string>;
   export const queue: NodeJS.EventEmitter;
   export function gradient(type?: 'linear' | 'radial'): Gradient;
   export function linearGradient(angle?: number): Gradient;
@@ -398,6 +430,16 @@ export const simd: typeof image.simd;
 export const format: typeof image.format;
 export const versions: typeof image.versions;
 export const interpolators: typeof image.interpolators;
+export const gravity: typeof image.gravity;
+export const strategy: typeof image.strategy;
+export const position: typeof image.position;
+export const kernel: typeof image.kernel;
+export const fit: typeof image.fit;
+export const blend: typeof image.blend;
+export const bool: typeof image.bool;
+export const colourspace: typeof image.colourspace;
+export const colorspace: typeof image.colorspace;
+export const align: typeof image.align;
 export const queue: typeof image.queue;
 export const gradient: typeof image.gradient;
 export const linearGradient: typeof image.linearGradient;

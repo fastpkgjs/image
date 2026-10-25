@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 fastpkg-core = { path = "../fastpkg-core" }
+fastpkg-codecs = { path = "../fastpkg-codecs" }
 fastpkg-stream = { path = "../fastpkg-stream" }
 napi = { workspace = true }
 napi-derive = { workspace = true }

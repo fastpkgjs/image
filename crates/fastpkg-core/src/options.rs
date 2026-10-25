@@ -10,6 +10,10 @@ fn default_quality() -> u8 {
     80
 }
 
+fn default_alpha_quality() -> u8 {
+    100
+}
+
 fn default_effort() -> u8 {
     4
 }
@@ -64,6 +68,10 @@ fn default_upper() -> f64 {
 
 fn default_threshold() -> u8 {
     128
+}
+
+fn default_trim_threshold() -> f64 {
+    10.0
 }
 
 fn default_median_size() -> u32 {
@@ -212,7 +220,27 @@ pub struct CreateInput {
     #[serde(default = "default_background")]
     pub background: String,
     #[serde(default)]
-    pub noise: Option<f64>,
+    pub noise: Option<NoiseInput>,
+}
+
+/// Gaussian noise fill for `create: { noise }` inputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoiseInput {
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default = "default_noise_mean")]
+    pub mean: f64,
+    #[serde(default = "default_noise_sigma")]
+    pub sigma: f64,
+}
+
+fn default_noise_mean() -> f64 {
+    128.0
+}
+
+fn default_noise_sigma() -> f64 {
+    30.0
 }
 
 fn default_create_channels() -> u8 {
@@ -374,6 +402,20 @@ pub enum Operation {
         without_reduction: bool,
         #[serde(default = "default_true")]
         fast_shrink_on_load: bool,
+        /// Skip the `cover` crop / `contain` padding; a later `Canvas` op applies it.
+        #[serde(default)]
+        defer_canvas: bool,
+    },
+    /// The crop / padding half of a `Resize` whose canvas step was deferred.
+    Canvas {
+        width: Option<u32>,
+        height: Option<u32>,
+        #[serde(default)]
+        fit: Fit,
+        #[serde(default = "default_position")]
+        position: String,
+        #[serde(default = "default_background")]
+        background: String,
     },
     Extend {
         width: Option<u32>,
@@ -384,6 +426,14 @@ pub enum Operation {
         position: String,
         #[serde(default)]
         extend_with: ExtendWith,
+        #[serde(default)]
+        top: Option<u32>,
+        #[serde(default)]
+        left: Option<u32>,
+        #[serde(default)]
+        bottom: Option<u32>,
+        #[serde(default)]
+        right: Option<u32>,
     },
     Extract {
         left: u32,
@@ -392,12 +442,15 @@ pub enum Operation {
         height: u32,
     },
     Trim {
-        #[serde(default = "default_background")]
-        background: String,
+        /// Background to trim away; defaults to the top-left pixel.
         #[serde(default)]
+        background: Option<String>,
+        #[serde(default = "default_trim_threshold")]
         threshold: f64,
         #[serde(default)]
         line_art: bool,
+        #[serde(default)]
+        margin: u32,
     },
     Rotate {
         angle: f64,
@@ -690,6 +743,9 @@ pub enum Operation {
         density: Option<u32>,
         #[serde(default)]
         premultiplied: bool,
+        /// Generated overlay (create / text / raw) instead of encoded bytes.
+        #[serde(default)]
+        source: Option<Box<InputOptions>>,
     },
 }
 
@@ -813,10 +869,21 @@ pub struct OutputOptions {
     pub optimise_scans: bool,
     #[serde(default = "default_true")]
     pub optimise_coding: bool,
+    /// Opt-in banded JPEG encode (see `fastpkg-codecs::jpeg_par`); ignored for small images.
+    #[serde(default)]
+    pub parallel: bool,
     #[serde(default)]
     pub smart_subsample: bool,
     #[serde(default)]
     pub near_lossless: bool,
+    /// WebP `exact`: keep the RGB values under fully transparent pixels (libwebp `exact`).
+    #[serde(default)]
+    pub exact: bool,
+    /// True when the caller passed `effort` explicitly (lossless WebP then uses libwebp).
+    #[serde(default)]
+    pub effort_set: bool,
+    #[serde(default = "default_alpha_quality")]
+    pub alpha_quality: u8,
     #[serde(default)]
     pub preset: Option<String>,
     #[serde(default)]

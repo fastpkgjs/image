@@ -43,8 +43,8 @@ pub fn extract(bytes: &[u8], _format: Format) -> MetadataExtras {
 }
 
 pub fn enrich(header: &mut HeaderInfo, extras: &MetadataExtras) {
-    header.orientation = extras.orientation;
-    header.density = extras.density;
+    header.orientation = extras.orientation.or(header.orientation);
+    header.density = extras.density.or(header.density);
     header.has_exif = header.has_exif || extras.exif.is_some() || extras.exif_raw.is_some();
     header.has_profile = header.has_profile || extras.icc.is_some() || extras.icc_raw.is_some();
     header.has_xmp = header.has_xmp || extras.xmp.is_some() || extras.xmp_raw.is_some();
@@ -159,6 +159,9 @@ fn read_icc_raw(bytes: &[u8]) -> Option<Vec<u8>> {
     if let Some(raw) = read_jpeg_icc_raw(bytes) {
         return Some(raw);
     }
+    if let Some(raw) = read_png_icc_raw(bytes) {
+        return Some(raw);
+    }
     if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         let mut offset = 12;
         while offset + 8 <= bytes.len() {
@@ -176,6 +179,43 @@ fn read_icc_raw(bytes: &[u8]) -> Option<Vec<u8>> {
             }
             offset = end.saturating_add(len & 1);
         }
+    }
+    None
+}
+
+/// ICC profile from a PNG `iCCP` chunk: profile name, NUL, compression method, zlib stream.
+fn read_png_icc_raw(bytes: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if bytes.len() < 8 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let mut offset = 8;
+    while offset + 12 <= bytes.len() {
+        let len = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        let kind = &bytes[offset + 4..offset + 8];
+        let start = offset + 8;
+        let end = start.saturating_add(len).min(bytes.len());
+        match kind {
+            b"iCCP" => {
+                let data = &bytes[start..end];
+                let name_end = data.iter().position(|&b| b == 0)?;
+                let compressed = data.get(name_end + 2..)?;
+                let mut profile = Vec::new();
+                flate2::read::ZlibDecoder::new(compressed)
+                    .take(64 * 1024 * 1024)
+                    .read_to_end(&mut profile)
+                    .ok()?;
+                return Some(profile);
+            }
+            b"IDAT" | b"IEND" => break,
+            _ => {}
+        }
+        offset = end.saturating_add(4);
     }
     None
 }

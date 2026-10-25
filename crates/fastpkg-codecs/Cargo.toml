@@ -25,7 +25,8 @@ jpeg-decoder.workspace = true
 jpeg-encoder.workspace = true
 jxl-oxide = { workspace = true, features = ["image", "rayon", "moxcms"] }
 mozjpeg.workspace = true
-oxideav-webp.workspace = true
+mozjpeg-sys.workspace = true
+libwebp-sys.workspace = true
 png.workspace = true
 qoi.workspace = true
 rayon.workspace = true

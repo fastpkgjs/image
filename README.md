@@ -1,6 +1,6 @@
 # @fastpkg/image
 
-A Rust image engine for Node.js with a sharp-compatible API. No libvips, no ImageMagick, no legacy TIFF/JPEG 2000/HEIC/PDF pipeline. JPEG uses the bundled MozJPEG/libjpeg-turbo codec for speed; the pipeline, PNG, WebP, AVIF, JPEG XL, QOI, GIF, SVG, and operations are Rust.
+A Rust image engine for Node.js with a sharp-compatible API. No libvips, no ImageMagick, no legacy TIFF/JPEG 2000/HEIC/PDF pipeline. JPEG uses the bundled MozJPEG/libjpeg-turbo codec and lossy WebP uses the bundled libwebp, both for speed; the pipeline, PNG, the fast lossless WebP path, AVIF, JPEG XL, QOI, GIF, SVG, and operations are Rust.
 
 `@fastpkg/image` is built around three ideas:
 
@@ -10,14 +10,40 @@ A Rust image engine for Node.js with a sharp-compatible API. No libvips, no Imag
 
 ## Status
 
-This is a working v0.1 implementation with benchmark wins across the current scenarios, but it is not a finished sharp replacement. The current benchmark is on Windows x64 with an i5-12450H. Cross-platform build targets are configured, but prebuilt binaries for macOS/Linux still need to be produced by CI.
+Version 0.2.0. The API follows sharp closely and covers the common resize/convert/composite/colour workflows (see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for what is and is not implemented), but it is not a complete sharp replacement. Prebuilt binaries are published to npm for the platforms below; see [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
+
+The benchmark numbers further down were measured on Linux x64 (shared 12 vCPU VM) for 0.2.0. Other platforms have not been benchmarked.
+
+### Supported platforms
+
+`npm install @fastpkg/image` installs exactly one prebuilt binary through `optionalDependencies`. No compiler is needed.
+
+| Platform | Architecture | Package | libc |
+| --- | --- | --- | --- |
+| Windows | x64 | `@fastpkg/image-win32-x64` | MSVC |
+| Windows | arm64 | `@fastpkg/image-win32-arm64` | MSVC |
+| macOS | x64 | `@fastpkg/image-darwin-x64` | |
+| macOS | arm64 (Apple silicon) | `@fastpkg/image-darwin-arm64` | |
+| Linux | x64 | `@fastpkg/image-linux-x64-gnu` | glibc (built on Ubuntu 22.04, glibc 2.35) |
+| Linux | arm64 | `@fastpkg/image-linux-arm64-gnu` | glibc (built on Ubuntu 22.04, glibc 2.35) |
+| Linux | x64 | `@fastpkg/image-linux-x64-musl` | musl (Alpine) |
+| Linux | arm64 | `@fastpkg/image-linux-arm64-musl` | musl (Alpine) |
+
+The loader detects musl at runtime and picks the `-musl` package on Alpine. Other platforms (FreeBSD, 32-bit, riscv, ...) are not supported. If the binary cannot be loaded, the error names the platform, libc, and the package it looked for. The usual fix is to reinstall with optional dependencies enabled (`npm install --include=optional`) and to avoid copying `node_modules` between operating systems or between glibc and musl.
+
+On Windows arm64 the bundled MozJPEG is built without its SIMD routines (they require the GNU assembler), so JPEG encode/decode is slower there than on other platforms.
 
 ## Requirements
 
-- Node.js 20.17 or newer (tested on Node 26.4)
-- Rust 1.99.1 or newer
-- A C/C++ compiler for MozJPEG (Visual Studio Build Tools on Windows, clang/gcc elsewhere)
-- NASM for MozJPEG SIMD and the AV1 decoder used by AVIF (NASM is auto-downloaded to `tools/nasm-2.16.03` by the Windows build script when missing)
+Using the package:
+
+- Node.js 22 or newer (the active LTS lines 22 and 24, and Node 26). CI runs the test suite on Node 22, 24, and 26.
+
+Building from source (only needed for development or unsupported platforms):
+
+- Rust 1.99.1 (pinned in `rust-toolchain.toml`)
+- A C compiler for MozJPEG and libwebp (Visual Studio Build Tools on Windows, clang/gcc elsewhere; `build-base` on Alpine)
+- NASM for MozJPEG SIMD and the AV1 decoder used by AVIF on x64 (NASM is auto-downloaded to `tools/nasm-2.16.03` by the Windows build script when missing)
 - CMake is not required by the default build
 
 ## Build
@@ -30,7 +56,7 @@ npm run bench
 ```
 
 
-`npm run build:native` invokes `scripts/build.mjs`. On Windows it delegates to `scripts/build.ps1`, which imports the MSVC environment, adds the auto-downloaded NASM to `PATH`, and builds the N-API addon into `packages/image`. On macOS/Linux it calls `napi build` directly.
+`npm run build:native` invokes `scripts/build.mjs`. On Windows it delegates to `scripts/build.ps1`, which imports the MSVC environment, adds the auto-downloaded NASM to `PATH`, and builds the N-API addon into `packages/image`. On macOS/Linux it calls `napi build` directly. On Alpine, install `build-base nasm` (plus `linux-headers` and `perl`) and Rust via rustup; `scripts/ci-musl.sh build` shows the exact steps CI uses.
 
 The addon is loaded by `packages/image/lib.cjs`. The generated JS binding is disabled on purpose (`--no-js`); the hand-written wrapper is the public API.
 
@@ -38,9 +64,15 @@ The external 16-bit PNG fixtures can be regenerated with `python scripts/make_pn
 
 ## Releases
 
-Push a tag such as `v0.1.0` to run `.github/workflows/release.yml`. The workflow builds native addons for Windows x64, macOS x64/arm64, and Linux x64/arm64 glibc, publishes them as `@fastpkg/image-*` platform packages, publishes `@fastpkg/image`, and creates a GitHub release with the `.node` binaries attached.
+Push a tag such as `v0.2.0` to run `.github/workflows/release.yml`. The tag must equal the version in `package.json`, the Cargo workspace (`Cargo.toml`), and `Cargo.lock`, otherwise the workflow fails before building.
+
+1. The workflow reuses `.github/workflows/ci.yml` to build the native addon for all eight targets and to run `npm test` and `tests/smoke.mjs` against each built binary on its own OS (Linux glibc x64/arm64, macOS x64/arm64, Windows x64/arm64, and Alpine x64/arm64 in `node:*-alpine` containers) on Node 22, 24, and 26.
+2. Only if all of that passes, the publish job stages the packages with `scripts/release-packages.mjs` (which also checks manifests, versions, `optionalDependencies`, and the `npm pack` file list), publishes each `@fastpkg/image-*` platform package, then publishes `@fastpkg/image` last, and creates a GitHub release with the `.node` binaries attached.
+3. Publishing skips any package whose exact version already exists on npm, so a failed run can be re-run.
 
 The publish job requires an `NPM_TOKEN` repository secret with access to the `@fastpkg` scope. `@fastpkg/image` declares the platform packages as `optionalDependencies`, and the loader resolves the matching one at runtime.
+
+To check the packaging locally without publishing: `node scripts/check-version.mjs v0.2.0`, then `node scripts/release-packages.mjs --version 0.2.0 --artifacts <dir with the eight .node files> --output <dir outside the repo>`.
 
 ## Usage
 
@@ -108,7 +140,7 @@ await image('input.png')
 |---|---|---|---|
 | PNG | Yes | Yes | 8/16-bit, alpha, palette input/output, interlaced input |
 | JPEG | Yes | Yes | MozJPEG codec, baseline/progressive, EXIF orientation, DCT-scaled decode |
-| WebP | Yes | Yes | Lossless via image-webp, lossy via oxideav-webp |
+| WebP | Yes | Yes | Lossy and near-lossless via libwebp (BSD-3, bundled via libwebp-sys); lossless via image-webp (fast), switching to libwebp for graphic-like images or when `effort` is set |
 | AVIF | Yes | Yes | Pure-Rust decode via rav1d/avif-decode; encode via ravif |
 | JPEG XL | Yes | Optional | Pure-Rust decode via jxl-oxide; encode behind `jxl-encode` (CMake, ClangCL, libjxl) |
 | QOI | Yes | Yes | |
@@ -171,6 +203,22 @@ Also included: `gradientMap`, `gradientRecolor`, `fill`, `paletteSwap`, `alphaFr
 - Resize uses `fast_image_resize` SIMD kernels (AVX2/SSE4.1/NEON) and rayon tiling. AVIF/JXL/PNG/JPEG codecs use their own internal threading where available.
 - JPEG targets are DCT-scaled during decode when a resize hint is present.
 
+## Parallel JPEG encoding (opt-in)
+
+```js
+await image(input).jpeg({ quality: 85, parallel: true }).toBuffer();
+```
+
+`parallel: true` splits images of 1 megapixel or more into horizontal bands (one per rayon thread, at least 64 rows each), encodes the bands concurrently as baseline JPEGs, and joins them into one standard file with restart markers (`DRI`/`RSTn`) at the band boundaries. Every band uses the same quality, subsampling and the standard Huffman tables, and the DC predictors and bit padding at a band edge are exactly what a restart marker resets, so the decoded pixels are identical to a single-pass baseline encode with the same settings (`optimiseCoding: false`). EXIF, ICC and density options are applied to the joined file as usual.
+
+Trade-offs:
+
+- Off by default; the default encoder and its output bytes are unchanged.
+- Because the Huffman tables are the standard ones, `optimiseCoding` is ignored and files are larger than the default optimised-table output. On a 4000x3000 photo that was +7.5% at q85, +16% at q60 and +17% at q95; very smooth or flat images can grow much more (a synthetic 4000x3000 test image was +48% to +140%). Compared with `optimiseCoding: false` the cost is a few dozen bytes of markers.
+- It cannot be combined with `progressive`, `mozjpeg` or `optimiseScans`; that combination throws a `TypeError`.
+- Images under 1 megapixel, or a thread pool of one (`image.concurrency(1)`), silently use the normal encoder.
+- Only the encode stage is parallel. Decoding the source and resizing are unchanged, so the end-to-end gain depends on how much of the pipeline is JPEG encoding: a 4000x3000 raw -> JPEG q85 went from 78 ms to 20 ms on a 12-thread machine, a JPEG -> JPEG re-encode of the same size from about 105 ms to about 46 ms (decoding is the remaining floor).
+
 ## Benchmarks
 
 Run:
@@ -179,18 +227,26 @@ Run:
 node bench/run.mjs
 ```
 
-Current results (median ms, `sharp@0.35.5`, concurrency 1, Windows x64, i5-12450H, Node 26.4):
+Current results (median ms, `sharp@0.35.5`, concurrency 1, Linux x64, AMD EPYC-Rome 12 vCPU, Node 24):
 
 | Scenario | Fastpkg | sharp | Ratio |
 |---|---:|---:|---:|
-| metadata 800x600 | 0.12 | 1.84 | 15.90x faster |
-| metadata 4000x3000 | 0.19 | 1.81 | 9.63x faster |
-| resize 1200 + JPEG q85 | 21.89 | 34.55 | 1.58x faster |
-| resize 1200 + PNG | 23.88 | 44.16 | 1.85x faster |
-| resize 1200 + WebP lossless | 25.28 | 451.67 | 17.86x faster |
-| blur + sharpen + JPEG | 36.45 | 54.88 | 1.51x faster |
-| stats 4000x3000 | 148.74 | 313.25 | 2.11x faster |
-| 8 concurrent resizes | 5.40 | 40.60 | 7.52x faster |
+| metadata 800x600 | 0.10 | 0.56 | 5.4x faster |
+| metadata 4000x3000 | 0.14 | 0.52 | 3.6x faster |
+| resize 1200 + JPEG q85 (synthetic gradient) | 29.8 | 36.1 | 1.21x faster |
+| photo JPEG 4000x3000 -> resize 1200 JPEG | 41-48 | 45 | about equal |
+| photo JPEG -> thumbnail 320 JPEG | 16.7 | 21.1 | 1.26x faster |
+| photo JPEG -> JPEG q85, no resize | 113-120 | 98-101 | 12-18% slower (single thread) |
+| photo JPEG -> resize 1200 WebP q80 | 158 | 171 | 1.08x faster |
+| resize 1200 + PNG | 36.9 | 44.3 | 1.20x faster |
+| photo PNG 2000 -> PNG | 68.7 | 217.6 | 3.2x faster |
+| alpha PNG 2000 -> resize 800 PNG | 54.3 | 104.2 | 1.9x faster |
+| resize 1200 + WebP lossless | 34.7 | 676.2 | 19.5x faster |
+| blur + sharpen + JPEG | 26.4 | 58.9 | 2.2x faster |
+| stats 4000x3000 | 141.2 | 419.3 | 3.0x faster |
+| 8 concurrent resizes | 4.7 | 25.7 | 5.5x faster |
+
+With the default thread pool (the table pins both engines to one thread), large raw/PNG conversions run in parallel, and `jpeg({ parallel: true })` (opt-in, see below) encodes a 4000x3000 image in about 14 ms instead of about 75 ms at the cost of 5-17% larger files.
 
 These are end-to-end Node timings, not codec microbenchmarks. Fastpkg now uses MozJPEG for JPEG decode/encode and DCT-scaled decode, while keeping libvips out of the pipeline. The remaining caveat is that this is a single laptop benchmark run, not a controlled release benchmark.
 

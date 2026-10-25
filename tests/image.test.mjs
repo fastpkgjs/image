@@ -453,7 +453,7 @@ test('static utilities exist', () => {
 });
 
 test('toColourspace b-w produces a one-channel greyscale output', async () => {
-  const out = await image({ create: { width: 8, height: 8, channels: 4, background: '#ff0000' } })
+  const out = await image({ create: { width: 8, height: 8, channels: 3, background: '#ff0000' } })
     .toColourspace('b-w')
     .png()
     .toBuffer({ resolveWithObject: true });
@@ -461,6 +461,16 @@ test('toColourspace b-w produces a one-channel greyscale output', async () => {
   const meta = await image(out.data).metadata();
   assert.equal(meta.channels, 1);
   assert.equal(meta.format, 'png');
+});
+
+test('toColourspace b-w keeps alpha as a second channel', async () => {
+  const out = await image({ create: { width: 8, height: 8, channels: 4, background: '#ff000080' } })
+    .toColourspace('b-w')
+    .png()
+    .toBuffer({ resolveWithObject: true });
+  assert.equal(out.info.channels, 2);
+  assert.equal(out.info.hasAlpha, true);
+  assert.equal((await image(out.data).metadata()).channels, 2);
 });
 
 test('pipelineColourspace accepts linear working space', async () => {

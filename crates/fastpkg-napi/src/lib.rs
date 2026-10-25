@@ -218,7 +218,7 @@ pub fn versions() -> Value {
         "rust": "1.99",
         "arch": std::env::consts::ARCH,
         "os": std::env::consts::OS,
-        "webp": "lossy + lossless (pure Rust)",
+        "webp": format!("libwebp {} via libwebp-sys (lossy, near-lossless, lossless for graphics or explicit effort) + image-webp (fast lossless)", fastpkg_codecs::libwebp_version()),
         "avif": "ravif (pure Rust encode)",
         "jxl": "jxl-oxide (pure Rust decode)",
         "png": "png + fdeflate",

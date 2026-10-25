@@ -2,16 +2,26 @@ name: ci
 
 on:
   push:
+    branches: ['**']
   pull_request:
   workflow_dispatch:
+  # Reused by release.yml so a release is built and tested by exactly the same jobs.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  lint:
+    name: lint (fmt, clippy)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -22,11 +32,55 @@ jobs:
         with:
           toolchain: 1.99.1
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources
+          sudo apt-get update
+          sudo apt-get install -y nasm
+      - run: npm ci
+      - run: node scripts/check-version.mjs
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  # Builds one native addon per target. Linux gnu binaries are built on
+  # ubuntu-22.04 (glibc 2.35) so they also load on older distributions.
+  build:
+    name: build ${{ matrix.id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: linux-x64-gnu, os: ubuntu-22.04 }
+          - { id: linux-arm64-gnu, os: ubuntu-22.04-arm }
+          - { id: darwin-arm64, os: macos-latest }
+          - { id: darwin-x64, os: macos-15-intel }
+          - { id: win32-x64, os: windows-latest }
+          # Cross-compiled from an x64 Windows host with the MSVC ARM64 tools.
+          - { id: win32-arm64, os: windows-latest, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.id }}
       - name: Install NASM (Windows)
         if: runner.os == 'Windows'
-        run: choco install nasm -y
-      - name: Install NASM (Linux)
-        if: runner.os == 'Linux'
+        shell: pwsh
+        run: |
+          choco install nasm -y
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Install NASM (Linux x64)
+        if: matrix.id == 'linux-x64-gnu'
         run: |
           sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources
           sudo apt-get update
@@ -35,8 +89,110 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install nasm
       - run: npm ci
-      - run: npm run build:native
-      - run: npm test
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build native addon
+        if: matrix.id != 'win32-arm64'
+        run: npm run build:native
+      - name: Configure MSVC (ARM64 cross)
+        if: matrix.id == 'win32-arm64'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+      - name: Build native addon (Windows ARM64 cross)
+        if: matrix.id == 'win32-arm64'
+        shell: pwsh
+        run: |
+          # Pin the Hostx64\arm64 linker so Git's /usr/bin/link.exe cannot shadow it.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -property installationPath
+          $link = Get-ChildItem (Join-Path $vsPath 'VC\Tools\MSVC') -Recurse -Filter link.exe |
+            Where-Object { $_.FullName -match 'Hostx64\\arm64\\link.exe$' } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $link) { throw 'MSVC Hostx64\arm64 link.exe not found (ARM64 build tools missing?)' }
+          $env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER = $link
+          npx napi build --platform --release --target aarch64-pc-windows-msvc --no-js --dts native.d.ts --manifest-path crates/fastpkg-napi/Cargo.toml --output-dir packages/image
+      - run: ls packages/image
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.id }}
+          path: packages/image/image.*.node
+          if-no-files-found: error
 
+  # musl (Alpine) is built natively inside an Alpine container. The container is
+  # driven with `docker run` rather than `container:` because JavaScript actions
+  # do not run reliably inside Alpine job containers.
+  build-musl:
+    name: build linux-${{ matrix.arch }}-musl
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, os: ubuntu-latest }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in node:22-alpine
+        run: |
+          docker run --rm -e OUT_DIR=packages/image -v "$PWD":/work -w /work \
+            node:22-alpine sh scripts/ci-musl.sh build
+      - name: Restore file ownership
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-linux-${{ matrix.arch }}-musl
+          path: packages/image/image.*.node
+          if-no-files-found: error
+
+  test:
+    name: test ${{ matrix.platform.id }} (${{ matrix.platform.os }}) / node ${{ matrix.node }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24', '26']
+        platform:
+          - { id: linux-x64-gnu, os: ubuntu-22.04 }
+          - { id: linux-x64-gnu, os: ubuntu-latest }
+          - { id: linux-arm64-gnu, os: ubuntu-24.04-arm }
+          - { id: darwin-arm64, os: macos-latest }
+          - { id: darwin-x64, os: macos-15-intel }
+          - { id: win32-x64, os: windows-latest }
+          - { id: win32-arm64, os: windows-11-arm }
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - uses: actions/download-artifact@v4
+        with:
+          name: bindings-${{ matrix.platform.id }}
+          path: packages/image
+      - run: npm ci
+      - run: npm test
+      - run: node tests/smoke.mjs
+
+  test-musl:
+    name: test linux-${{ matrix.platform.arch }}-musl / node ${{ matrix.node }}
+    needs: build-musl
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24', '26']
+        platform:
+          - { arch: x64, os: ubuntu-latest }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bindings-linux-${{ matrix.platform.arch }}-musl
+          path: packages/image
+      - name: Test in node:${{ matrix.node }}-alpine
+        run: |
+          docker run --rm -v "$PWD":/work -w /work \
+            node:${{ matrix.node }}-alpine sh scripts/ci-musl.sh test

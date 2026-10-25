@@ -67,6 +67,12 @@ fn validate_operation(op: &Operation) -> Result<()> {
     Ok(())
 }
 
+/// Size the source is resampled to before any `cover` crop or `contain` padding.
+///
+/// Mirrors sharp/libvips: per-axis shrink factors are derived from the fit, then
+/// `withoutReduction` clamps each factor to at most 1 and `withoutEnlargement` to at least 1.
+/// When both flags are given only `withoutReduction` applies. `fill` with a single
+/// dimension keeps the source size on the other axis.
 pub fn compute_target(
     width: u32,
     height: u32,
@@ -76,51 +82,52 @@ pub fn compute_target(
     without_enlargement: bool,
     without_reduction: bool,
 ) -> (u32, u32) {
-    let (w, h) = match (target_width, target_height) {
-        (Some(w), Some(h)) => match fit {
-            Fit::Fill => (w, h),
-            Fit::Contain | Fit::Inside => {
-                let scale = (w as f64 / width as f64).min(h as f64 / height as f64);
-                (
-                    (width as f64 * scale).round() as u32,
-                    (height as f64 * scale).round() as u32,
-                )
+    let (iw, ih) = (width.max(1) as f64, height.max(1) as f64);
+    let fill = fit == Fit::Fill;
+    let (mut xf, mut yf) = (1.0f64, 1.0f64);
+    match (target_width, target_height) {
+        (Some(w), Some(h)) => {
+            xf = iw / w.max(1) as f64;
+            yf = ih / h.max(1) as f64;
+            match fit {
+                Fit::Cover | Fit::Outside => {
+                    if xf < yf {
+                        yf = xf;
+                    } else {
+                        xf = yf;
+                    }
+                }
+                Fit::Contain | Fit::Inside => {
+                    if xf > yf {
+                        yf = xf;
+                    } else {
+                        xf = yf;
+                    }
+                }
+                Fit::Fill => {}
             }
-            Fit::Outside => {
-                let scale = (w as f64 / width as f64).max(h as f64 / height as f64);
-                (
-                    (width as f64 * scale).round() as u32,
-                    (height as f64 * scale).round() as u32,
-                )
-            }
-            Fit::Cover => (w, h),
-        },
+        }
         (Some(w), None) => {
-            let scale = w as f64 / width as f64;
-            (w, (height as f64 * scale).round() as u32)
+            xf = iw / w.max(1) as f64;
+            yf = if fill { 1.0 } else { xf };
         }
         (None, Some(h)) => {
-            let scale = h as f64 / height as f64;
-            ((width as f64 * scale).round() as u32, h)
+            yf = ih / h.max(1) as f64;
+            xf = if fill { 1.0 } else { yf };
         }
-        (None, None) => (width, height),
-    };
-    let mut out = (w.max(1), h.max(1));
-    if without_enlargement && (out.0 > width || out.1 > height) {
-        let scale = (width as f64 / out.0 as f64).min(height as f64 / out.1 as f64);
-        out = (
-            (out.0 as f64 * scale).round().max(1.0) as u32,
-            (out.1 as f64 * scale).round().max(1.0) as u32,
-        );
+        (None, None) => {}
     }
-    if without_reduction && (out.0 < width || out.1 < height) {
-        let scale = (width as f64 / out.0 as f64).max(height as f64 / out.1 as f64);
-        out = (
-            (out.0 as f64 * scale).round().max(1.0) as u32,
-            (out.1 as f64 * scale).round().max(1.0) as u32,
-        );
+    if without_reduction {
+        xf = xf.min(1.0);
+        yf = yf.min(1.0);
+    } else if without_enlargement {
+        xf = xf.max(1.0);
+        yf = yf.max(1.0);
     }
-    out
+    (
+        ((iw / xf).round() as u32).max(1),
+        ((ih / yf).round() as u32).max(1),
+    )
 }
 
 pub fn kernel_name(kernel: Kernel) -> &'static str {

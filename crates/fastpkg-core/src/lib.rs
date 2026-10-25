@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod color;
+pub mod exif;
 pub mod image;
 pub mod options;
 pub mod pipeline;
@@ -211,6 +212,7 @@ pub struct HeaderInfo {
     pub delay: Option<Vec<u32>>,
     pub orientation: Option<u32>,
     pub density: Option<u32>,
+    pub chroma_subsampling: Option<String>,
     pub has_profile: bool,
     pub has_exif: bool,
     pub has_xmp: bool,
