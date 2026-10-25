@@ -604,15 +604,71 @@ fn resize_raw_wide(
     Ok(image)
 }
 
+fn custom_filter(name: &'static str, func: fn(f64) -> f64, support: f64) -> FirFilter {
+    // The supports are positive constants, so construction cannot fail.
+    FirFilter::Custom(
+        fast_image_resize::Filter::new(name, func, support)
+            .unwrap_or_else(|_| unreachable!("filter support is a positive constant")),
+    )
+}
+
+/// Lanczos window with two lobes (libvips `lanczos2`).
+fn lanczos2_filter(x: f64) -> f64 {
+    let x = x.abs();
+    if x == 0.0 {
+        1.0
+    } else if x >= 2.0 {
+        0.0
+    } else {
+        let px = std::f64::consts::PI * x;
+        2.0 * px.sin() * (px / 2.0).sin() / (px * px)
+    }
+}
+
+/// Quadratic "magic kernel" `m` (Costella): the base of both Magic Kernel Sharp variants.
+fn magic_kernel(x: f64) -> f64 {
+    let x = x.abs();
+    if x < 0.5 {
+        0.75 - x * x
+    } else if x < 1.5 {
+        0.5 * (x - 1.5) * (x - 1.5)
+    } else {
+        0.0
+    }
+}
+
+/// Magic Kernel Sharp 2013: `m` sharpened with the `[-1, 6, -1] / 4` filter (radius 2.5).
+fn mks2013_filter(x: f64) -> f64 {
+    (6.0 * magic_kernel(x) - magic_kernel(x + 1.0) - magic_kernel(x - 1.0)) / 4.0
+}
+
+/// Magic Kernel Sharp 2021: `m` convolved with the truncated (seven taps) inverse of its own
+/// sampled response, which makes the kernel interpolating (radius 4.5).
+fn mks2021_filter(x: f64) -> f64 {
+    // g[n] = sqrt(2) * (2 * sqrt(2) - 3)^|n|
+    const G: [f64; 4] = [
+        std::f64::consts::SQRT_2,
+        -0.242_640_687_119_284_88,
+        0.041_630_560_342_615_74,
+        -0.007_142_674_936_409_807,
+    ];
+    let mut sum = G[0] * magic_kernel(x);
+    for (n, g) in G.iter().enumerate().skip(1) {
+        sum += g * (magic_kernel(x - n as f64) + magic_kernel(x + n as f64));
+    }
+    sum
+}
+
 fn resize_options(kernel: Kernel, has_alpha: bool) -> ResizeOptions {
     let algorithm = match kernel {
         Kernel::Nearest => ResizeAlg::Nearest,
         Kernel::Linear | Kernel::Bilinear => ResizeAlg::Convolution(FirFilter::Bilinear),
         Kernel::Cubic => ResizeAlg::Convolution(FirFilter::CatmullRom),
         Kernel::Mitchell => ResizeAlg::Convolution(FirFilter::Mitchell),
-        Kernel::Lanczos2 => ResizeAlg::Convolution(FirFilter::Lanczos3),
+        Kernel::Lanczos2 => ResizeAlg::Convolution(custom_filter("lanczos2", lanczos2_filter, 2.0)),
         Kernel::Lanczos3 => ResizeAlg::Convolution(FirFilter::Lanczos3),
-        Kernel::Mks2013 | Kernel::Mks2021 => ResizeAlg::Convolution(FirFilter::Lanczos3),
+        Kernel::Mks2013 => ResizeAlg::Convolution(custom_filter("mks2013", mks2013_filter, 2.5)),
+        Kernel::Mks2021 => ResizeAlg::Convolution(custom_filter("mks2021", mks2021_filter, 4.5)),
     };
     ResizeOptions::new()
         .resize_alg(algorithm)
