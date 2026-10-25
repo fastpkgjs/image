@@ -1762,7 +1762,7 @@ const RECIPROCAL: [u64; 256] = {
     let mut table = [0u64; 256];
     let mut a = 1;
     while a < 256 {
-        table[a] = ((1u64 << 32) + a as u64 - 1) / a as u64;
+        table[a] = (1u64 << 32).div_ceil(a as u64);
         a += 1;
     }
     table

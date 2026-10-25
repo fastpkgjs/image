@@ -332,8 +332,7 @@ pub fn conv3x3(data: &[u8], width: usize, height: usize, mask: [i32; 9], divisor
     let inv = 1.0 / divisor as f32;
     let finish = |acc: f32| -> u8 {
         ((acc - centre) * inv + MAGIC)
-            .max(MAGIC)
-            .min(MAGIC + 255.0)
+            .clamp(MAGIC, MAGIC + 255.0)
             .to_bits() as u8
     };
     let mut out = vec![0u8; data.len()];
