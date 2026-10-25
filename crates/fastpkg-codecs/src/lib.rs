@@ -16,6 +16,8 @@ use image::codecs::webp::WebPEncoder;
 use image::{Delay, DynamicImage, ExtendedColorType, Frame, ImageDecoder, ImageEncoder};
 
 pub mod header;
+pub mod png_enc;
+pub mod png_quant;
 pub mod svg;
 mod webp;
 
@@ -1242,94 +1244,84 @@ fn is_16bit_name(value: &str) -> bool {
 }
 
 fn encode_png(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Result<()> {
+    use png_enc::{encode, Params};
+    let level = options.compression_level.min(9);
+    let adaptive = options.adaptive_filtering;
+    let (width, height) = (image.width, image.height);
     if options.palette {
-        encode_png_palette(image, options, out)?;
-        write_png_metadata(out, image, options);
-        if let Some(density) = options.with_density.or_else(|| {
-            options
-                .with_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.density)
-        }) {
-            write_png_density(out, density);
-        }
-        return Ok(());
-    }
-    // `bitdepth: 16` only matters for images that actually carry 16-bit samples (sharp keeps
-    // 8-bit sources at 8 bits); toColourspace('rgb16') etc. still force it.
-    let eight_bit_source = options.bitdepth == Some(16)
-        && options.depth.is_none()
-        && options.raw_depth.is_none()
-        && options.colourspace.is_none()
-        && !image.has_wide()
-        && image.depth != "ushort";
-    if output_is_16(options) && !eight_bit_source {
-        encode_png_16(image, options, out)?;
-        write_png_metadata(out, image, options);
-        if let Some(density) = options.with_density.or_else(|| {
-            options
-                .with_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.density)
-        }) {
-            write_png_density(out, density);
-        }
-        return Ok(());
-    }
-    if options.progressive {
-        encode_png_interlaced(image, options, out)?;
-        write_png_metadata(out, image, options);
-        if let Some(density) = options.with_density.or_else(|| {
-            options
-                .with_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.density)
-        }) {
-            write_png_density(out, density);
-        }
-        return Ok(());
-    }
-    let compression = match options.compression_level {
-        0..=6 => png::Compression::Fast,
-        7..=8 => png::Compression::Balanced,
-        _ => png::Compression::High,
-    };
-    let mut encoder = png::Encoder::new(&mut *out, image.width, image.height);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_compression(compression);
-    encoder.set_filter(png::Filter::Adaptive);
-    let result = if image.gray {
-        encoder.set_color(if image.has_alpha {
-            png::ColorType::GrayscaleAlpha
+        encode_png_palette(image, options, out);
+    } else if output_is_16(options) && !eight_bit_source(image, options) {
+        // `bitdepth: 16` only matters for images that carry 16-bit samples (sharp keeps 8-bit
+        // sources at 8 bits); toColourspace('rgb16') etc. still force it.
+        let wide = image.to_rgba16();
+        let mut samples = Vec::with_capacity(wide.len() * 2);
+        let color_type = if image.gray {
+            for px in wide.chunks_exact(4) {
+                samples.extend_from_slice(&px[0].to_be_bytes());
+                if image.has_alpha {
+                    samples.extend_from_slice(&px[3].to_be_bytes());
+                }
+            }
+            if image.has_alpha {
+                4
+            } else {
+                0
+            }
         } else {
-            png::ColorType::Grayscale
-        });
-        let samples = image.to_packed();
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| FastpkgError::Encode(e.to_string()))?;
-        writer
-            .write_image_data(&samples)
-            .map_err(|e| FastpkgError::Encode(e.to_string()))
-    } else if image.has_alpha {
-        encoder.set_color(png::ColorType::Rgba);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| FastpkgError::Encode(e.to_string()))?;
-        writer
-            .write_image_data(&image.data)
-            .map_err(|e| FastpkgError::Encode(e.to_string()))
+            let n = if image.has_alpha { 4 } else { 3 };
+            for px in wide.chunks_exact(4) {
+                for value in &px[..n] {
+                    samples.extend_from_slice(&value.to_be_bytes());
+                }
+            }
+            if image.has_alpha {
+                6
+            } else {
+                2
+            }
+        };
+        encode(
+            &Params {
+                width,
+                height,
+                bit_depth: 16,
+                color_type,
+                palette: None,
+                trns: None,
+                interlace: options.progressive,
+                level,
+                adaptive,
+            },
+            &samples,
+            out,
+        );
     } else {
-        encoder.set_color(png::ColorType::Rgb);
-        let rgb = image.to_rgb();
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| FastpkgError::Encode(e.to_string()))?;
-        writer
-            .write_image_data(&rgb)
-            .map_err(|e| FastpkgError::Encode(e.to_string()))
-    };
-    result?;
+        let (samples, color_type): (std::borrow::Cow<[u8]>, u8) = if image.gray {
+            (
+                image.to_packed().into(),
+                if image.has_alpha { 4 } else { 0 },
+            )
+        } else if image.has_alpha {
+            ((&image.data[..]).into(), 6)
+        } else {
+            (image.to_rgb().into(), 2)
+        };
+        encode(
+            &Params {
+                width,
+                height,
+                bit_depth: 8,
+                color_type,
+                palette: None,
+                trns: None,
+                interlace: options.progressive,
+                level,
+                adaptive,
+            },
+            &samples,
+            out,
+        );
+    }
     write_png_metadata(out, image, options);
     if let Some(density) = options.with_density.or_else(|| {
         options
@@ -1342,223 +1334,67 @@ fn encode_png(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Resu
     Ok(())
 }
 
-/// 8-bit Adam7 interlaced PNG. The `png` crate cannot write interlaced images, so the chunks
-/// are assembled here: every pass is filtered row by row (minimum-sum heuristic) and the whole
-/// stream is deflated once.
-fn encode_png_interlaced(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Result<()> {
-    use std::io::Write;
-    let (samples, channels, color_type): (Vec<u8>, usize, u8) = if image.gray {
-        if image.has_alpha {
-            (image.to_packed(), 2, 4)
-        } else {
-            (image.to_packed(), 1, 0)
-        }
-    } else if image.has_alpha {
-        (image.data.clone(), 4, 6)
-    } else {
-        (image.to_rgb(), 3, 2)
-    };
-    let (width, height) = (image.width as usize, image.height as usize);
-    const PASSES: [(usize, usize, usize, usize); 7] = [
-        (0, 0, 8, 8),
-        (4, 0, 8, 8),
-        (0, 4, 4, 8),
-        (2, 0, 4, 4),
-        (0, 2, 2, 4),
-        (1, 0, 2, 2),
-        (0, 1, 1, 2),
-    ];
-    let paeth = |a: i32, b: i32, c: i32| -> i32 {
-        let p = a + b - c;
-        let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
-        if pa <= pb && pa <= pc {
-            a
-        } else if pb <= pc {
-            b
-        } else {
-            c
-        }
-    };
-    let mut raw = Vec::with_capacity(samples.len() + height * 7);
-    for (x0, y0, dx, dy) in PASSES {
-        if x0 >= width || y0 >= height {
-            continue;
-        }
-        let pass_width = (width - x0).div_ceil(dx);
-        let mut previous = vec![0u8; pass_width * channels];
-        let mut y = y0;
-        while y < height {
-            let mut row = Vec::with_capacity(pass_width * channels);
-            for k in 0..pass_width {
-                let start = (y * width + x0 + k * dx) * channels;
-                row.extend_from_slice(&samples[start..start + channels]);
-            }
-            let mut best: Option<(u64, Vec<u8>)> = None;
-            for filter in 0u8..5 {
-                let mut filtered = Vec::with_capacity(row.len() + 1);
-                filtered.push(filter);
-                for i in 0..row.len() {
-                    let a = if i >= channels {
-                        row[i - channels] as i32
-                    } else {
-                        0
-                    };
-                    let b = previous[i] as i32;
-                    let c = if i >= channels {
-                        previous[i - channels] as i32
-                    } else {
-                        0
-                    };
-                    let predicted = match filter {
-                        0 => 0,
-                        1 => a,
-                        2 => b,
-                        3 => (a + b) / 2,
-                        _ => paeth(a, b, c),
-                    };
-                    filtered.push((row[i] as i32 - predicted) as u8);
-                }
-                let cost: u64 = filtered[1..]
-                    .iter()
-                    .map(|&v| (v as i8 as i32).unsigned_abs() as u64)
-                    .sum();
-                if best.as_ref().is_none_or(|(c, _)| cost < *c) {
-                    best = Some((cost, filtered));
-                }
-            }
-            raw.extend_from_slice(&best.expect("five filters tried").1);
-            previous = row;
-            y += dy;
-        }
-    }
-    let level = match options.compression_level {
-        0 => flate2::Compression::none(),
-        1..=6 => flate2::Compression::fast(),
-        7..=8 => flate2::Compression::default(),
-        _ => flate2::Compression::best(),
-    };
-    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), level);
-    encoder
-        .write_all(&raw)
-        .map_err(|e| FastpkgError::Encode(e.to_string()))?;
-    let idat = encoder
-        .finish()
-        .map_err(|e| FastpkgError::Encode(e.to_string()))?;
-    let chunk = |out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]| {
-        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        out.extend_from_slice(kind);
-        out.extend_from_slice(data);
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(kind);
-        hasher.update(data);
-        out.extend_from_slice(&hasher.finalize().to_be_bytes());
-    };
-    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-    let mut header = Vec::with_capacity(13);
-    header.extend_from_slice(&image.width.to_be_bytes());
-    header.extend_from_slice(&image.height.to_be_bytes());
-    header.extend_from_slice(&[8, color_type, 0, 0, 1]);
-    chunk(out, b"IHDR", &header);
-    chunk(out, b"IDAT", &idat);
-    chunk(out, b"IEND", &[]);
-    Ok(())
+fn eight_bit_source(image: &Image, options: &OutputOptions) -> bool {
+    options.bitdepth == Some(16)
+        && options.depth.is_none()
+        && options.raw_depth.is_none()
+        && options.colourspace.is_none()
+        && !image.has_wide()
+        && image.depth != "ushort"
 }
 
-fn encode_png_16(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Result<()> {
-    let wide = image.to_rgba16();
-    let mut samples = Vec::new();
-    let color_type = if image.gray {
-        if image.has_alpha {
-            for px in wide.chunks_exact(4) {
-                samples.extend_from_slice(&px[0].to_be_bytes());
-                samples.extend_from_slice(&px[3].to_be_bytes());
-            }
-            png::ColorType::GrayscaleAlpha
-        } else {
-            for px in wide.chunks_exact(4) {
-                samples.extend_from_slice(&px[0].to_be_bytes());
-            }
-            png::ColorType::Grayscale
-        }
-    } else if image.has_alpha {
-        for px in wide.chunks_exact(4) {
-            for value in px {
-                samples.extend_from_slice(&value.to_be_bytes());
-            }
-        }
-        png::ColorType::Rgba
-    } else {
-        for px in wide.chunks_exact(4) {
-            for value in &px[..3] {
-                samples.extend_from_slice(&value.to_be_bytes());
-            }
-        }
-        png::ColorType::Rgb
+/// Indexed PNG through the built-in quantiser. Mirrors sharp/libvips: `colours` selects a
+/// 1/2/4/8-bit depth and therefore caps the palette at 2/4/16/256 entries.
+fn encode_png_palette(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) {
+    let cap = match options.colors {
+        0..=2 => 2,
+        3..=4 => 4,
+        5..=16 => 16,
+        _ => 256,
     };
-    let mut encoder = png::Encoder::new(&mut *out, image.width, image.height);
-    encoder.set_color(color_type);
-    encoder.set_depth(png::BitDepth::Sixteen);
-    encoder.set_compression(match options.compression_level {
-        0..=6 => png::Compression::Fast,
-        7..=8 => png::Compression::Balanced,
-        _ => png::Compression::High,
-    });
-    encoder.set_filter(png::Filter::Adaptive);
-    let mut writer = encoder
-        .write_header()
-        .map_err(|e| FastpkgError::Encode(e.to_string()))?;
-    writer
-        .write_image_data(&samples)
-        .map_err(|e| FastpkgError::Encode(e.to_string()))
-}
-
-fn encode_png_palette(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Result<()> {
-    let colors = (options.colors as usize).clamp(2, 256);
-    let quant = color_quant::NeuQuant::new(10, colors, &image.data);
-    let palette_rgba = quant.color_map_rgba();
-    let palette_len = palette_rgba.len() / 4;
-    let mut palette = Vec::with_capacity(palette_len * 3);
-    let mut alpha = Vec::with_capacity(palette_len);
-    let mut has_alpha = false;
-    for px in palette_rgba.chunks_exact(4) {
-        palette.extend_from_slice(&px[..3]);
-        alpha.push(px[3]);
-        has_alpha |= image.has_alpha && px[3] < 255;
-    }
-    const BAYER: [[i32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
-    let dither = options.dither.clamp(0.0, 1.0) * 32.0;
-    let width = image.width as usize;
-    let mut indices = Vec::with_capacity(image.pixel_count());
-    for (index, px) in image.data.chunks_exact(4).enumerate() {
-        let x = index % width;
-        let y = index / width;
-        let offset = (BAYER[y % 4][x % 4] as f64 / 16.0 - 0.5) * dither;
-        let pixel = [
-            (px[0] as f64 + offset).clamp(0.0, 255.0) as u8,
-            (px[1] as f64 + offset).clamp(0.0, 255.0) as u8,
-            (px[2] as f64 + offset).clamp(0.0, 255.0) as u8,
-            px[3],
-        ];
-        indices.push(quant.index_of(&pixel) as u8);
-    }
-    let mut encoder = png::Encoder::new(&mut *out, image.width, image.height);
-    encoder.set_color(png::ColorType::Indexed);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_palette(palette);
-    if has_alpha {
-        encoder.set_trns(alpha);
-    }
-    encoder.set_compression(match options.compression_level {
-        0..=6 => png::Compression::Fast,
-        7..=8 => png::Compression::Balanced,
-        _ => png::Compression::High,
-    });
-    let mut writer = encoder
-        .write_header()
-        .map_err(|e| FastpkgError::Encode(e.to_string()))?;
-    writer
-        .write_image_data(&indices)
-        .map_err(|e| FastpkgError::Encode(e.to_string()))
+    let quantized = png_quant::quantize(
+        &image.data,
+        image.width as usize,
+        image.height as usize,
+        &png_quant::Settings {
+            max_colors: cap,
+            quality: if options.quality_set {
+                options.quality
+            } else {
+                100
+            },
+            effort: if options.effort_set {
+                options.effort
+            } else {
+                7
+            },
+            dither: options.dither as f32,
+        },
+    );
+    let depth = match quantized.colors {
+        0..=2 => 1,
+        3..=4 => 2,
+        5..=16 => 4,
+        _ => 8,
+    };
+    // Adam7 here is written at 8 bits per index (no sub-byte pass packing).
+    let depth = if options.progressive { 8 } else { depth };
+    let packed = png_enc::pack_indices(&quantized.indices, image.width as usize, depth);
+    png_enc::encode(
+        &png_enc::Params {
+            width: image.width,
+            height: image.height,
+            bit_depth: depth,
+            color_type: 3,
+            palette: Some(&quantized.palette),
+            trns: (!quantized.trns.is_empty()).then_some(&quantized.trns[..]),
+            interlace: options.progressive,
+            level: options.compression_level.min(9),
+            adaptive: options.adaptive_filtering,
+        },
+        &packed,
+        out,
+    );
 }
 
 /// (EXIF, ICC, XMP) chunk payloads.
@@ -1952,7 +1788,8 @@ fn insert_png_chunk(data: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) {
             data[offset + 3],
         ]) as usize;
         let tag = &data[offset + 4..offset + 8];
-        if tag == b"IDAT" || tag == b"IEND" {
+        // Colour-space chunks (iCCP) must precede PLTE as well as IDAT.
+        if tag == b"IDAT" || tag == b"IEND" || (tag == b"PLTE" && kind == b"iCCP") {
             insert_at = Some(offset);
             break;
         }

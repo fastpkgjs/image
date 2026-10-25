@@ -151,6 +151,21 @@ await image('input.png')
 
 16-bit PNG and raw `ushort` samples are preserved for decode/encode, raw round-trips, and geometry operations (`resize`, `extract`, `extend`, `rotate`, `affine`, `flip`, `flop`, `autoOrient`). Point and filter operations currently run on the 8-bit representation and discard the wide buffer. Use `.toColourspace('rgb16')` or `.png({ bitdepth: 16 })` for 16-bit output.
 
+### PNG output
+
+`png()` takes sharp's options and maps them like this:
+
+| Option | Behaviour |
+|---|---|
+| `compressionLevel` (0-9, default 6) | A zlib ladder as in libpng/sharp: `0` stored (uncompressed) blocks, `1`-`3` fast, `4`-`6` default, `7`-`9` strongest. Deflate is zlib-rs; large images are deflated as fixed 512 KiB blocks in parallel and joined into one zlib stream (about 0.04% larger than one stream). |
+| `adaptiveFiltering` | `true` filters every row adaptively, `false` writes unfiltered rows (what libvips does by default). Left unset, the encoder trial-compresses a sample of rows both ways and keeps the smaller (adaptive only when it wins by 2% or more), so the default output is never meaningfully larger than sharp's and is often several times smaller on photos and gradients. |
+| `palette`, `quality`, `effort`, `colours`/`colors`, `dither` | Indexed output through a built-in median-cut quantiser with error diffusion (no libimagequant, which is GPL). Like sharp, giving `quality`, `effort`, `colours` or `dither` switches `palette` on. Images with at most `colours` distinct colours (alpha included) are converted losslessly. `colours` picks a 1/2/4/8-bit depth (2/4/16/256 entries) exactly as libvips does; translucent entries are written to `tRNS`. |
+| `progressive` | Adam7 interlacing (also for palette output). |
+
+The colour type and channel count are never changed behind your back: RGBA stays RGBA unless `palette` is requested.
+
+PNG bytes are **not** libvips-identical, but the encoder is a pure function of the pixels and the options: the same input gives the same bytes on every run, with any thread count (`image.concurrency()`), and, by construction, on every platform. They are stable within a release line (pinned by `tests/png-stability.test.mjs`); any change to the encoded bytes is listed in the CHANGELOG.
+
 ## API surface
 
 Implemented sharp-compatible methods:
@@ -227,7 +242,7 @@ Run:
 node bench/run.mjs
 ```
 
-Current results (median ms, `sharp@0.35.5`, concurrency 1, Linux x64, AMD EPYC-Rome 12 vCPU, Node 24):
+Current results (the PNG rows were re-measured separately after the PNG encoder rewrite; median ms, `sharp@0.35.5`, concurrency 1, Linux x64, AMD EPYC-Rome 12 vCPU, Node 24):
 
 | Scenario | Fastpkg | sharp | Ratio |
 |---|---:|---:|---:|
@@ -238,9 +253,11 @@ Current results (median ms, `sharp@0.35.5`, concurrency 1, Linux x64, AMD EPYC-R
 | photo JPEG -> thumbnail 320 JPEG | 16.7 | 21.1 | 1.26x faster |
 | photo JPEG -> JPEG q85, no resize | 113-120 | 98-101 | 12-18% slower (single thread) |
 | photo JPEG -> resize 1200 WebP q80 | 158 | 171 | 1.08x faster |
-| resize 1200 + PNG | 36.9 | 44.3 | 1.20x faster |
-| photo PNG 2000 -> PNG | 68.7 | 217.6 | 3.2x faster |
-| alpha PNG 2000 -> resize 800 PNG | 54.3 | 104.2 | 1.9x faster |
+| resize 1200 + PNG (default level) | 97.0 | 49.3 | 2.0x slower single-thread, 40% smaller output; 1.3x faster with the default pool |
+| photo PNG 2000 -> PNG (default level) | 531 | 287 | 1.85x slower single-thread, 3.0x smaller output; 2.2x faster with the default pool |
+| alpha PNG 2000 -> resize 800 PNG | 94.0 | 113 | 1.2x faster, 1.9x smaller output |
+| graphic PNG 1200 -> palette PNG | 56 | 113 | 2.0x faster |
+| photo PNG 2000 -> palette PNG | 1325 | 11050 | 8.3x faster |
 | resize 1200 + WebP lossless | 34.7 | 676.2 | 19.5x faster |
 | blur + sharpen + JPEG | 26.4 | 58.9 | 2.2x faster |
 | stats 4000x3000 | 141.2 | 419.3 | 3.0x faster |
