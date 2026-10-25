@@ -140,8 +140,17 @@ fn apply_op(mut image: Image, op: &Operation) -> Result<Image> {
             odx,
             ody,
             background,
-            ..
-        } => affine(image, matrix, *idx, *idy, *odx, *ody, background),
+            interpolator,
+        } => affine(
+            image,
+            matrix,
+            *idx,
+            *idy,
+            *odx,
+            *ody,
+            background,
+            interpolator.as_deref(),
+        ),
         Operation::Sharpen {
             sigma,
             m1,
@@ -984,14 +993,26 @@ fn rotate(image: Image, angle: f64, background: &str) -> Result<Image> {
     let (cos, sin, new_w, new_h, left, top) = rotation_frame(image.width, image.height, angle);
     let mut out = Image::from_rgba(new_w, new_h, vec![0u8; new_w as usize * new_h as usize * 4])?;
     out.has_alpha = image.has_alpha || bg.alpha < 255;
+    let with_alpha = out.has_alpha;
+    let fill = if with_alpha {
+        premultiplied(bg)
+    } else {
+        [bg.r as f32, bg.g as f32, bg.b as f32, bg.alpha as f32]
+    };
     out.data
         .par_chunks_exact_mut(new_w as usize * 4)
         .enumerate()
         .for_each(|(y, row)| {
             for (x, dst) in row.chunks_exact_mut(4).enumerate() {
                 let (sx, sy) = rotation_source(cos, sin, left, top, x as u32, y as u32);
-                let color = sample_bilinear(&image, sx, sy, bg);
-                dst.copy_from_slice(&[color.r, color.g, color.b, color.alpha]);
+                dst.copy_from_slice(&sample_pixel(
+                    &image,
+                    sx,
+                    sy,
+                    Interpolator::Bilinear,
+                    fill,
+                    with_alpha,
+                ));
             }
         });
     out.format = image.format;
@@ -1081,6 +1102,9 @@ fn rotate_wide(mut image: Image, angle: f64, background: &str) -> Result<Image> 
     Ok(image)
 }
 
+/// Bilinear sample at source position `(x, y)` (pixel-index space). Like libvips' `affine`, taps
+/// that fall outside the image read the background colour, so the edge of the image blends into
+/// the background by coverage instead of ending in a hard line.
 fn sample_bilinear_wide(
     wide: &[u16],
     width: usize,
@@ -1089,19 +1113,19 @@ fn sample_bilinear_wide(
     y: f64,
     fallback: [u16; 4],
 ) -> [u16; 4] {
-    if x < -0.5 || y < -0.5 || x > width as f64 - 0.5 || y > height as f64 - 0.5 {
+    if x <= -1.0 || y <= -1.0 || x >= width as f64 || y >= height as f64 {
         return fallback;
     }
-    let x = x.clamp(0.0, (width - 1) as f64);
-    let y = y.clamp(0.0, (height - 1) as f64);
-    let x0 = x.floor() as usize;
-    let y0 = y.floor() as usize;
-    let x1 = (x0 + 1).min(width - 1);
-    let y1 = (y0 + 1).min(height - 1);
-    let fx = x - x0 as f64;
-    let fy = y - y0 as f64;
-    let at = |px: usize, py: usize| -> [f64; 4] {
-        let idx = (py * width + px) * 4;
+    let x0 = x.floor();
+    let y0 = y.floor();
+    let fx = x - x0;
+    let fy = y - y0;
+    let (x0, y0) = (x0 as i64, y0 as i64);
+    let at = |px: i64, py: i64| -> [f64; 4] {
+        if px < 0 || py < 0 || px >= width as i64 || py >= height as i64 {
+            return fallback.map(|v| v as f64);
+        }
+        let idx = (py as usize * width + px as usize) * 4;
         [
             wide[idx] as f64,
             wide[idx + 1] as f64,
@@ -1110,9 +1134,9 @@ fn sample_bilinear_wide(
         ]
     };
     let c00 = at(x0, y0);
-    let c10 = at(x1, y0);
-    let c01 = at(x0, y1);
-    let c11 = at(x1, y1);
+    let c10 = at(x0 + 1, y0);
+    let c01 = at(x0, y0 + 1);
+    let c11 = at(x0 + 1, y0 + 1);
     let mut out = [0u16; 4];
     for c in 0..4 {
         let top = c00[c] + (c10[c] - c00[c]) * fx;
@@ -1122,32 +1146,147 @@ fn sample_bilinear_wide(
     out
 }
 
-fn sample_bilinear(image: &Image, x: f64, y: f64, fallback: Color) -> Color {
-    if x < -0.5 || y < -0.5 || x > image.width as f64 - 0.5 || y > image.height as f64 - 0.5 {
-        return fallback;
+/// Premultiplied float colour as libvips computes it: `colour * (alpha / 255)` in `f32`.
+#[inline]
+fn premultiplied(color: Color) -> [f32; 4] {
+    let factor = color.alpha as f32 / 255.0;
+    [
+        color.r as f32 * factor,
+        color.g as f32 * factor,
+        color.b as f32 * factor,
+        color.alpha as f32,
+    ]
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interpolator {
+    Nearest,
+    Bilinear,
+    Bicubic,
+}
+
+impl Interpolator {
+    /// `nohalo`, `lbb` and `vsqbs` are approximated by bilinear.
+    fn parse(name: Option<&str>) -> Self {
+        match name {
+            Some("nearest") => Interpolator::Nearest,
+            Some("bicubic") => Interpolator::Bicubic,
+            _ => Interpolator::Bilinear,
+        }
     }
-    let x = x.clamp(0.0, (image.width - 1) as f64);
-    let y = y.clamp(0.0, (image.height - 1) as f64);
-    let x0 = x.floor() as u32;
-    let y0 = y.floor() as u32;
-    let x1 = (x0 + 1).min(image.width - 1);
-    let y1 = (y0 + 1).min(image.height - 1);
-    let fx = x - x0 as f64;
-    let fy = y - y0 as f64;
-    let c00 = image.get(x0, y0);
-    let c10 = image.get(x1, y0);
-    let c01 = image.get(x0, y1);
-    let c11 = image.get(x1, y1);
-    let lerp = |a: u8, b: u8, c: u8, d: u8| -> u8 {
-        let top = a as f64 + (b as f64 - a as f64) * fx;
-        let bottom = c as f64 + (d as f64 - c as f64) * fx;
-        (top + (bottom - top) * fy).clamp(0.0, 255.0).round() as u8
+}
+
+/// Catmull-Rom weights for the four taps `floor(x) - 1 ..= floor(x) + 2` (libvips `bicubic`).
+#[inline]
+fn catmull_rom(t: f64) -> [f64; 4] {
+    [
+        ((-0.5 * t + 1.0) * t - 0.5) * t,
+        (1.5 * t - 2.5) * t * t + 1.0,
+        ((-1.5 * t + 2.0) * t + 0.5) * t,
+        (0.5 * t - 0.5) * t * t,
+    ]
+}
+
+/// Samples the image at source position `(x, y)` (pixel-index space) the way libvips' `affine`
+/// does: taps outside the image read the background, so the edge blends into it by coverage.
+/// Images with alpha are premultiplied, interpolated in float, unpremultiplied
+/// (`value * (255 / alpha)`, zero for alpha 0) and truncated to 8 bits; opaque images are
+/// interpolated directly and rounded. `background` is premultiplied for images with alpha.
+fn sample_pixel(
+    image: &Image,
+    x: f64,
+    y: f64,
+    interpolator: Interpolator,
+    background: [f32; 4],
+    with_alpha: bool,
+) -> [u8; 4] {
+    let (w, h) = (image.width as i64, image.height as i64);
+    let tap = |px: i64, py: i64| -> [f32; 4] {
+        if px < 0 || py < 0 || px >= w || py >= h {
+            return background;
+        }
+        let color = image.get(px as u32, py as u32);
+        if with_alpha {
+            premultiplied(color)
+        } else {
+            [color.r as f32, color.g as f32, color.b as f32, color.alpha as f32]
+        }
     };
-    Color {
-        r: lerp(c00.r, c10.r, c01.r, c11.r),
-        g: lerp(c00.g, c10.g, c01.g, c11.g),
-        b: lerp(c00.b, c10.b, c01.b, c11.b),
-        alpha: lerp(c00.alpha, c10.alpha, c01.alpha, c11.alpha),
+    let (wx, wy, first): ([f64; 4], [f64; 4], i64);
+    let (x0, y0);
+    let taps;
+    match interpolator {
+        Interpolator::Nearest => {
+            x0 = x.floor() as i64;
+            y0 = y.floor() as i64;
+            wx = [1.0, 0.0, 0.0, 0.0];
+            wy = wx;
+            first = 0;
+            taps = 1;
+        }
+        Interpolator::Bilinear => {
+            let (fx, fy) = (x.floor(), y.floor());
+            x0 = fx as i64;
+            y0 = fy as i64;
+            wx = [1.0 - (x - fx), x - fx, 0.0, 0.0];
+            wy = [1.0 - (y - fy), y - fy, 0.0, 0.0];
+            first = 0;
+            taps = 2;
+        }
+        Interpolator::Bicubic => {
+            let (fx, fy) = (x.floor(), y.floor());
+            x0 = fx as i64;
+            y0 = fy as i64;
+            wx = catmull_rom(x - fx);
+            wy = catmull_rom(y - fy);
+            first = -1;
+            taps = 4;
+        }
+    }
+    let far = 3 as f64;
+    let blended = if x < -far || y < -far || x > w as f64 + far || y > h as f64 + far {
+        background
+    } else if interpolator == Interpolator::Bilinear {
+        // Same arithmetic as the generic loop below, spelled out as two lerps.
+        let c00 = tap(x0, y0);
+        let c10 = tap(x0 + 1, y0);
+        let c01 = tap(x0, y0 + 1);
+        let c11 = tap(x0 + 1, y0 + 1);
+        let (fx, fy) = (wx[1], wy[1]);
+        let mut out = [0f32; 4];
+        for c in 0..4 {
+            let top = c00[c] as f64 + (c10[c] as f64 - c00[c] as f64) * fx;
+            let bottom = c01[c] as f64 + (c11[c] as f64 - c01[c] as f64) * fx;
+            out[c] = (top + (bottom - top) * fy) as f32;
+        }
+        out
+    } else {
+        let mut acc = [0f64; 4];
+        for j in 0..taps {
+            let mut row = [0f64; 4];
+            for i in 0..taps {
+                let value = tap(x0 + first + i as i64, y0 + first + j as i64);
+                for c in 0..4 {
+                    row[c] += value[c] as f64 * wx[i];
+                }
+            }
+            for c in 0..4 {
+                acc[c] += row[c] * wy[j];
+            }
+        }
+        acc.map(|v| v as f32)
+    };
+    if with_alpha {
+        let alpha = blended[3];
+        let factor = if alpha == 0.0 { 0.0 } else { 255.0 / alpha };
+        [
+            (blended[0] * factor).clamp(0.0, 255.0) as u8,
+            (blended[1] * factor).clamp(0.0, 255.0) as u8,
+            (blended[2] * factor).clamp(0.0, 255.0) as u8,
+            alpha.clamp(0.0, 255.0) as u8,
+        ]
+    } else {
+        blended.map(|v| v.clamp(0.0, 255.0).round() as u8)
     }
 }
 
@@ -1184,6 +1323,7 @@ fn affine(
     odx: f64,
     ody: f64,
     background: &str,
+    interpolator: Option<&str>,
 ) -> Result<Image> {
     if matrix.len() != 4 && matrix.len() != 6 {
         return Err(FastpkgError::InvalidOptions(
@@ -1265,6 +1405,13 @@ fn affine(
         vec![0u8; width as usize * height as usize * 4],
     )?;
     out.has_alpha = image.has_alpha || bg.alpha < 255;
+    let with_alpha = out.has_alpha;
+    let fill = if with_alpha {
+        premultiplied(bg)
+    } else {
+        [bg.r as f32, bg.g as f32, bg.b as f32, bg.alpha as f32]
+    };
+    let interpolator = Interpolator::parse(interpolator);
     out.data
         .par_chunks_exact_mut(width as usize * 4)
         .enumerate()
@@ -1276,8 +1423,14 @@ fn affine(
                 let dy = oy - ody;
                 let sx = inv_a * dx + inv_b * dy - idx;
                 let sy = inv_c * dx + inv_d * dy - idy;
-                let color = sample_bilinear(&image, sx, sy, bg);
-                dst.copy_from_slice(&[color.r, color.g, color.b, color.alpha]);
+                dst.copy_from_slice(&sample_pixel(
+                    &image,
+                    sx,
+                    sy,
+                    interpolator,
+                    fill,
+                    with_alpha,
+                ));
             }
         });
     out.format = image.format;
