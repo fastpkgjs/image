@@ -5,42 +5,62 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish from an existing tag, e.g. 0.2.0 (empty: build and test only, nothing is published)'
+        required: false
+        default: ''
+      ci_run_id:
+        description: 'Reuse the binaries of this finished CI/release run id instead of rebuilding and retesting (empty: build and test)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
   id-token: write
+  actions: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.ref }}-${{ inputs.version }}
   cancel-in-progress: false
+
+env:
+  # Tag pushes publish the tag's version; manual runs publish `inputs.version`.
+  RELEASE_VERSION: ${{ inputs.version || (startsWith(github.ref, 'refs/tags/v') && github.ref_name || '') }}
 
 jobs:
   # Fail fast: the tag must match package.json, the Cargo workspace and Cargo.lock.
   verify-version:
     name: verify version
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.version != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: node scripts/check-version.mjs "$GITHUB_REF_NAME"
+      - run: node scripts/check-version.mjs "v${RELEASE_VERSION#v}"
 
   # Builds every platform binary and runs `npm test` + tests/smoke.mjs against
   # each built binary on its target OS (Node 22/24/26), including Alpine/musl.
-  # See ci.yml. Publishing below is gated on all of it passing.
+  # See ci.yml. Publishing below is gated on all of it passing. Skipped when a
+  # previous run's binaries are reused (`ci_run_id`).
   ci:
     name: build and test
+    if: inputs.ci_run_id == ''
     uses: ./.github/workflows/ci.yml
 
   publish:
     name: publish
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: [verify-version, ci]
+    if: ${{ !cancelled() && needs.verify-version.result == 'success' && (needs.ci.result == 'success' || needs.ci.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -50,21 +70,33 @@ jobs:
           pattern: bindings-*
           path: artifacts
           merge-multiple: true
+          run-id: ${{ inputs.ci_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - run: ls -l artifacts
       - name: Stage packages
-        run: node scripts/release-packages.mjs --version "${GITHUB_REF_NAME#v}" --artifacts artifacts --output dist/npm
+        run: node scripts/release-packages.mjs --version "${RELEASE_VERSION#v}" --artifacts artifacts --output dist/npm
       - name: Publish platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          set -uo pipefail
+          version="${RELEASE_VERSION#v}"
           for directory in dist/npm/image-*; do
             name="$(node -p "require('./$directory/package.json').name")"
             if out="$(npm view "$name@$version" version 2>&1)"; then
               echo "skip $name@$version (already published)"
             elif grep -q 'E404' <<<"$out"; then
-              npm publish "$directory" --access public --provenance
+              if ! pub="$(npm publish "$directory" --access public --provenance 2>&1)"; then
+                echo "$pub" >&2
+                # The registry view can lag behind a publish; an existing version is fine.
+                if grep -qiE 'previously published|cannot publish over' <<<"$pub"; then
+                  echo "skip $name@$version (already published)"
+                else
+                  exit 1
+                fi
+              else
+                echo "$pub"
+              fi
             else
               echo "npm view failed for $name@$version:" >&2
               echo "$out" >&2
@@ -75,12 +107,22 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          set -uo pipefail
+          version="${RELEASE_VERSION#v}"
           # Every platform package must exist on the registry before the main package goes out.
+          # A fresh publish can take a while to show up in `npm view`, so retry.
           for directory in dist/npm/image-*; do
             name="$(node -p "require('./$directory/package.json').name")"
-            npm view "$name@$version" version >/dev/null
+            ok=0
+            for attempt in $(seq 1 30); do
+              if npm view "$name@$version" version >/dev/null 2>&1; then ok=1; break; fi
+              echo "waiting for $name@$version to appear on the registry ($attempt/30)"
+              sleep 10
+            done
+            if [ "$ok" != 1 ]; then
+              echo "$name@$version never appeared on the registry" >&2
+              exit 1
+            fi
           done
           if out="$(npm view "@fastpkg/image@$version" version 2>&1)"; then
             echo "skip @fastpkg/image@$version (already published)"
@@ -95,9 +137,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" artifacts/*.node --clobber
+          tag="v${RELEASE_VERSION#v}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/*.node --clobber
           else
-            gh release create "$GITHUB_REF_NAME" artifacts/*.node \
-              --title "$GITHUB_REF_NAME" --generate-notes
+            gh release create "$tag" artifacts/*.node \
+              --title "$tag" --generate-notes --verify-tag
           fi
