@@ -19,6 +19,8 @@ use fastpkg_core::{Color, FastpkgError, Format, Image, Result, Stats};
 use image::imageops::FilterType as ImageFilter;
 use rayon::prelude::*;
 
+mod gauss;
+mod sharpen;
 mod vips;
 
 pub fn apply(mut image: Image, operations: &[Operation]) -> Result<Image> {
@@ -150,7 +152,12 @@ fn apply_op(mut image: Image, op: &Operation) -> Result<Image> {
             simple,
         } => sharpen(image, *sigma, *m1, *m2, *x1, *y2, *y3, *simple),
         Operation::Median { size } => median(image, *size),
-        Operation::Blur { sigma } => blur(image, *sigma),
+        Operation::Blur {
+            sigma,
+            min_amplitude,
+            precision,
+            mild,
+        } => blur(image, *sigma, *min_amplitude, precision.as_deref(), *mild),
         Operation::Dilate { width } => morphology(image, *width, true),
         Operation::Erode { width } => morphology(image, *width, false),
         Operation::Flatten { background } => flatten(image, background),
@@ -1278,7 +1285,7 @@ fn affine(
 }
 
 fn sharpen(
-    image: Image,
+    mut image: Image,
     sigma: f64,
     m1: f64,
     m2: f64,
@@ -1287,146 +1294,101 @@ fn sharpen(
     y3: f64,
     simple: bool,
 ) -> Result<Image> {
-    let sigma = sigma.clamp(0.1, 10.0);
-    let blurred = blur_pixels(
-        &image.data,
-        image.width as usize,
-        image.height as usize,
-        if simple { 1.0 } else { sigma },
-    );
-    let x1 = if simple { f64::MAX } else { x1.max(0.0) };
-    let m1 = if simple { 0.5 } else { m1.max(0.0) };
-    let m2 = if simple { 0.5 } else { m2.max(0.0) };
-    let bright_limit = if simple { 1.0 } else { (y2 / 255.0).max(0.0) };
-    let dark_limit = if simple { 1.0 } else { (y3 / 255.0).max(0.0) };
-    let mut out = image;
-    let row_bytes = (out.width as usize * 4).max(4);
-    out.data
-        .par_chunks_mut(row_bytes)
-        .zip(blurred.par_chunks(row_bytes))
-        .for_each(|(dst_row, blur_row)| {
-            for (dst, blur_px) in dst_row.chunks_exact_mut(4).zip(blur_row.chunks_exact(4)) {
-                let original_lum = luminance(dst[0], dst[1], dst[2]) as f64;
-                let blurred_lum = luminance(blur_px[0], blur_px[1], blur_px[2]) as f64;
-                let diff = original_lum - blurred_lum;
-                let contrast = diff.abs();
-                let amount = if contrast < x1 { m1 } else { m2 } * 0.5;
-                let boost = (diff * amount).clamp(-dark_limit * 255.0, bright_limit * 255.0);
-                for channel in 0..3 {
-                    dst[channel] = (dst[channel] as f64 + boost).clamp(0.0, 255.0) as u8;
-                }
-            }
-        });
-    Ok(out)
+    let (w, h) = (image.width as usize, image.height as usize);
+    let has_alpha = image.has_alpha;
+    // sharp premultiplies RGBA before sharpening and unpremultiplies afterwards.
+    let mut data = std::mem::take(&mut image.data);
+    if has_alpha {
+        premultiply(&mut data);
+    }
+    if simple {
+        // Fast, mild sharpen: a 3x3 integer convolution.
+        data = gauss::conv3x3(&data, w, h, [-1, -1, -1, -1, 32, -1, -1, -1, -1], 24, 0);
+    } else {
+        sharpen::sharpen(
+            &mut data,
+            w,
+            h,
+            sigma,
+            (
+                m1.max(0.0),
+                m2.max(0.0),
+                x1.max(0.0),
+                y2.max(0.0),
+                y3.max(0.0),
+            ),
+        );
+    }
+    if has_alpha {
+        unpremultiply(&mut data);
+    }
+    let mut image = image;
+    image.data = data;
+    image.wide = None;
+    Ok(image)
 }
 
-fn blur(image: Image, sigma: f64) -> Result<Image> {
-    let out = blur_pixels(
-        &image.data,
-        image.width as usize,
-        image.height as usize,
-        sigma,
-    );
+fn blur(
+    image: Image,
+    sigma: f64,
+    min_ampl: Option<f64>,
+    precision: Option<&str>,
+    mild: bool,
+) -> Result<Image> {
+    let (w, h) = (image.width as usize, image.height as usize);
+    let has_alpha = image.has_alpha;
+    // sharp premultiplies RGBA before blurring and unpremultiplies afterwards.
+    let mut data = image.data;
+    if has_alpha {
+        premultiply(&mut data);
+    }
+    let mut out = if mild {
+        gauss::conv3x3(&data, w, h, [1; 9], 9, 0)
+    } else {
+        gauss::gaussblur(
+            &data,
+            w,
+            h,
+            sigma,
+            min_ampl.unwrap_or(0.2),
+            gauss::Precision::parse(precision),
+        )
+    };
+    if has_alpha {
+        unpremultiply(&mut out);
+    }
     let mut out_image = Image::from_rgba(image.width, image.height, out)?;
     out_image.format = image.format;
-    out_image.has_alpha = image.has_alpha;
+    out_image.has_alpha = has_alpha;
     Ok(out_image)
 }
 
-/// `dst[i] = sum_k kernel[k] * srcs[k][i]`, accumulated in tap order. Columns are processed in
-/// blocks so the accumulator stays in registers across all taps.
-#[inline(always)]
-fn mac_rows(dst: &mut [f32], kernel: &[f32], srcs: &[&[f32]]) {
-    const LANES: usize = 16;
-    let split = dst.len() / LANES * LANES;
-    let (head, tail) = dst.split_at_mut(split);
-    for (block, chunk) in head.chunks_exact_mut(LANES).enumerate() {
-        let base = block * LANES;
-        let mut acc = [0.0f32; LANES];
-        for (&weight, src) in kernel.iter().zip(srcs) {
-            for (a, &value) in acc.iter_mut().zip(&src[base..base + LANES]) {
-                *a += value * weight;
+/// libvips `premultiply().cast(uchar)`: colour * alpha / 255, truncated.
+fn premultiply(data: &mut [u8]) {
+    data.par_chunks_mut(4096).for_each(|chunk| {
+        for px in chunk.chunks_exact_mut(4) {
+            let a = px[3] as u32;
+            for c in &mut px[..3] {
+                *c = (*c as u32 * a / 255) as u8;
             }
         }
-        chunk.copy_from_slice(&acc);
-    }
-    for (i, out) in tail.iter_mut().enumerate() {
-        let mut acc = 0.0f32;
-        for (&weight, src) in kernel.iter().zip(srcs) {
-            acc += src[split + i] * weight;
-        }
-        *out = acc;
-    }
+    });
 }
 
-/// Exactly `value.clamp(0.0, 255.0).round() as u8` (ties away from zero), written with an
-/// integer truncation so it vectorises instead of calling `roundf` per sample.
-#[inline(always)]
-fn round_u8(value: f32) -> u8 {
-    let value = value.clamp(0.0, 255.0);
-    let whole = value as i32;
-    (whole + i32::from(value - whole as f32 >= 0.5)) as u8
-}
-
-/// Separable Gaussian blur on RGBA8. Both passes accumulate whole rows (`acc[i] += w * src[i]`)
-/// in tap order, so the compiler vectorises them without any architecture-specific code and
-/// the f32 result is identical to a per-pixel multiply-accumulate over the same taps.
-fn blur_pixels(data: &[u8], width: usize, height: usize, sigma: f64) -> Vec<u8> {
-    if width == 0 || height == 0 {
-        return Vec::new();
-    }
-    let sigma = sigma.max(0.1) as f32;
-    let radius = (sigma * 3.0).ceil() as usize;
-    let mut kernel = Vec::with_capacity(radius * 2 + 1);
-    let mut sum = 0.0f32;
-    for i in -(radius as i32)..=(radius as i32) {
-        let value = (-(i * i) as f32 / (2.0 * sigma * sigma)).exp();
-        kernel.push(value);
-        sum += value;
-    }
-    for value in &mut kernel {
-        *value /= sum;
-    }
-
-    let row_len = width * 4;
-    let mut horizontal = vec![0.0f32; data.len()];
-    horizontal
-        .par_chunks_exact_mut(row_len)
-        .zip(data.par_chunks_exact(row_len))
-        .for_each_init(
-            || vec![0.0f32; (width + 2 * radius) * 4],
-            |padded, (row, source)| {
-                // Edge-clamped copy of the source row as f32: padded[j] = source[clamp(j - radius)].
-                for (j, dst) in padded.chunks_exact_mut(4).enumerate() {
-                    let sx = j.saturating_sub(radius).min(width - 1);
-                    for (d, &v) in dst.iter_mut().zip(&source[sx * 4..sx * 4 + 4]) {
-                        *d = v as f32;
-                    }
-                }
-                let taps: Vec<&[f32]> = (0..kernel.len())
-                    .map(|k| &padded[k * 4..k * 4 + row_len])
-                    .collect();
-                mac_rows(row, &kernel, &taps);
-            },
-        );
-
-    let mut out = vec![0u8; data.len()];
-    out.par_chunks_exact_mut(row_len).enumerate().for_each_init(
-        || vec![0.0f32; row_len],
-        |acc, (y, row)| {
-            let taps: Vec<&[f32]> = (0..kernel.len())
-                .map(|k| {
-                    let sy = (y + k).saturating_sub(radius).min(height - 1);
-                    &horizontal[sy * row_len..(sy + 1) * row_len]
-                })
-                .collect();
-            mac_rows(acc, &kernel, &taps);
-            for (dst, &value) in row.iter_mut().zip(acc.iter()) {
-                *dst = round_u8(value);
+/// libvips `unpremultiply().cast(uchar)`: colour * 255 / alpha, truncated; alpha 0 gives 0.
+fn unpremultiply(data: &mut [u8]) {
+    data.par_chunks_mut(4096).for_each(|chunk| {
+        for px in chunk.chunks_exact_mut(4) {
+            let a = px[3] as u32;
+            for c in &mut px[..3] {
+                *c = if a == 0 {
+                    0
+                } else {
+                    (*c as u32 * 255 / a).min(255) as u8
+                };
             }
-        },
-    );
-    out
+        }
+    });
 }
 
 fn median(image: Image, size: u32) -> Result<Image> {
