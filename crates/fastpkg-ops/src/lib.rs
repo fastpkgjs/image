@@ -1684,7 +1684,7 @@ fn sharpen(
     }
     if simple {
         // Fast, mild sharpen: a 3x3 integer convolution.
-        data = gauss::conv3x3(&data, w, h, [-1, -1, -1, -1, 32, -1, -1, -1, -1], 24, 0);
+        data = gauss::conv3x3(&data, w, h, [-1, -1, -1, -1, 32, -1, -1, -1, -1], 24);
     } else {
         sharpen::sharpen(
             &mut data,
@@ -1724,7 +1724,7 @@ fn blur(
         premultiply(&mut data);
     }
     let mut out = if mild {
-        gauss::conv3x3(&data, w, h, [1; 9], 9, 0)
+        gauss::conv3x3(&data, w, h, [1; 9], 9)
     } else {
         gauss::gaussblur(
             data,
@@ -1756,15 +1756,25 @@ fn premultiply(data: &mut [u8]) {
     });
 }
 
+/// `ceil(2^32 / a)` for every alpha (0 for alpha 0): `n / a == (n * RECIPROCAL[a]) >> 32` for
+/// every `n < 2^16`, which replaces a hardware division per channel.
+const RECIPROCAL: [u64; 256] = {
+    let mut table = [0u64; 256];
+    let mut a = 1;
+    while a < 256 {
+        table[a] = ((1u64 << 32) + a as u64 - 1) / a as u64;
+        a += 1;
+    }
+    table
+};
+
 /// libvips `unpremultiply().cast(uchar)`: colour * 255 / alpha, truncated; alpha 0 gives 0.
 fn unpremultiply(data: &mut [u8]) {
     data.par_chunks_mut(4096).for_each(|chunk| {
         for px in chunk.chunks_exact_mut(4) {
-            let a = px[3] as u32;
+            let reciprocal = RECIPROCAL[px[3] as usize];
             for c in &mut px[..3] {
-                *c = (*c as u32 * 255)
-                    .checked_div(a)
-                    .map_or(0, |value| value.min(255)) as u8;
+                *c = (((*c as u64 * 255 * reciprocal) >> 32).min(255)) as u8;
             }
         }
     });
@@ -2618,26 +2628,27 @@ fn join_channel(
 fn bandbool(image: Image, operator: &str) -> Result<Image> {
     let mut out = image;
     let has_alpha = out.has_alpha;
-    out.data.par_chunks_exact_mut(4).for_each(|px| {
-        let mut value = match operator {
-            "and" => px[0] & px[1] & px[2],
-            "or" => px[0] | px[1] | px[2],
-            "eor" | "xor" => px[0] ^ px[1] ^ px[2],
-            _ => px[0],
-        };
-        if has_alpha {
-            match operator {
-                "and" => value &= px[3],
-                "or" => value |= px[3],
-                "eor" | "xor" => value ^= px[3],
-                _ => {}
+    // Choose the combining function once instead of matching the operator for every pixel.
+    #[inline(always)]
+    fn run(data: &mut [u8], has_alpha: bool, combine: impl Fn(u8, u8) -> u8 + Sync) {
+        data.par_chunks_mut(1 << 14).for_each(|chunk| {
+            for px in chunk.chunks_exact_mut(4) {
+                let mut value = combine(combine(px[0], px[1]), px[2]);
+                if has_alpha {
+                    value = combine(value, px[3]);
+                }
+                px[..3].fill(value);
+                px[3] = 255;
             }
-        }
-        px[0] = value;
-        px[1] = value;
-        px[2] = value;
-        px[3] = 255;
-    });
+        });
+    }
+    match operator {
+        "and" => run(&mut out.data, has_alpha, |a, b| a & b),
+        "or" => run(&mut out.data, has_alpha, |a, b| a | b),
+        "eor" | "xor" => run(&mut out.data, has_alpha, |a, b| a ^ b),
+        // Any other operator keeps the first band and ignores alpha.
+        _ => run(&mut out.data, false, |a, _| a),
+    }
     out.has_alpha = false;
     Ok(out)
 }
@@ -4322,6 +4333,16 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn reciprocal_division_is_exact() {
+        for alpha in 1..=255u64 {
+            for colour in 0..=255u64 {
+                let n = colour * 255;
+                assert_eq!((n * RECIPROCAL[alpha as usize]) >> 32, n / alpha);
             }
         }
     }

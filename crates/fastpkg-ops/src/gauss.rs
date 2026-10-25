@@ -45,42 +45,6 @@ fn half_mask(sigma: f64, min_ampl: f64) -> Vec<f64> {
 
 const LANES: usize = 16;
 
-/// `dst[i] = clip(floor((sum_k taps[k] * srcs[k][i] + half) / scale))` for `i32` taps.
-/// Columns are processed in blocks so the accumulator stays in registers across all taps.
-#[inline(always)]
-fn mac_int(dst: &mut [u8], taps: &[i32], srcs: &[&[u8]], half: i32, scale: i32) {
-    let inv = 1.0 / scale as f32;
-    let finish = |acc: i32| -> u8 {
-        let n = acc + half;
-        // Exact floor division: the float quotient is within one of the true value.
-        let mut q = (n as f32 * inv) as i32;
-        q -= i32::from(q * scale > n);
-        q += i32::from((q + 1) * scale <= n);
-        q.clamp(0, 255) as u8
-    };
-    let split = dst.len() / LANES * LANES;
-    let (head, tail) = dst.split_at_mut(split);
-    for (block, chunk) in head.chunks_exact_mut(LANES).enumerate() {
-        let base = block * LANES;
-        let mut acc = [0i32; LANES];
-        for (&weight, src) in taps.iter().zip(srcs) {
-            for (a, &value) in acc.iter_mut().zip(&src[base..base + LANES]) {
-                *a += value as i32 * weight;
-            }
-        }
-        for (out, &a) in chunk.iter_mut().zip(&acc) {
-            *out = finish(a);
-        }
-    }
-    for (i, out) in tail.iter_mut().enumerate() {
-        let mut acc = 0i32;
-        for (&weight, src) in taps.iter().zip(srcs) {
-            acc += src[split + i] as i32 * weight;
-        }
-        *out = finish(acc);
-    }
-}
-
 /// Float-precision accumulation: `dst[i] = sum_k taps[k] * srcs[k][i]`.
 #[inline(always)]
 fn mac_f32(dst: &mut [f32], taps: &[f32], srcs: &[&[f32]]) {
@@ -350,39 +314,70 @@ fn blur_fixed(
     out
 }
 
-/// 3x3 integer convolution (libvips `conv` with an int mask): `clip((sum + rounding) / scale)`,
-/// edge pixels replicated. `mask` is row-major.
-pub fn conv3x3(
-    data: &[u8],
-    width: usize,
-    height: usize,
-    mask: [i32; 9],
-    scale: i32,
-    rounding: i32,
-) -> Vec<u8> {
+/// 3x3 integer convolution as libvips applies it to 8-bit images in sharp's mild `blur()` and
+/// `sharpen()`: `clip(floor(sum / divisor))` (no rounding), edge pixels replicated. `mask` is
+/// row-major. All sums are small integers, so f32 arithmetic is exact; `floor(s / d)` equals
+/// `round_to_nearest((s - (d - 1) / 2) / d)` (the fraction never reaches 0.5), which avoids the
+/// saturating float-to-int cast that does not vectorise.
+pub fn conv3x3(data: &[u8], width: usize, height: usize, mask: [i32; 9], divisor: i32) -> Vec<u8> {
     if width == 0 || height == 0 {
         return Vec::new();
     }
+    const MAGIC: f32 = 8_388_608.0;
+    const LANES: usize = 32;
     let row_len = width * 4;
+    let stride = (width + 2) * 4;
+    let weights = mask.map(|m| m as f32);
+    let centre = (divisor as f32 - 1.0) / 2.0;
+    let inv = 1.0 / divisor as f32;
+    let finish = |acc: f32| -> u8 {
+        ((acc - centre) * inv + MAGIC)
+            .max(MAGIC)
+            .min(MAGIC + 255.0)
+            .to_bits() as u8
+    };
     let mut out = vec![0u8; data.len()];
     out.par_chunks_exact_mut(row_len).enumerate().for_each_init(
-        || vec![0u8; (width + 2) * 4 * 3],
+        || vec![0f32; stride * 3],
         |padded, (y, row)| {
-            let stride = (width + 2) * 4;
             for (r, line) in padded.chunks_exact_mut(stride).enumerate() {
                 let sy = (y + r).saturating_sub(1).min(height - 1);
                 let source = &data[sy * row_len..(sy + 1) * row_len];
-                line[..4].copy_from_slice(&source[..4]);
-                line[4..4 + row_len].copy_from_slice(source);
-                line[4 + row_len..].copy_from_slice(&source[row_len - 4..]);
+                for (d, &v) in line[4..4 + row_len].iter_mut().zip(source) {
+                    *d = v as f32;
+                }
+                for k in 0..4 {
+                    line[k] = line[4 + k];
+                    line[4 + row_len + k] = line[row_len + k];
+                }
             }
-            let srcs: Vec<&[u8]> = (0..9)
+            let taps: Vec<&[f32]> = (0..9)
                 .map(|k| {
                     let (r, c) = (k / 3, k % 3);
                     &padded[r * stride + c * 4..r * stride + c * 4 + row_len]
                 })
                 .collect();
-            mac_int(row, &mask, &srcs, rounding, scale);
+            let mut at = 0;
+            while at + LANES <= row_len {
+                let mut acc = [0f32; LANES];
+                for (tap, &weight) in taps.iter().zip(&weights) {
+                    let src = &tap[at..at + LANES];
+                    for i in 0..LANES {
+                        acc[i] += src[i] * weight;
+                    }
+                }
+                for (o, &a) in row[at..at + LANES].iter_mut().zip(&acc) {
+                    *o = finish(a);
+                }
+                at += LANES;
+            }
+            for i in at..row_len {
+                let mut acc = 0f32;
+                for (tap, &weight) in taps.iter().zip(&weights) {
+                    acc += tap[i] * weight;
+                }
+                row[i] = finish(acc);
+            }
         },
     );
     out
@@ -495,6 +490,33 @@ mod tests {
                 reference(&data, w, h, sigma),
                 "{w}x{h} sigma {sigma}"
             );
+        }
+    }
+
+    #[test]
+    fn conv3x3_matches_integer_division() {
+        for (w, h, mask, divisor) in [
+            (9usize, 7usize, [1; 9], 9),
+            (33, 5, [-1, -1, -1, -1, 32, -1, -1, -1, -1], 24),
+            (1, 4, [1; 9], 9),
+            (6, 1, [-1, -1, -1, -1, 32, -1, -1, -1, -1], 24),
+        ] {
+            let data = noise(w * h * 4);
+            let out = conv3x3(&data, w, h, mask, divisor);
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..4 {
+                        let mut sum = 0i32;
+                        for k in 0..9 {
+                            let sx = (x + k % 3).saturating_sub(1).min(w - 1);
+                            let sy = (y + k / 3).saturating_sub(1).min(h - 1);
+                            sum += mask[k] * data[(sy * w + sx) * 4 + c] as i32;
+                        }
+                        let expected = sum.div_euclid(divisor).clamp(0, 255) as u8;
+                        assert_eq!(out[(y * w + x) * 4 + c], expected, "{w}x{h} ({x},{y},{c})");
+                    }
+                }
+            }
         }
     }
 
