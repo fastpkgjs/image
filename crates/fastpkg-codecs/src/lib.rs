@@ -721,6 +721,45 @@ fn png_idat_end(bytes: &[u8]) -> Option<usize> {
     end
 }
 
+/// Whether the zlib stream spread over the IDAT run ends properly (final block, checksum): the
+/// decoder stops after the last row and never notices a stream that was cut short.
+fn png_zlib_complete(bytes: &[u8]) -> bool {
+    let mut inflate = flate2::Decompress::new(true);
+    let mut sink = vec![0u8; 1 << 16];
+    let mut pos = 8usize;
+    let mut seen = false;
+    while pos + 12 <= bytes.len() {
+        let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+            as usize;
+        let is_idat = &bytes[pos + 4..pos + 8] == b"IDAT";
+        if seen && !is_idat {
+            break;
+        }
+        if is_idat {
+            seen = true;
+            let end = pos.saturating_add(8).saturating_add(len).min(bytes.len());
+            let mut input = &bytes[pos + 8..end];
+            loop {
+                let (before_in, before_out) = (inflate.total_in(), inflate.total_out());
+                match inflate.decompress(input, &mut sink, flate2::FlushDecompress::None) {
+                    Ok(flate2::Status::StreamEnd) => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+                input = &input[(inflate.total_in() - before_in) as usize..];
+                if inflate.total_in() == before_in && inflate.total_out() == before_out {
+                    break;
+                }
+            }
+        }
+        match pos.checked_add(12).and_then(|p| p.checked_add(len)) {
+            Some(next) => pos = next,
+            None => break,
+        }
+    }
+    false
+}
+
 /// libpng stops once the last row is read, so a missing or damaged tail (IEND, trailing chunks)
 /// is not an error: a failed decode is retried with the data cut after the IDAT run and a
 /// synthetic IEND appended.
@@ -762,6 +801,10 @@ fn decode_png_once(bytes: &[u8], fail_on: &str) -> Result<Image> {
     let (out_width, out_height) = reader.info().size();
     let out_line = reader.output_line_size(out_width).unwrap_or(0);
     let interlaced = reader.info().interlaced;
+    // Interlaced files are read whole by libvips, so there a short stream is fatal at any level.
+    if (!lenient || interlaced) && !png_zlib_complete(bytes) {
+        return Err(FastpkgError::Decode("PNG: truncated zlib stream".into()));
+    }
     let info = match reader.next_frame(&mut buffer) {
         Ok(info) => info,
         Err(error) if lenient && !interlaced => {
