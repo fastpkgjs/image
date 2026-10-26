@@ -962,9 +962,18 @@ fn decode_png_buffered(bytes: &[u8], lenient: bool) -> Result<Image> {
     let buffer_size = reader
         .output_buffer_size()
         .ok_or_else(|| FastpkgError::Decode("PNG output buffer is too large".into()))?;
-    let mut buffer = vec![0; buffer_size];
     let (out_color, out_depth) = reader.output_color_type();
     let (out_width, out_height) = reader.info().size();
+    // 8-bit samples are expanded to RGBA inside this same buffer, so size it for that up front.
+    let rgba_size = if out_depth == png::BitDepth::Sixteen {
+        0
+    } else {
+        (out_width as usize)
+            .checked_mul(out_height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| FastpkgError::Decode("PNG output buffer is too large".into()))?
+    };
+    let mut buffer = vec![0; buffer_size.max(rgba_size)];
     let out_line = reader.output_line_size(out_width).unwrap_or(0);
     let interlaced = reader.info().interlaced;
     let info = match reader.next_frame(&mut buffer) {
@@ -1061,49 +1070,44 @@ fn decode_png_buffered(bytes: &[u8], lenient: bool) -> Result<Image> {
     }
     let row_bytes = info.line_size;
     let (width_px, height_px) = (width as usize, height as usize);
-    let rgba = match color_type {
-        // Already tightly packed RGBA: reuse the decode buffer instead of copying it.
-        png::ColorType::Rgba if row_bytes == width_px * 4 => {
-            buffer.truncate(pixels * 4);
-            buffer
-        }
-        _ => {
-            let mut rgba = vec![255u8; pixels * 4];
-            if width_px > 0 {
-                for (dst_row, src_row) in rgba
-                    .chunks_exact_mut(width_px * 4)
-                    .zip(raw.chunks_exact(row_bytes))
-                    .take(height_px)
-                {
-                    match color_type {
-                        png::ColorType::Grayscale => {
-                            for (dst, &v) in dst_row.chunks_exact_mut(4).zip(src_row) {
-                                dst[..3].fill(v);
-                            }
-                        }
-                        png::ColorType::GrayscaleAlpha => {
-                            for (dst, src) in
-                                dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(2))
-                            {
-                                dst[..3].fill(src[0]);
-                                dst[3] = src[1];
-                            }
-                        }
-                        png::ColorType::Rgb => {
-                            for (dst, src) in
-                                dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(3))
-                            {
-                                dst[..3].copy_from_slice(src);
-                            }
-                        }
-                        png::ColorType::Rgba => dst_row.copy_from_slice(&src_row[..width_px * 4]),
-                        _ => return Err(FastpkgError::Decode("unsupported PNG layout".into())),
-                    }
-                }
-            }
-            rgba
-        }
+    // The buffer was sized for RGBA, so the samples expand in place, last row and pixel first:
+    // a pixel's destination never lies before its source, and only pixels already read are
+    // overwritten.
+    let channels = match color_type {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        _ => return Err(FastpkgError::Decode("unsupported PNG layout".into())),
     };
+    if width_px > 0 && (channels < 4 || row_bytes != width_px * 4) {
+        for y in (0..height_px).rev() {
+            for x in (0..width_px).rev() {
+                let src = y * row_bytes + x * channels;
+                let dst = (y * width_px + x) * 4;
+                let px = match color_type {
+                    png::ColorType::Grayscale => {
+                        let v = buffer[src];
+                        [v, v, v, 255]
+                    }
+                    png::ColorType::GrayscaleAlpha => {
+                        let v = buffer[src];
+                        [v, v, v, buffer[src + 1]]
+                    }
+                    png::ColorType::Rgb => [buffer[src], buffer[src + 1], buffer[src + 2], 255],
+                    _ => [
+                        buffer[src],
+                        buffer[src + 1],
+                        buffer[src + 2],
+                        buffer[src + 3],
+                    ],
+                };
+                buffer[dst..dst + 4].copy_from_slice(&px);
+            }
+        }
+    }
+    buffer.truncate(pixels * 4);
+    let rgba = buffer;
     let mut image = Image::from_rgba(width, height, rgba)?;
     image.has_alpha = matches!(
         color_type,
