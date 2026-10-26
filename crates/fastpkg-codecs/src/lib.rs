@@ -360,7 +360,9 @@ fn decode_with_hint_inner(
 /// ICC profiles only.
 fn source_is_gray(bytes: &[u8], format: Format) -> bool {
     match format {
-        Format::Png => bytes.get(25).is_some_and(|color_type| matches!(color_type, 0 | 4)),
+        Format::Png => bytes
+            .get(25)
+            .is_some_and(|color_type| matches!(color_type, 0 | 4)),
         Format::Jpeg => jpeg_sof(bytes).is_some_and(|sof| sof.2 == 1),
         _ => false,
     }

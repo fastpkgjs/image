@@ -43,7 +43,8 @@ fn srgb_eotf(e: f64) -> f64 {
 }
 
 fn inverse3(m: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let c = |r0: usize, c0: usize, r1: usize, c1: usize| m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0];
+    let c =
+        |r0: usize, c0: usize, r1: usize, c1: usize| m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0];
     let det = m[0][0] * c(1, 1, 2, 2) - m[0][1] * c(1, 0, 2, 2) + m[0][2] * c(1, 0, 2, 1);
     let k = 1.0 / det;
     [
@@ -64,7 +65,11 @@ fn inverse3(m: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
 /// moxcms uses for it. Matrix/TRC sources have a black point of zero and need none of this.
 fn target_with_bpc(source: &ColorProfile, black: [u16; 4]) -> Option<ColorProfile> {
     let mut target = ColorProfile::new_srgb();
-    let cols = [target.red_colorant, target.green_colorant, target.blue_colorant];
+    let cols = [
+        target.red_colorant,
+        target.green_colorant,
+        target.blue_colorant,
+    ];
     let m = [
         [cols[0].x, cols[1].x, cols[2].x],
         [cols[0].y, cols[1].y, cols[2].y],
@@ -88,7 +93,10 @@ fn target_with_bpc(source: &ColorProfile, black: [u16; 4]) -> Option<ColorProfil
             .ok()?;
         let mut out = [0u16; 4];
         exec.transform(&black, &mut out).ok()?;
-        let lin: Vec<f64> = out[..3].iter().map(|&v| srgb_eotf(v as f64 / 65535.0)).collect();
+        let lin: Vec<f64> = out[..3]
+            .iter()
+            .map(|&v| srgb_eotf(v as f64 / 65535.0))
+            .collect();
         let xyz = |row: usize| m[row][0] * lin[0] + m[row][1] * lin[1] + m[row][2] * lin[2];
         [xyz(0), xyz(1), xyz(2)]
     };
