@@ -511,9 +511,17 @@ fn decode_avif(bytes: &[u8]) -> Result<Image> {
             (data, w as u32, h as u32, false)
         }
     };
-    // libheif refuses a picture whose size differs from every `ispe` box.
+    // libheif refuses a picture whose size differs from every `ispe` box (a rotation swaps the
+    // sides; cropped and tiled images are left alone).
     let sizes = header::avif_ispe_sizes(bytes);
-    if !sizes.is_empty() && !sizes.contains(&(width, height)) {
+    let transformed = [&b"clap"[..], b"grid"]
+        .iter()
+        .any(|tag| bytes.windows(4).any(|window| window == *tag));
+    if !transformed
+        && !sizes.is_empty()
+        && !sizes.contains(&(width, height))
+        && !sizes.contains(&(height, width))
+    {
         return Err(FastpkgError::Decode(
             "heif: decoded image size does not match ispe".into(),
         ));
