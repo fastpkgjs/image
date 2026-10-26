@@ -182,7 +182,7 @@ Implemented sharp-compatible methods:
 - Extras: `toStream`, `responsive`, `dominant`, `joinChannel`
 - Colour extensions: `replaceColor`, `recolor`, `duotone`, `gradientMap`, `gradientRecolor`, `gradientFill`, `applyLut`, `curves`, `levels`, `whiteBalance`, `colourBalance`, `posterize`, `solarize`, `fill`, `paletteSwap`, `alphaFromLuma`
 
-Known gaps are documented in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). Remaining major gaps: animation, JXL output without the optional native feature, CMYK/Lab colour spaces, 16-bit point/filter operations, gain maps, raw depths above 16-bit, and true incremental decode for every codec.
+Known gaps are documented in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). Remaining major gaps: animation, JXL output without the optional native feature, Lab colour spaces and CMYK output (CMYK JPEG input is converted to sRGB), 16-bit point/filter operations, gain maps, raw depths above 16-bit, and true incremental decode for every codec.
 
 ## Colour, gradients, and LUTs
 

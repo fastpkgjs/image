@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Colour management (sharp parity)
+
+- Embedded ICC profiles are converted to sRGB while decoding, like sharp (perceptual intent, alpha untouched, pixels left alone for corrupt, unsupported or wrong-model profiles and for profiles equivalent to sRGB). `ignoreIcc: true` keeps the stored values, as do `keepIccProfile()` / `keepMetadata()` (the profile describes the pixels); `withMetadata()` converts and embeds sRGB, as in sharp. Untagged images only pay a header-level profile lookup.
+- 16-bit RGB sources are converted to Display P3 (sharp's processing profile), through a 33-point tetrahedral lookup table as in lcms, so colours near the edge of the destination gamut match sharp (the exact transform differed by up to 17 levels there).
+- CMYK/YCCK JPEGs decode to sRGB: Adobe-inverted values are un-inverted, an embedded CMYK profile is used when present and libvips' built-in CMYK profile otherwise; `metadata()` reports `space: 'cmyk'`, `channels: 4` and `chromaSubsampling: '4:4:4:4'` like sharp.
+- Known differences: JPEG DCT-scale and non-integer resize factors differ slightly from libvips with or without a profile (see the resize tolerance in `tests/differential.test.mjs`); profiles of other colour models (Lab, ...) and 16-bit grey data are passed through unconverted, as in libvips.
+
 ## 0.3.0
 
 Output-size, speed and parity release. **PNG and WebP output bytes change** (see below); PNG bytes remain deterministic and independent of thread count, and are pinned by `tests/png-stability.test.mjs`. They are not libvips-identical.

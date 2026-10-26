@@ -16,7 +16,7 @@ Status: **Supported**, **Partial**, **Unsupported**.
 | `sequentialRead` | Partial | Parsed; file input is mmap-based |
 | `density`, `pages`, `page`, `animated` | Partial | Parsed; animation frame selection is not implemented |
 | `autoOrient` input option | Supported | |
-| `ignoreIcc` | Partial | Parsed; no colour transform is applied |
+| `ignoreIcc` | Supported | Embedded ICC profiles (RGB, grey, CMYK JPEG) are converted to sRGB at decode unless ignored, like sharp |
 
 ## Output
 
@@ -65,7 +65,7 @@ Operations run in sharp's fixed pipeline order, not call order (`packages/image/
 
 ## Colour and channel
 
-`toColourspace` supports `srgb`, `rgb`, `rgb16`/`rgba16`, `grey16`/`gray16`, and true one-channel `b-w`/`grey`. `pipelineColourspace` supports `srgb`, `rgb`, `linear`, `scrgb`, and `b-w`. CMYK/Lab/XYZ are still unsupported.
+`toColourspace` supports `srgb`, `rgb`, `rgb16`/`rgba16`, `grey16`/`gray16`, and true one-channel `b-w`/`grey`. `pipelineColourspace` supports `srgb`, `rgb`, `linear`, `scrgb`, and `b-w`. Lab/XYZ are still unsupported, and CMYK is input-only (CMYK JPEGs are converted to sRGB).
 
 16-bit PNG decode/encode and raw `ushort` input/output preserve wide RGBA samples. Geometry operations (`resize`, `extract`, `extend`, `rotate`, `affine`, `flip`, `flop`, `autoOrient`) keep the wide buffer; point and filter operations currently run on the 8-bit representation and discard it.
 
