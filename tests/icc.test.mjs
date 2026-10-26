@@ -60,13 +60,39 @@ for (const kind of ['jpeg', 'png', 'webp']) {
 }
 
 test('conversion happens before resize (same result as sharp)', async () => {
-  const tagged = embedIcc(await encoded('jpeg'), profiles['display-p3 (sRGB curve)']);
+  // sharp converts straight after loading, then resizes. With a PNG source nothing else
+  // differs, so the order shows: resizing the engine's own converted pixels gives the very
+  // same bytes, and the result stays near sharp's.
+  const png = embedIcc(await encoded('png'), profiles['display-p3 (sRGB curve)']);
+  const converted = await engine(png).raw().toBuffer({ resolveWithObject: true });
   for (const width of [80, 41]) {
-    const [s, e] = await Promise.all([
-      pixels(sharp, tagged, (x) => x.resize(width)),
-      pixels(engine, tagged, (x) => x.resize(width)),
+    const [s, e, once, sharpOfConverted] = await Promise.all([
+      pixels(sharp, png, (x) => x.resize(width)),
+      pixels(engine, png, (x) => x.resize(width)),
+      pixels(engine, converted.data, (x) => x.resize(width), { raw: converted.info }),
+      pixels(sharp, converted.data, (x) => x.resize(width), { raw: converted.info }),
     ]);
-    assertClose(e.data, s.data, { mad: 1.5, max: 14 }, `resize ${width}`);
+    sameBytes(e.data, once.data, `resize ${width}: converted first`);
+    // The resizer itself differs a little from libvips' for non-integer factors; the profile
+    // must not add to that.
+    const baseline = diffStats(once.data, sharpOfConverted.data);
+    assertClose(e.data, s.data, { mad: baseline.mad + 0.2, max: baseline.max + 4 }, `png resize ${width}`);
+    if (width === 80) assertClose(e.data, s.data, { mad: 0.3, max: 4 }, 'png resize 80');
+  }
+  // JPEG sources are decoded with DCT scaling by both; the choice of factor differs slightly,
+  // so the baseline is the same comparison without a profile.
+  const jpeg = await encoded('jpeg');
+  const jpegTagged = embedIcc(jpeg, profiles['display-p3 (sRGB curve)']);
+  for (const width of [80, 41]) {
+    const [s, e, sp, ep] = await Promise.all([
+      pixels(sharp, jpegTagged, (x) => x.resize(width)),
+      pixels(engine, jpegTagged, (x) => x.resize(width)),
+      pixels(sharp, jpeg, (x) => x.resize(width)),
+      pixels(engine, jpeg, (x) => x.resize(width)),
+    ]);
+    const baseline = diffStats(ep.data, sp.data);
+    const d = diffStats(e.data, s.data);
+    assert.ok(d.mad <= baseline.mad + 0.5, `jpeg resize ${width}: mad ${d.mad.toFixed(3)} vs ${baseline.mad.toFixed(3)} without profile`);
   }
 });
 
@@ -76,15 +102,15 @@ test('conversion combined with other operations and output formats', async () =>
     ['rotate 90 + flip', (x) => x.rotate(90).flip()],
     ['extract', (x) => x.extract({ left: 10, top: 8, width: 90, height: 50 })],
     ['greyscale', (x) => x.greyscale()],
-    ['png roundtrip', (x) => sharp(null) && x],
   ]) {
-    if (name === 'png roundtrip') continue;
     const [s, e] = await Promise.all([pixels(sharp, tagged, build), pixels(engine, tagged, build)]);
     assertClose(e.data, s.data, { mad: 1, max: 5 }, name);
   }
-  for (const format of ['png', 'jpeg', 'webp']) {
-    const out = await engine(tagged)[format]({ lossless: format === 'webp', quality: 100 }).toBuffer();
-    const ref = await sharp(tagged)[format]({ lossless: format === 'webp', quality: 100 }).toBuffer();
+  // Lossless or near-lossless settings per format. (Any png quality/effort option switches on
+  // palette output, whose quantisers differ between libraries; not what is tested here.)
+  for (const [format, options] of [['png', {}], ['jpeg', { quality: 100 }], ['webp', { lossless: true }]]) {
+    const out = await engine(tagged)[format](options).toBuffer();
+    const ref = await sharp(tagged)[format](options).toBuffer();
     const [a, b] = await Promise.all([pixels(sharp, out), pixels(sharp, ref)]);
     assertClose(a.data, b.data, { mad: 1.2, max: 8 }, `${format} output`);
     assert.equal((await sharp(out).metadata()).hasProfile, false, `${format}: converted output carries no profile`);
@@ -251,13 +277,24 @@ test('CMYK JPEG: resize, embedded CMYK profile, ignoreIcc, keepIccProfile', asyn
   const [plain, withProfile] = await Promise.all([pixels(sharp, jpeg), pixels(engine, tagged)]);
   assertClose(withProfile.data, plain.data, { mad: 1, max: 12 }, 'embedded profile');
   for (const [name, build, options] of [
-    ['resize', (x) => x.resize(60), undefined],
     ['ignoreIcc', (x) => x, { ignoreIcc: true }],
     ['keepIccProfile', (x) => x.keepIccProfile(), undefined],
   ]) {
     const [s, e] = await Promise.all([pixels(sharp, tagged, build, options), pixels(engine, tagged, build, options)]);
-    assertClose(e.data, s.data, { mad: name === 'resize' ? 1.5 : 1, max: 16 }, name);
+    assertClose(e.data, s.data, { mad: 1, max: 16 }, name);
   }
+  // Resize: the resampler (and its choice of DCT scale) differs a little from libvips' even
+  // without any colour management, so the same resize of a plain RGB JPEG is the baseline.
+  const rgbJpeg = await sharp(rgbRaw, sharpRaw(3)).jpeg({ quality: 100 }).toBuffer();
+  const [rs, re, bs, be] = await Promise.all([
+    pixels(sharp, tagged, (x) => x.resize(60)),
+    pixels(engine, tagged, (x) => x.resize(60)),
+    pixels(sharp, rgbJpeg, (x) => x.resize(60)),
+    pixels(engine, rgbJpeg, (x) => x.resize(60)),
+  ]);
+  const resized = diffStats(re.data, rs.data);
+  const baseline = diffStats(be.data, bs.data);
+  assert.ok(resized.mad <= baseline.mad + 0.6, `cmyk resize: mad ${resized.mad.toFixed(3)} vs ${baseline.mad.toFixed(3)} for rgb`);
   const out = await engine(tagged).keepIccProfile().jpeg().toBuffer();
   assert.equal((await sharp(out).metadata()).hasProfile, true);
 });

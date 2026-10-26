@@ -63,7 +63,14 @@ pub fn jpeg_details(bytes: &[u8]) -> JpegDetails {
                     (4, 2) => Some("4:1:0"),
                     _ => None,
                 }
-                .map(str::to_string);
+                .map(|name| {
+                    // libvips names a fourth (CMYK/YCCK) component too.
+                    if data[5] == 4 {
+                        format!("{name}:4")
+                    } else {
+                        name.to_string()
+                    }
+                });
             }
         }
         offset += 2 + length;
