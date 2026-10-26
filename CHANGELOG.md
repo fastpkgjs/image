@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Memory
+
+- PNG decoding is now sequential. Non-interlaced files are read row by row straight into the RGBA result (no intermediate full-frame buffer next to it, which held two copies of RGB and 16-bit images), and when a resize comes first and downscales by 4x or more the rows are box-averaged while they arrive (premultiplied for images with alpha, any colour type and bit depth), so only the shrunk image is resident. The factor leaves the Lanczos resize 2x headroom over the target (like libvips' integer pre-shrink, so PNG downscales of 4x and more are also closer to sharp's output than before: for example a 2400 px photo to 100 px is off by 0.3 instead of 2.0 levels on average); `fastShrinkOnLoad` does not apply to PNG. A 16384x16384 (256 MP), 800 KB flat PNG resized to 800 px: peak RSS about 1.85 GB to about 70 MB (sharp about 300 MB), about 2.2 s to about 0.8 s (sharp about 1.0 s). Interlaced PNGs still decode the whole frame. `failOn` and `limitInputPixels` behave as before; `bench/mem.mjs` has the 256 MP case (`huge-png-800-png`, `huge-png-800-jpeg`).
+
 ## 0.3.0
 
 Output-size, speed and parity release. **PNG and WebP output bytes change** (see below); PNG bytes remain deterministic and independent of thread count, and are pinned by `tests/png-stability.test.mjs`. They are not libvips-identical.
