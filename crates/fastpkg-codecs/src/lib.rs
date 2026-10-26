@@ -825,14 +825,10 @@ impl BoxShrink {
             let n = columns * self.rows;
             if self.has_alpha {
                 let alpha = sum[3];
-                if alpha == 0 {
-                    px.fill(T::default());
-                } else {
-                    for k in 0..3 {
-                        px[k] = T::from_u64((sum[k] + alpha / 2) / alpha);
-                    }
-                    px[3] = T::from_u64((alpha + n / 2) / n);
+                for k in 0..3 {
+                    px[k] = T::from_u64((sum[k] + alpha / 2).checked_div(alpha).unwrap_or(0));
                 }
+                px[3] = T::from_u64((alpha + n / 2) / n);
             } else {
                 for k in 0..3 {
                     px[k] = T::from_u64((sum[k] + n / 2) / n);
