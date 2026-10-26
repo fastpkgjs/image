@@ -322,12 +322,7 @@ fn decode_with_hint_inner(
             }
             decode_webp(bytes, input, hint, fast_shrink)?
         }
-        Format::Gif if input.fail_on == "none" => decode_gif_lenient(bytes)?,
-        Format::Gif if header::gif_truncated(bytes) => {
-            return Err(FastpkgError::Decode(
-                "gifload: unexpected end of GIF source data".into(),
-            ))
-        }
+        Format::Gif => decode_gif(bytes, &input.fail_on)?,
         Format::Raw => {
             return Err(FastpkgError::InvalidOptions(
                 "raw input requires raw width/height/channels".into(),
@@ -509,39 +504,52 @@ fn decode_avif(bytes: &[u8]) -> Result<Image> {
     Ok(image)
 }
 
-/// `failOn: 'none'` GIF decoding: a damaged file yields what could be recovered. The data is cut
-/// after the last complete sub-block and closed properly; if the frame still cannot be read an
-/// empty transparent canvas is returned, unless no frame data survived at all (libvips: "no
-/// frames in GIF").
-fn decode_gif_lenient(bytes: &[u8]) -> Result<Image> {
+/// GIF decoding as libvips judges it. A file cut inside a block is an error unless `failOn` is
+/// `none`, which returns what survived; a frame whose LZW data is short decodes to a blank
+/// canvas at any level, while an invalid code is fatal at any level.
+fn decode_gif(bytes: &[u8], fail_on: &str) -> Result<Image> {
+    let lenient = fail_on == "none";
+    if !lenient && header::gif_truncated(bytes) {
+        return Err(FastpkgError::Decode(
+            "gifload: unexpected end of GIF source data".into(),
+        ));
+    }
+    let bytes = header::gif_with_canvas(bytes);
     let decode = |data: &[u8]| -> Result<Image> {
         let dynamic = image::load_from_memory_with_format(data, image::ImageFormat::Gif)
             .map_err(|e| FastpkgError::Decode(format!("image/gif: {e}")))?;
         dynamic_to_image(dynamic, Format::Gif)
     };
-    if let Ok(image) = decode(bytes) {
-        return Ok(image);
+    let invalid = |error: &FastpkgError| error.to_string().contains("invalid code");
+    let mut result = decode(&bytes);
+    if let Err(error) = &result {
+        if invalid(error) || !(lenient || error.to_string().contains("truncated")) {
+            return result;
+        }
+        if lenient && bytes.len() >= 13 {
+            result = decode(&header::gif_repair(&bytes));
+            if result.as_ref().is_err_and(invalid) {
+                return result;
+            }
+        }
     }
-    if bytes.len() >= 13 {
-        let repaired = header::gif_repair(bytes);
-        if let Ok(image) = decode(&repaired) {
-            return Ok(image);
-        }
-        let (width, height) = (
-            u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
-            u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
-        );
-        if width > 0 && height > 0 && header::gif_has_frame_data(bytes) {
-            validate_dimensions(width, height, &Limits::default())?;
-            let mut image = Image::from_rgba(
-                width,
-                height,
-                vec![0u8; width as usize * height as usize * 4],
-            )?;
-            image.has_alpha = true;
-            image.format = Format::Gif;
-            return Ok(image);
-        }
+    if result.is_ok() {
+        return result;
+    }
+    let (width, height) = (
+        u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
+        u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
+    );
+    if bytes.len() >= 13 && width > 0 && height > 0 && header::gif_has_frame_data(&bytes) {
+        validate_dimensions(width, height, &Limits::default())?;
+        let mut image = Image::from_rgba(
+            width,
+            height,
+            vec![0u8; width as usize * height as usize * 4],
+        )?;
+        image.has_alpha = true;
+        image.format = Format::Gif;
+        return Ok(image);
     }
     Err(FastpkgError::Decode("image/gif: unreadable data".into()))
 }

@@ -1,5 +1,7 @@
 //! Header-only readers used by `probe`/`metadata()`: none of them decode pixel data.
 
+use std::borrow::Cow;
+
 /// Pixels per inch from a JFIF APP0 segment (units 1 = dpi, 2 = dots per cm, 0 = aspect only).
 fn jfif_density(data: &[u8]) -> Option<u32> {
     if data.len() < 12 || !data.starts_with(b"JFIF\0") {
@@ -263,6 +265,78 @@ pub fn avif_has_alpha(bytes: &[u8]) -> bool {
         .any(|urn| head.windows(urn.len()).any(|window| window == *urn))
 }
 
+/// Canvas size libvips (nsgif) works on: the logical screen grown to the extent of every frame;
+/// a screen that is empty or larger than 2048 either way is ignored in favour of the frames.
+fn gif_canvas(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 13 {
+        return None;
+    }
+    let screen = (
+        u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
+        u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
+    );
+    let mut at = 13usize;
+    if bytes[10] & 0x80 != 0 {
+        at += 3 * (1usize << ((bytes[10] & 7) + 1));
+    }
+    let skip_sub_blocks = |mut p: usize| -> usize {
+        while p < bytes.len() {
+            let size = bytes[p] as usize;
+            p += 1 + size;
+            if size == 0 {
+                break;
+            }
+        }
+        p
+    };
+    let (mut right, mut bottom) = (0u32, 0u32);
+    while at < bytes.len() {
+        match bytes[at] {
+            0x21 => at = skip_sub_blocks(at + 2),
+            0x2c if at + 10 <= bytes.len() => {
+                let field =
+                    |i: usize| u16::from_le_bytes([bytes[at + i], bytes[at + i + 1]]) as u32;
+                right = right.max(field(1) + field(5));
+                bottom = bottom.max(field(3) + field(7));
+                let mut p = at + 10;
+                if bytes[at + 9] & 0x80 != 0 {
+                    p += 3 * (1usize << ((bytes[at + 9] & 7) + 1));
+                }
+                at = skip_sub_blocks(p + 1);
+            }
+            _ => break,
+        }
+    }
+    let valid = screen.0 > 0 && screen.1 > 0 && screen.0 <= 2048 && screen.1 <= 2048;
+    Some(if valid {
+        (screen.0.max(right), screen.1.max(bottom))
+    } else {
+        (right, bottom)
+    })
+}
+
+/// The file with its logical screen rewritten to the canvas libvips would use, so the decoder
+/// composites onto the same size.
+pub fn gif_with_canvas(bytes: &[u8]) -> Cow<'_, [u8]> {
+    match gif_canvas(bytes) {
+        Some((width, height))
+            if (1..=u16::MAX as u32).contains(&width)
+                && (1..=u16::MAX as u32).contains(&height)
+                && (width, height)
+                    != (
+                        u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
+                        u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
+                    ) =>
+        {
+            let mut patched = bytes.to_vec();
+            patched[6..8].copy_from_slice(&(width as u16).to_le_bytes());
+            patched[8..10].copy_from_slice(&(height as u16).to_le_bytes());
+            Cow::Owned(patched)
+        }
+        _ => Cow::Borrowed(bytes),
+    }
+}
+
 /// Whether the file ends inside a block (a cut header, colour table, descriptor or an
 /// unterminated sub-block chain). A file that merely lacks its trailer is not truncated.
 pub fn gif_truncated(bytes: &[u8]) -> bool {
@@ -342,7 +416,7 @@ pub fn gif_has_frame_data(bytes: &[u8]) -> bool {
                 }
                 return bytes
                     .get(p + 1)
-                    .is_some_and(|&size| size > 0 && p + 2 + size as usize <= bytes.len());
+                    .is_some_and(|&size| size > 0 && bytes.len() > p + 2);
             }
             _ => return false,
         }
@@ -398,8 +472,13 @@ pub fn gif_repair(bytes: &[u8]) -> Vec<u8> {
                     at = end;
                     keep = at;
                 } else {
-                    // Keep the complete sub-blocks of this frame and close the chain.
+                    // Keep the complete sub-blocks of this frame, shorten the cut one to what
+                    // is there (an invalid code in it must still be noticed) and close the chain.
                     let mut out = bytes[..end].to_vec();
+                    if end + 1 < bytes.len() {
+                        out.push((bytes.len() - end - 1) as u8);
+                        out.extend_from_slice(&bytes[end + 1..]);
+                    }
                     out.push(0);
                     out.push(0x3b);
                     return out;
