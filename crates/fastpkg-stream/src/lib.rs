@@ -144,7 +144,16 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
         }
         _ => (None, false),
     };
-    let mut image = decode_with_hint(bytes, header.format, &spec.input, hint, fast_shrink)?;
+    // sharp keeps the pixels as stored when the input profile is to be kept (the profile
+    // describes them); otherwise an embedded profile is converted to sRGB while decoding.
+    let keeps_input_icc = (spec.output.keep_metadata
+        || spec.output.keep_icc
+        || spec.output.with_metadata.is_some())
+        && spec.output.with_icc.is_none()
+        && spec.output.with_icc_raw.is_none();
+    let mut input = spec.input.clone();
+    input.ignore_icc |= keeps_input_icc;
+    let mut image = decode_with_hint(bytes, header.format, &input, hint, fast_shrink)?;
     check_deadline(deadline)?;
 
     let keep_metadata = spec.output.keep_metadata
