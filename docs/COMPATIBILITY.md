@@ -11,7 +11,7 @@ Status: **Supported**, **Partial**, **Unsupported**.
 | `metadata()` | Supported | Header-only |
 | `stats()` | Supported | Full decode |
 | `probe()` | Extension | Header-only fast path |
-| `failOn` | Partial | Parsed; decoder-specific truncation policy is not fully wired |
+| `failOn` | Supported | Validated like sharp and honoured by the JPEG, PNG, WebP, GIF and AVIF decoders; checked against sharp on a corrupt-file corpus (`tests/failon.test.mjs`). Known differences: damaged AV1 payloads in AVIF and some damaged lossless WebP streams |
 | `limitInputPixels`, `unlimited` | Supported | Checked before decode |
 | `sequentialRead` | Partial | Parsed; file input is mmap-based |
 | `density`, `pages`, `page`, `animated` | Partial | Parsed; animation frame selection is not implemented |

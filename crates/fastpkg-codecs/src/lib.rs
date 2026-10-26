@@ -544,7 +544,7 @@ fn decode_gif(bytes: &[u8], fail_on: &str) -> Result<Image> {
     };
     let mut result = recovered(decode(&bytes), &bytes);
     if let Err(error) = &result {
-        if invalid(error) || !(lenient || error.to_string().contains("truncated")) {
+        if !lenient && (invalid(error) || !error.to_string().contains("truncated")) {
             return result;
         }
         if lenient && bytes.len() >= 13 {
@@ -647,7 +647,13 @@ unsafe extern "C-unwind" fn jpeg_collect_warning(
     if level >= 0 {
         return; // trace messages
     }
-    let truncated = jpeg_message(cinfo).is_some_and(|text| text.contains("Premature end"));
+    let text = jpeg_message(cinfo).unwrap_or_default();
+    let truncated = text.contains("Premature end");
+    // libvips fails a progressive file whose scan script is inconsistent, whatever `failOn` says.
+    if text.contains("progression") {
+        JPEG_FATAL.with(|fatal| *fatal.borrow_mut() = Some(text));
+        return;
+    }
     JPEG_WARNINGS.with(|counts| {
         let (a, b) = counts.get();
         counts.set(if truncated { (a + 1, b) } else { (a, b + 1) });
@@ -754,6 +760,9 @@ fn decode_jpeg_mozjpeg(
             _ => Ok(None),
         };
     };
+    if let Some(text) = JPEG_FATAL.with(|fatal| fatal.borrow_mut().take()) {
+        return Err(FastpkgError::Decode(format!("VipsJpeg: {text}")));
+    }
     let (truncated, other) = JPEG_WARNINGS.with(|counts| counts.get());
     if fail_on != "none" && (truncated > 0 || (other > 0 && fail_on == "warning")) {
         return Err(FastpkgError::Decode(if truncated > 0 {
