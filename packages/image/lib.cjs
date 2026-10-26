@@ -2708,7 +2708,7 @@ function image(input, options) {
   // sharp(undefined) is an error while sharp() creates a write-fed stream instance.
   if (arguments.length === 1 && !is.defined(input)) throw new Error('Invalid input');
   // `sharp({ failOn: 'none' })`: options only, the input is written to the instance.
-  if (options === undefined && is.plainObject(input) && !input.create && !input.text) {
+  if (options === undefined && is.plainObject(input) && !isStream(input) && Object.keys(input).length && !input.create && !input.text) {
     options = input;
     input = undefined;
   }
