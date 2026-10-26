@@ -181,8 +181,11 @@ test('stream shrink: failOn semantics on truncated and corrupt files', async () 
   const a = await raw4(engine(bad, { failOn: 'none' }).resize({ width: 40 }));
   const b = await raw4(sharp(bad, { failOn: 'none' }).resize({ width: 40 }));
   assert.deepEqual([a.info.width, a.info.height], [b.info.width, b.info.height]);
-  // The decoded top part is close to sharp's; the missing rows are transparent in both.
-  assert.ok(meanAbs(a.data, b.data) <= 4, 'lenient partial decode');
+  // The decoded top part is close to sharp's (libpng stops a few rows earlier than the png crate
+  // near the cut, so only the rows well before it are comparable); the rest is transparent.
+  const head = 12 * 40 * 4;
+  assert.ok(meanAbs(a.data.subarray(0, head), b.data.subarray(0, head)) <= 4, 'lenient partial decode');
+  assert.equal(a.data[a.data.length - 1], 0);
   // An opaque colour type: missing rows are opaque black.
   const rgb = encode({ width: W, height: H, type: 2, depth: 8, sample: scaled(8), truncate: 0.5 });
   const c = await raw4(engine(rgb, { failOn: 'none' }).resize({ width: 40 }));
@@ -207,16 +210,21 @@ test('stream shrink: ICC, EXIF-less metadata survive a shrinking resize', async 
   assert.equal(meta.width, 40);
 });
 
-test('peak memory of a large flat PNG resize stays far below the decoded size', () => {
+// maxRSS of a forked child starts from the parent's peak (which holds the raw test image here);
+// VmHWM is reset by exec.
+test('peak memory of a large flat PNG resize stays far below the decoded size', { skip: process.platform !== 'linux' }, () => {
   const size = 8192; // 192 MB as RGB, 256 MB as RGBA
   const png = encode({ width: size, height: size, type: 2, depth: 8, filter: 2, sample: (x, y, c) => [(y >> 6) & 255, (x >> 6) & 255, 128][c] });
   const script = `
+    import fs from 'node:fs';
     import engine from ${JSON.stringify(new URL('../packages/image/index.js', import.meta.url).href)};
-    const png = Buffer.from(process.argv[1], 'base64');
+    const chunks = [];
+    for await (const part of process.stdin) chunks.push(part);
+    const png = Buffer.concat(chunks);
     const out = await engine(png, { limitInputPixels: false }).resize(400).jpeg().toBuffer();
-    console.log(JSON.stringify({ length: out.length, rss: process.resourceUsage().maxRSS / 1024 }));
+    console.log(JSON.stringify({ length: out.length, rss: Number(/VmHWM:\\s+(\\d+)/.exec(fs.readFileSync('/proc/self/status', 'utf8'))[1]) / 1024 }));
   `;
-  const run = spawnSync(process.execPath, ['--input-type=module', '-e', script, png.toString('base64')], { encoding: 'utf8', maxBuffer: 1 << 26 });
+  const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], { input: png, encoding: 'utf8', maxBuffer: 1 << 26 });
   assert.equal(run.status, 0, run.stderr);
   const { length, rss } = JSON.parse(run.stdout);
   assert.ok(length > 100);
