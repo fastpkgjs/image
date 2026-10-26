@@ -121,17 +121,24 @@ pub fn probe(bytes: &[u8], input: &InputOptions) -> Result<HeaderInfo> {
 }
 
 fn probe_generic(bytes: &[u8], format: Format) -> Result<HeaderInfo> {
-    let size = imagesize::blob_size(bytes).map_err(|e| FastpkgError::Decode(e.to_string()))?;
+    // libjpeg skips junk between marker segments; the size reader gives up on it.
+    let (width, height) = match imagesize::blob_size(bytes) {
+        Ok(size) => (size.width as u32, size.height as u32),
+        Err(error) => match jpeg_sof(bytes) {
+            Some((w, h, ..)) if format == Format::Jpeg => (w, h),
+            _ => return Err(FastpkgError::Decode(error.to_string())),
+        },
+    };
     let mut header = HeaderInfo {
         format,
-        width: size.width as u32,
-        height: size.height as u32,
+        width,
+        height,
         channels: 3,
         has_alpha: format.supports_alpha(),
         depth: "uchar".into(),
         space: "srgb".into(),
         pages: 1,
-        page_height: size.height as u32,
+        page_height: height,
         ..Default::default()
     };
     match format {
@@ -202,6 +209,11 @@ fn probe_generic(bytes: &[u8], format: Format) -> Result<HeaderInfo> {
         }
         Format::Gif => {
             let details = header::gif_details(bytes);
+            if let Some((width, height)) = header::gif_canvas(bytes) {
+                header.width = width;
+                header.height = height;
+                header.page_height = height;
+            }
             header.has_alpha = details.transparent;
             header.channels = if details.transparent { 4 } else { 3 };
             header.is_palette = true;
@@ -522,13 +534,22 @@ fn decode_gif(bytes: &[u8], fail_on: &str) -> Result<Image> {
         dynamic_to_image(dynamic, Format::Gif)
     };
     let invalid = |error: &FastpkgError| error.to_string().contains("invalid code");
-    let mut result = decode(&bytes);
+    // libvips stops reading a frame once its last pixel is in, so a bad code after that point
+    // does not matter; the frame is re-encoded from the pixels that were good.
+    let recovered = |result: Result<Image>, data: &[u8]| match &result {
+        Err(error) if invalid(error) => gif_reencode_first_frame(data)
+            .map(|fixed| decode(&fixed))
+            .unwrap_or(result),
+        _ => result,
+    };
+    let mut result = recovered(decode(&bytes), &bytes);
     if let Err(error) = &result {
         if invalid(error) || !(lenient || error.to_string().contains("truncated")) {
             return result;
         }
         if lenient && bytes.len() >= 13 {
-            result = decode(&header::gif_repair(&bytes));
+            let repaired = header::gif_repair(&bytes);
+            result = recovered(decode(&repaired), &repaired);
             if result.as_ref().is_err_and(invalid) {
                 return result;
             }
@@ -553,6 +574,53 @@ fn decode_gif(bytes: &[u8], fail_on: &str) -> Result<Image> {
         return Ok(image);
     }
     Err(FastpkgError::Decode("image/gif: unreadable data".into()))
+}
+
+/// The file reduced to its first frame with the LZW data re-encoded from the pixels that
+/// decoded cleanly, provided those cover the whole frame.
+fn gif_reencode_first_frame(bytes: &[u8]) -> Option<Vec<u8>> {
+    let (start, width, height) = header::gif_first_frame(bytes)?;
+    let code_size = *bytes.get(start)?;
+    if !(2..=8).contains(&code_size) {
+        return None;
+    }
+    let mut data = Vec::new();
+    let mut at = start + 1;
+    while let Some(&size) = bytes.get(at) {
+        if size == 0 {
+            break;
+        }
+        data.extend_from_slice(bytes.get(at + 1..(at + 1 + size as usize).min(bytes.len()))?);
+        at += 1 + size as usize;
+    }
+    let need = width as usize * height as usize;
+    if need == 0 || need > Limits::default().max_pixels as usize {
+        return None;
+    }
+    let mut decoder = weezl::decode::Decoder::new(weezl::BitOrder::Lsb, code_size);
+    let mut pixels = vec![0u8; need];
+    let (mut input, mut filled) = (&data[..], 0usize);
+    while filled < need {
+        let step = decoder.decode_bytes(input, &mut pixels[filled..]);
+        input = &input[step.consumed_in..];
+        filled += step.consumed_out;
+        if step.status.is_err() || (step.consumed_in == 0 && step.consumed_out == 0) {
+            break;
+        }
+    }
+    if filled < need {
+        return None;
+    }
+    let packed = weezl::encode::Encoder::new(weezl::BitOrder::Lsb, code_size)
+        .encode(&pixels)
+        .ok()?;
+    let mut out = bytes[..start + 1].to_vec();
+    for block in packed.chunks(255) {
+        out.push(block.len() as u8);
+        out.extend_from_slice(block);
+    }
+    out.extend_from_slice(&[0, 0x3b]);
+    Some(out)
 }
 
 // Warnings libjpeg raised while decoding on this thread: (truncation, anything else), and the
@@ -708,21 +776,26 @@ fn png_decoder<'a>(bytes: &'a [u8], fail_on: &str) -> png::Decoder<Cursor<&'a [u
     decoder
 }
 
-/// libpng refuses a chunk whose type is not four ASCII letters while it reads the header
-/// chunks, whatever `failOn` says.
-fn png_header_chunk_names_valid(bytes: &[u8]) -> bool {
+/// libpng refuses a chunk whose type is not four ASCII letters or whose length exceeds 2^31 - 1
+/// while it reads the header chunks and the IDAT run, whatever `failOn` says.
+fn png_chunk_headers_valid(bytes: &[u8]) -> bool {
     let mut pos = 8usize;
+    let mut seen_idat = false;
     while pos + 12 <= bytes.len() {
         let kind = &bytes[pos + 4..pos + 8];
-        if !kind.iter().all(u8::is_ascii_alphabetic) {
+        let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]);
+        if !kind.iter().all(u8::is_ascii_alphabetic) || len > 0x7fff_ffff {
             return false;
         }
         if kind == b"IDAT" {
+            seen_idat = true;
+        } else if seen_idat {
             break;
         }
-        let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
-            as usize;
-        match pos.checked_add(12).and_then(|p| p.checked_add(len)) {
+        match pos
+            .checked_add(12)
+            .and_then(|p| p.checked_add(len as usize))
+        {
             Some(next) => pos = next,
             None => break,
         }
@@ -785,7 +858,8 @@ fn png_raster_size(info: &png::Info) -> u64 {
 
 /// Whether the zlib stream spread over the IDAT run ends properly (final block, checksum): the
 /// decoder stops after the last row and never notices a stream that was cut short. A stream
-/// that outgrows the raster may carry a wrong checksum: libpng quits reading before it gets there.
+/// that breaks only after it outgrew the raster is let through: libpng has stopped inflating
+/// by then and treats the error as benign.
 fn png_zlib_complete(bytes: &[u8], raster: u64) -> bool {
     let mut inflate = flate2::Decompress::new(true);
     let mut sink = vec![0u8; 1 << 16];
@@ -807,10 +881,7 @@ fn png_zlib_complete(bytes: &[u8], raster: u64) -> bool {
                 match inflate.decompress(input, &mut sink, flate2::FlushDecompress::None) {
                     Ok(flate2::Status::StreamEnd) => return true,
                     Ok(_) => {}
-                    Err(error) => {
-                        return inflate.total_out() > raster
-                            && error.message() == Some("incorrect data check");
-                    }
+                    Err(_) => return inflate.total_out() > raster,
                 }
                 input = &input[(inflate.total_in() - before_in) as usize..];
                 if inflate.total_in() == before_in && inflate.total_out() == before_out {
@@ -851,8 +922,8 @@ fn decode_png(bytes: &[u8], fail_on: &str) -> Result<Image> {
 /// rest stays zero, as in libvips. Interlaced files are all-or-nothing.
 fn decode_png_once(bytes: &[u8], fail_on: &str) -> Result<Image> {
     let lenient = fail_on == "none";
-    if !png_header_chunk_names_valid(bytes) {
-        return Err(FastpkgError::Decode("PNG: invalid chunk type".into()));
+    if !png_chunk_headers_valid(bytes) {
+        return Err(FastpkgError::Decode("PNG: invalid chunk header".into()));
     }
     let decoder = png_decoder(bytes, fail_on);
     let mut reader = decoder

@@ -232,8 +232,8 @@ pub fn scaled_size(source: (u32, u32), min: (u32, u32)) -> Option<(u32, u32)> {
 
 /// Decodes a still WebP (lossy, lossless, with or without alpha) through libwebp, with its
 /// default fancy upsampling (what libvips / sharp use). `scale_to` asks for libwebp's built-in
-/// scaled decode. `Ok(None)` means libwebp cannot or will not decode the file (animation,
-/// damaged data); the caller falls back to another decoder, which also decides the error.
+/// scaled decode. `Ok(None)` means libwebp will not decode the file (animation, unsupported
+/// canvas); the caller falls back to another decoder. Damaged data is an error, as in libvips.
 /// `max_pixels` is checked against the header before anything is allocated.
 pub fn decode(
     bytes: &[u8],
@@ -314,8 +314,15 @@ fn decode_inner(
         size: rgba.len(),
     };
     let status = unsafe { w::WebPDecode(bytes.as_ptr(), bytes.len(), &mut config) };
-    if status != w::VP8StatusCode::VP8_STATUS_OK {
-        return Ok(None);
+    match status {
+        w::VP8StatusCode::VP8_STATUS_OK => {}
+        // The scaled decode was refused; the caller decodes at full size instead.
+        w::VP8StatusCode::VP8_STATUS_INVALID_PARAM => return Ok(None),
+        _ => {
+            return Err(FastpkgError::Decode(
+                "webp2vips: unable to read pixels".into(),
+            ))
+        }
     }
     Ok(Some(Decoded {
         rgba,

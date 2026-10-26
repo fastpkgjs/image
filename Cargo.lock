@@ -494,6 +494,7 @@ dependencies = [
  "rayon",
  "resvg",
  "serde_json",
+ "weezl",
  "zlib-rs",
 ]
 

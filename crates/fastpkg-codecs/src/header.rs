@@ -298,7 +298,7 @@ pub fn avif_trim_trailing(bytes: &[u8]) -> &[u8] {
 
 /// Canvas size libvips (nsgif) works on: the logical screen grown to the extent of every frame;
 /// a screen that is empty or larger than 2048 either way is ignored in favour of the frames.
-fn gif_canvas(bytes: &[u8]) -> Option<(u32, u32)> {
+pub fn gif_canvas(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < 13 {
         return None;
     }
@@ -366,6 +366,39 @@ pub fn gif_with_canvas(bytes: &[u8]) -> Cow<'_, [u8]> {
         }
         _ => Cow::Borrowed(bytes),
     }
+}
+
+/// Offset of the first frame's LZW minimum code size byte and the frame's dimensions.
+pub fn gif_first_frame(bytes: &[u8]) -> Option<(usize, u32, u32)> {
+    if bytes.len() < 13 {
+        return None;
+    }
+    let mut at = 13usize;
+    if bytes[10] & 0x80 != 0 {
+        at += 3 * (1usize << ((bytes[10] & 7) + 1));
+    }
+    while at < bytes.len() {
+        match bytes[at] {
+            0x21 => {
+                at += 2;
+                while *bytes.get(at)? != 0 {
+                    at += bytes[at] as usize + 1;
+                }
+                at += 1;
+            }
+            0x2c if at + 10 < bytes.len() => {
+                let field =
+                    |i: usize| u16::from_le_bytes([bytes[at + i], bytes[at + i + 1]]) as u32;
+                let mut p = at + 10;
+                if bytes[at + 9] & 0x80 != 0 {
+                    p += 3 * (1usize << ((bytes[at + 9] & 7) + 1));
+                }
+                return (p < bytes.len()).then(|| (p, field(5), field(7)));
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Whether the file ends inside a block (a cut header, colour table, descriptor or an
