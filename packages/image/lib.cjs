@@ -2720,7 +2720,8 @@ image.cache = function cache() {
 
 image.concurrency = function concurrency(value) {
   if (value === undefined) return native.getConcurrency();
-  return native.setConcurrency(value);
+  // sharp: 0 (or any non-positive value) resets to the default, the number of available cores.
+  return native.setConcurrency(Number(value) > 0 ? value : undefined);
 };
 
 image.counters = function counters() {
