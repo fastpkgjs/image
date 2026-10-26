@@ -858,8 +858,8 @@ fn png_raster_size(info: &png::Info) -> u64 {
 
 /// Whether the zlib stream spread over the IDAT run ends properly (final block, checksum): the
 /// decoder stops after the last row and never notices a stream that was cut short. A stream
-/// that breaks only after it outgrew the raster is let through: libpng has stopped inflating
-/// by then and treats the error as benign.
+/// that breaks once the raster is complete is let through: libpng has stopped inflating by then
+/// and treats the error as benign (a bad checksum right at the end is not).
 fn png_zlib_complete(bytes: &[u8], raster: u64) -> bool {
     let mut inflate = flate2::Decompress::new(true);
     let mut sink = vec![0u8; 1 << 16];
@@ -881,7 +881,11 @@ fn png_zlib_complete(bytes: &[u8], raster: u64) -> bool {
                 match inflate.decompress(input, &mut sink, flate2::FlushDecompress::None) {
                     Ok(flate2::Status::StreamEnd) => return true,
                     Ok(_) => {}
-                    Err(_) => return inflate.total_out() > raster,
+                    Err(error) => {
+                        let total = inflate.total_out();
+                        let checksum = error.message() == Some("incorrect data check");
+                        return total > raster || (total == raster && !checksum);
+                    }
                 }
                 input = &input[(inflate.total_in() - before_in) as usize..];
                 if inflate.total_in() == before_in && inflate.total_out() == before_out {

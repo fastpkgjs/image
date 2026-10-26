@@ -194,7 +194,7 @@ pub struct GifDetails {
 
 pub fn gif_details(bytes: &[u8]) -> GifDetails {
     let mut details = GifDetails::default();
-    if bytes.len() < 13 || !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+    if bytes.len() < 13 || !bytes.starts_with(b"GIF8") {
         return details;
     }
     let skip_sub_blocks = |mut at: usize| -> usize {
@@ -346,26 +346,30 @@ pub fn gif_canvas(bytes: &[u8]) -> Option<(u32, u32)> {
     })
 }
 
-/// The file with its logical screen rewritten to the canvas libvips would use, so the decoder
-/// composites onto the same size.
+/// The file with its signature and logical screen rewritten to what libvips would use (any
+/// "GIF8" file, the canvas of `gif_canvas`), so the decoder composites onto the same size.
 pub fn gif_with_canvas(bytes: &[u8]) -> Cow<'_, [u8]> {
-    match gif_canvas(bytes) {
-        Some((width, height))
-            if (1..=u16::MAX as u32).contains(&width)
-                && (1..=u16::MAX as u32).contains(&height)
-                && (width, height)
-                    != (
-                        u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
-                        u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
-                    ) =>
-        {
-            let mut patched = bytes.to_vec();
-            patched[6..8].copy_from_slice(&(width as u16).to_le_bytes());
-            patched[8..10].copy_from_slice(&(height as u16).to_le_bytes());
-            Cow::Owned(patched)
-        }
-        _ => Cow::Borrowed(bytes),
+    if bytes.len() < 13 {
+        return Cow::Borrowed(bytes);
     }
+    let screen = (
+        u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
+        u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
+    );
+    let canvas = gif_canvas(bytes)
+        .filter(|&(w, h)| (1..=u16::MAX as u32).contains(&w) && (1..=u16::MAX as u32).contains(&h))
+        .unwrap_or(screen);
+    let signature = bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a");
+    if signature && canvas == screen {
+        return Cow::Borrowed(bytes);
+    }
+    let mut patched = bytes.to_vec();
+    if !signature {
+        patched[..6].copy_from_slice(b"GIF89a");
+    }
+    patched[6..8].copy_from_slice(&(canvas.0 as u16).to_le_bytes());
+    patched[8..10].copy_from_slice(&(canvas.1 as u16).to_le_bytes());
+    Cow::Owned(patched)
 }
 
 /// Offset of the first frame's LZW minimum code size byte and the frame's dimensions.
@@ -536,13 +540,9 @@ pub fn gif_repair(bytes: &[u8]) -> Vec<u8> {
                     at = end;
                     keep = at;
                 } else {
-                    // Keep the complete sub-blocks of this frame, shorten the cut one to what
-                    // is there (an invalid code in it must still be noticed) and close the chain.
+                    // Keep the complete sub-blocks of this frame and close the chain: libvips
+                    // only decodes whole sub-blocks, so a bad code in the cut one goes unseen.
                     let mut out = bytes[..end].to_vec();
-                    if end + 1 < bytes.len() {
-                        out.push((bytes.len() - end - 1) as u8);
-                        out.extend_from_slice(&bytes[end + 1..]);
-                    }
                     out.push(0);
                     out.push(0x3b);
                     return out;
