@@ -213,6 +213,83 @@ pub fn convert_embedded(image: &mut Image, profile: &[u8], source_gray: bool) ->
     true
 }
 
+/// Grid points per axis of lcms' resampled 16-bit RGB to RGB transform.
+const GRID: usize = 33;
+
+/// lcms' fixed-point domain helper (`_cmsToFixedDomain`): 0xffff maps to exactly 1.0.
+fn to_fixed(a: i32) -> i32 {
+    a + (a + 0x7fff) / 0xffff
+}
+
+/// A 33-point-per-axis lookup table of a 16-bit RGB to RGB transform, applied with lcms'
+/// tetrahedral interpolation.
+///
+/// lcms only has its exact matrix/shaper fast path for 8-bit data. For 16-bit pixels (what
+/// libvips feeds it for 16-bit images) it samples the whole transform on a 33^3 grid and
+/// interpolates, which is what sharp's output contains: colours near the boundary of the
+/// destination gamut are smoothed instead of clipped, a difference of up to several 8-bit
+/// levels against the exact transform. Reproducing the grid reproduces those values.
+struct Clut16 {
+    table: Vec<u16>,
+}
+
+impl Clut16 {
+    fn build(exec: &(dyn TransformExecutor<u16> + Send + Sync)) -> Option<Clut16> {
+        let step = |i: usize| ((i as f64 * 65535.0) / (GRID - 1) as f64).round() as u16;
+        let mut nodes = Vec::with_capacity(GRID * GRID * GRID * 4);
+        for r in 0..GRID {
+            for g in 0..GRID {
+                for b in 0..GRID {
+                    nodes.extend_from_slice(&[step(r), step(g), step(b), 65535]);
+                }
+            }
+        }
+        let mut out = vec![0u16; nodes.len()];
+        exec.transform(&nodes, &mut out).ok()?;
+        let table = out
+            .chunks_exact(4)
+            .flat_map(|px| [px[0], px[1], px[2]])
+            .collect();
+        Some(Clut16 { table })
+    }
+
+    /// RGB (16-bit) through the grid; the output has the same alpha as the input.
+    fn apply(&self, src: &[u16], dst: &mut [u16]) {
+        const S: [usize; 3] = [GRID * GRID * 3, GRID * 3, 3];
+        let table = &self.table;
+        for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+            let mut base = 0usize;
+            let mut rest = [0i32; 3];
+            let mut next = [0usize; 3];
+            for c in 0..3 {
+                let fixed = to_fixed(s[c] as i32 * (GRID as i32 - 1));
+                base += S[c] * (fixed >> 16) as usize;
+                rest[c] = fixed & 0xffff;
+                next[c] = if s[c] == 0xffff { 0 } else { S[c] };
+            }
+            // Corner offsets in the order the tetrahedron visits them.
+            let mut axes = [0usize, 1, 2];
+            axes.sort_by(|&a, &b| rest[b].cmp(&rest[a]));
+            for ch in 0..3 {
+                let at = |o: usize| table[base + o + ch] as i32;
+                let mut offset = 0usize;
+                let mut previous = at(0);
+                let c0 = previous;
+                let mut acc = 0i32;
+                for &axis in &axes {
+                    offset += next[axis];
+                    let value = at(offset);
+                    acc += (value - previous) * rest[axis];
+                    previous = value;
+                }
+                let v = c0 + ((acc + acc / 0xffff + 0x8000) >> 16);
+                d[ch] = v.clamp(0, 65535) as u16;
+            }
+            d[3] = s[3];
+        }
+    }
+}
+
 fn convert_wide(image: &mut Image, source: &ColorProfile, target: &ColorProfile) -> bool {
     let Ok(exec) = source.create_transform_16bit(Layout::Rgba, target, Layout::Rgba, options())
     else {
@@ -232,9 +309,16 @@ fn convert_wide(image: &mut Image, source: &ColorProfile, target: &ColorProfile)
     {
         return false;
     }
-    let mut out = vec![0u16; wide.len()];
-    if !run(exec.as_ref(), wide, 4, &mut out, 4) {
+    let Some(clut) = Clut16::build(exec.as_ref()) else {
         return false;
+    };
+    let mut out = vec![0u16; wide.len()];
+    if wide.len() / 4 >= PAR_MIN_PIXELS && rayon::current_num_threads() > 1 {
+        wide.par_chunks(CHUNK_PIXELS * 4)
+            .zip(out.par_chunks_mut(CHUNK_PIXELS * 4))
+            .for_each(|(s, d)| clut.apply(s, d));
+    } else {
+        clut.apply(wide, &mut out);
     }
     let (width, height) = (image.width, image.height);
     image.set_wide_rgba(width, height, out).is_ok()
