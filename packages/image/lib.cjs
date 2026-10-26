@@ -2287,6 +2287,8 @@ class Sharp extends Duplex {
     }
     // sharp: withMetadata() keeps all metadata (and optionally overrides orientation/density/...).
     this._spec.output.keepMetadata = true;
+    // ... and, like sharp, converts to sRGB and embeds that profile unless `icc` says otherwise.
+    this.withIccProfile('srgb');
     const meta = { ...options };
     if (is.number(meta.density)) meta.density = Math.round(meta.density);
     // A named or file profile is resolved here (built-in 'srgb' / 'p3' are generated).

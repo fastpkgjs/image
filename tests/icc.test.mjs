@@ -29,6 +29,10 @@ const pixels = async (lib, input, build = (s) => s, options) => {
   return { data, info };
 };
 
+// Large buffers go through Buffer.compare: a failing assert.deepEqual builds a diff of every
+// byte and can take gigabytes.
+const sameBytes = (a, b, label = 'pixels') => assert.ok(Buffer.compare(a, b) === 0, `${label} differ`);
+
 const assertClose = (a, b, { mad, max }, label) => {
   const d = diffStats(a, b);
   assert.ok(d.mad <= mad && d.max <= max, `${label}: mad ${d.mad.toFixed(3)} (limit ${mad}), max ${d.max} (limit ${max})`);
@@ -46,7 +50,8 @@ for (const kind of ['jpeg', 'png', 'webp']) {
       const plain = await encoded(kind);
       const tagged = embedIcc(plain, profile, { width: W, height: H });
       const [s, e, untagged] = await Promise.all([pixels(sharp, tagged), pixels(engine, tagged), pixels(engine, plain)]);
-      assert.deepEqual({ ...e.info }, { ...s.info });
+      // The engine also reports `space`, which sharp leaves out of raw output info.
+      assert.deepEqual({ ...e.info, space: undefined }, { ...s.info, space: undefined });
       // Regression: the colours really moved (the old behaviour left them untouched).
       assert.ok(diffStats(untagged.data, s.data).mad > 3, 'fixture must change colour when converted');
       assertClose(e.data, s.data, { mad: 0.9, max: 4 }, 'pixels');
@@ -92,7 +97,7 @@ test('alpha is kept and only the colour is converted', async () => {
   const [s, e] = await Promise.all([pixels(sharp, tagged), pixels(engine, tagged)]);
   assert.equal(e.info.channels, 4);
   const alpha = (buf) => Buffer.from(buf.filter((_, i) => i % 4 === 3));
-  assert.deepEqual(alpha(e.data), alpha(s.data));
+  sameBytes(Buffer.from(alpha(e.data)), Buffer.from(alpha(s.data)), "alpha");
   assertClose(e.data, s.data, { mad: 0.9, max: 4 }, 'rgba');
 });
 
@@ -101,11 +106,15 @@ test('keepIccProfile / withMetadata keep the pixels as stored and the profile', 
   const plain = await encoded('jpeg');
   const tagged = embedIcc(plain, profile);
   const stored = await pixels(engine, plain);
-  for (const build of [(x) => x.keepIccProfile(), (x) => x.withMetadata(), (x) => x.keepMetadata()]) {
+  for (const build of [(x) => x.keepIccProfile(), (x) => x.keepMetadata()]) {
     const [s, e] = await Promise.all([pixels(sharp, tagged, build), pixels(engine, tagged, build)]);
-    assert.deepEqual(e.data, stored.data, 'engine leaves the stored values');
-    assert.deepEqual(s.data, stored.data, 'sharp does too');
+    sameBytes(e.data, stored.data, 'engine leaves the stored values');
+    sameBytes(s.data, stored.data, 'sharp does too');
   }
+  // withMetadata() is keepMetadata() plus withIccProfile('srgb'): converted, with sRGB embedded.
+  const [sw, ew] = await Promise.all([pixels(sharp, tagged, (x) => x.withMetadata()), pixels(engine, tagged, (x) => x.withMetadata())]);
+  assertClose(ew.data, sw.data, { mad: 0.9, max: 4 }, 'withMetadata pixels');
+  assert.ok(diffStats(stored.data, ew.data).mad > 3, 'withMetadata converts');
   const out = await engine(tagged).keepIccProfile().jpeg().toBuffer();
   const meta = await sharp(out).metadata();
   assert.equal(meta.hasProfile, true);
@@ -122,8 +131,8 @@ test('ignoreIcc leaves the stored values', async () => {
     pixels(engine, tagged, (x) => x, { ignoreIcc: true }),
     pixels(engine, plain),
   ]);
-  assert.deepEqual(e.data, stored.data);
-  assert.deepEqual(s.data, stored.data);
+  sameBytes(e.data, stored.data);
+  sameBytes(s.data, stored.data);
 });
 
 test('sRGB-equivalent profiles are left alone', async () => {
@@ -151,8 +160,8 @@ test('corrupt, truncated and mismatched profiles pass the pixels through', async
     ['grey profile on an RGB image', makeGrayProfile(2.2)],
   ]) {
     const [s, e] = await Promise.all([pixels(sharp, embedIcc(plain, profile)), pixels(engine, embedIcc(plain, profile))]);
-    assert.deepEqual(e.data, stored.data, `${name}: engine`);
-    assert.deepEqual(s.data, stored.data, `${name}: sharp`);
+    sameBytes(e.data, stored.data, `${name}: engine`);
+    sameBytes(s.data, stored.data, `${name}: sharp`);
   }
 });
 
@@ -167,7 +176,7 @@ test('grey images: grey profiles convert, RGB profiles are ignored', async () =>
     if (gamma !== 2.2) assert.ok(diffStats(stored.data, e.data).mad > 5);
   }
   const e = await pixels(engine, embedIcc(grey, profiles['display-p3 (sRGB curve)']));
-  assert.deepEqual(e.data, stored.data);
+  sameBytes(e.data, stored.data);
   const greyPng = await sharp(pattern(W, H, 1), sharpRaw(1)).toColourspace('b-w').png().toBuffer();
   const taggedPng = embedIcc(greyPng, makeGrayProfile(1.8));
   const [sp, ep] = await Promise.all([pixels(sharp, taggedPng), pixels(engine, taggedPng)]);
@@ -224,7 +233,8 @@ test('CMYK JPEG (Adobe, inverted) converts to sRGB like sharp', async () => {
   const jpeg = await cmykJpeg();
   const [s, e] = await Promise.all([pixels(sharp, jpeg), pixels(engine, jpeg)]);
   assert.equal(e.info.channels, 3);
-  assert.deepEqual({ ...e.info }, { ...s.info });
+  // The engine also reports `space`, which sharp leaves out of raw output info.
+      assert.deepEqual({ ...e.info, space: undefined }, { ...s.info, space: undefined });
   // Not the old behaviour: inverted or naively converted values are far off.
   assertClose(e.data, s.data, { mad: 1, max: 12 }, 'cmyk');
   // Round trip through CMYK stays near the original colours (inversion is right).
