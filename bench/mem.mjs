@@ -33,6 +33,9 @@ const SCENARIOS = {
   'atlas-webp': { file: 'rgba-1024.png', overlay: 'sprite-256.png', parallel: 1 },
   'big-jpeg-1200': { file: 'photo-4000.jpg', parallel: 1 },
   'big-jpeg-1200-x8': { file: 'photo-4000.jpg', parallel: 8 },
+  // 16384x16384 PNG (bench/gen-huge-png.mjs): few iterations, one sample each, peak RSS matters.
+  'huge-png-800-png': { file: 'huge-256mp.png', parallel: 1, iters: 6, every: 1 },
+  'huge-png-800-jpeg': { file: 'huge-256mp.png', parallel: 1, iters: 6, every: 1 },
 };
 
 function run(engine, input, name, overlay) {
@@ -46,6 +49,10 @@ function run(engine, input, name, overlay) {
       return sharpLike(input).composite([{ input: overlay, left: 100, top: 100 }]).png().toBuffer();
     case 'atlas-webp':
       return sharpLike(input).composite([{ input: overlay, left: 100, top: 100 }]).webp({ quality: 80 }).toBuffer();
+    case 'huge-png-800-png':
+      return sharpLike(input, { limitInputPixels: false }).resize({ width: 800 }).png().toBuffer();
+    case 'huge-png-800-jpeg':
+      return sharpLike(input, { limitInputPixels: false }).resize({ width: 800 }).jpeg({ quality: 80 }).toBuffer();
     case 'big-jpeg-1200':
     case 'big-jpeg-1200-x8':
       return sharpLike(input).resize({ width: 1200 }).jpeg({ quality: 85 }).toBuffer();
@@ -55,7 +62,8 @@ function run(engine, input, name, overlay) {
 }
 
 async function child() {
-  const [engineName, scenario, conc, iters] = [opt('engine'), opt('scenario'), opt('conc'), Number(opt('iters', '1500'))];
+  const [engineName, scenario, conc] = [opt('engine'), opt('scenario'), opt('conc')];
+  const iters = SCENARIOS[scenario].iters ?? Number(opt('iters', '1500'));
   const engine = engineName === 'sharp' ? (await import('sharp')).default : (await import(process.env.FASTPKG_PKG ? path.resolve(process.env.FASTPKG_PKG, 'index.js') : '../packages/image/index.js')).default;
   if (engineName === 'sharp') {
     // Matches production use: sharp's default cache is kept.
@@ -77,7 +85,7 @@ async function child() {
     if (spec.parallel === 1) await run(engine, input, scenario, overlay);
     else await Promise.all(Array.from({ length: spec.parallel }, () => run(engine, input, scenario, overlay)));
     if (i >= warm) times.push((performance.now() - t0) / spec.parallel);
-    if (i >= warm && (i / spec.parallel) % 25 === 0) samples.push(process.memoryUsage().rss);
+    if (i >= warm && (i / spec.parallel) % (spec.every ?? 25) === 0) samples.push(process.memoryUsage().rss);
   }
   const ms = (performance.now() - start) / (iters - warm);
   const cpu = process.cpuUsage(cpu0);
@@ -89,12 +97,17 @@ async function child() {
     sysMs: cpu.system / 1000 / (iters - warm),
     median: samples[samples.length >> 1] / 1048576,
     max: samples[samples.length - 1] / 1048576,
+    peak: process.resourceUsage().maxRSS / 1024,
     msPerImage: ms,
   }));
 }
 
 async function prepare() {
   fs.mkdirSync(cache, { recursive: true });
+  const huge = path.join(cache, 'huge-256mp.png');
+  if (!fs.existsSync(huge) && (opt('scenarios', 'huge') + '').includes('huge')) {
+    spawnSync(process.execPath, [path.join(here, 'gen-huge-png.mjs'), huge], { stdio: 'inherit' });
+  }
   if (fs.existsSync(path.join(cache, 'sprite-256.png'))) return;
   const sharp = (await import('sharp')).default;
   const noise = (w, h, c, seed) => {
@@ -143,7 +156,7 @@ async function main() {
         row[engine] = JSON.parse(r.stdout.trim().split('\n').pop());
       }
       rows.push(row);
-      const fmt = (e) => (row[e] ? (row[e].error ? `ERR ${row[e].error}` : `${row[e].median.toFixed(0)} MB (max ${row[e].max.toFixed(0)}) ${row[e].medianMs.toFixed(1)} ms/img (mean ${row[e].msPerImage.toFixed(1)}, cpu ${row[e].cpuMs.toFixed(1)}, sys ${row[e].sysMs.toFixed(1)})`) : '-');
+      const fmt = (e) => (row[e] ? (row[e].error ? `ERR ${row[e].error}` : `${row[e].median.toFixed(0)} MB (max ${row[e].max.toFixed(0)}, peak ${row[e].peak.toFixed(0)}) ${row[e].medianMs.toFixed(1)} ms/img (mean ${row[e].msPerImage.toFixed(1)}, cpu ${row[e].cpuMs.toFixed(1)}, sys ${row[e].sysMs.toFixed(1)})`) : '-');
       console.log(`${scenario.padEnd(18)} conc=${conc.padEnd(7)} ${engines.map((e) => `${e}: ${fmt(e)}`).join(' | ')}`);
     }
   }
