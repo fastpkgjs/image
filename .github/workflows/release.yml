@@ -110,13 +110,13 @@ jobs:
           set -uo pipefail
           version="${RELEASE_VERSION#v}"
           # Every platform package must exist on the registry before the main package goes out.
-          # A fresh publish can take a while to show up in `npm view`, so retry.
+          # A fresh publish can take many minutes to show up in `npm view`: retry for up to 20 minutes.
           for directory in dist/npm/image-*; do
             name="$(node -p "require('./$directory/package.json').name")"
             ok=0
-            for attempt in $(seq 1 30); do
+            for attempt in $(seq 1 120); do
               if npm view "$name@$version" version >/dev/null 2>&1; then ok=1; break; fi
-              echo "waiting for $name@$version to appear on the registry ($attempt/30)"
+              echo "waiting for $name@$version to appear on the registry ($attempt/120)"
               sleep 10
             done
             if [ "$ok" != 1 ]; then
