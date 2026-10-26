@@ -699,6 +699,28 @@ fn png_decoder<'a>(bytes: &'a [u8], fail_on: &str) -> png::Decoder<Cursor<&'a [u
     decoder
 }
 
+/// libpng refuses a chunk whose type is not four ASCII letters while it reads the header
+/// chunks, whatever `failOn` says.
+fn png_header_chunk_names_valid(bytes: &[u8]) -> bool {
+    let mut pos = 8usize;
+    while pos + 12 <= bytes.len() {
+        let kind = &bytes[pos + 4..pos + 8];
+        if !kind.iter().all(u8::is_ascii_alphabetic) {
+            return false;
+        }
+        if kind == b"IDAT" {
+            break;
+        }
+        let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+            as usize;
+        match pos.checked_add(12).and_then(|p| p.checked_add(len)) {
+            Some(next) => pos = next,
+            None => break,
+        }
+    }
+    true
+}
+
 /// End offset of the last complete IDAT chunk when the data before it parses as a chunk list.
 fn png_idat_end(bytes: &[u8]) -> Option<usize> {
     let mut pos = 8;
@@ -721,9 +743,41 @@ fn png_idat_end(bytes: &[u8]) -> Option<usize> {
     end
 }
 
+/// Size of the filtered raster (filter bytes included) a PNG header describes.
+fn png_raster_size(info: &png::Info) -> u64 {
+    let bits = u64::from(info.bit_depth as u8) * info.color_type.samples() as u64;
+    let pass = |width: u64, height: u64| match (width, height) {
+        (0, _) | (_, 0) => 0,
+        _ => height * (1 + (width * bits).div_ceil(8)),
+    };
+    let (width, height) = (u64::from(info.width), u64::from(info.height));
+    if !info.interlaced {
+        return pass(width, height);
+    }
+    const PASSES: [(u64, u64, u64, u64); 7] = [
+        (0, 0, 8, 8),
+        (4, 0, 8, 8),
+        (0, 4, 4, 8),
+        (2, 0, 4, 4),
+        (0, 2, 2, 4),
+        (1, 0, 2, 2),
+        (0, 1, 1, 2),
+    ];
+    PASSES
+        .iter()
+        .map(|&(x0, y0, dx, dy)| {
+            pass(
+                width.saturating_sub(x0).div_ceil(dx),
+                height.saturating_sub(y0).div_ceil(dy),
+            )
+        })
+        .sum()
+}
+
 /// Whether the zlib stream spread over the IDAT run ends properly (final block, checksum): the
-/// decoder stops after the last row and never notices a stream that was cut short.
-fn png_zlib_complete(bytes: &[u8]) -> bool {
+/// decoder stops after the last row and never notices a stream that was cut short. A stream
+/// that outgrows the raster is left alone: libpng quits reading before it reaches the checksum.
+fn png_zlib_complete(bytes: &[u8], raster: u64) -> bool {
     let mut inflate = flate2::Decompress::new(true);
     let mut sink = vec![0u8; 1 << 16];
     let mut pos = 8usize;
@@ -743,8 +797,9 @@ fn png_zlib_complete(bytes: &[u8]) -> bool {
                 let (before_in, before_out) = (inflate.total_in(), inflate.total_out());
                 match inflate.decompress(input, &mut sink, flate2::FlushDecompress::None) {
                     Ok(flate2::Status::StreamEnd) => return true,
+                    Ok(_) if inflate.total_out() > raster => return true,
                     Ok(_) => {}
-                    Err(_) => return false,
+                    Err(_) => return inflate.total_out() > raster,
                 }
                 input = &input[(inflate.total_in() - before_in) as usize..];
                 if inflate.total_in() == before_in && inflate.total_out() == before_out {
@@ -785,6 +840,9 @@ fn decode_png(bytes: &[u8], fail_on: &str) -> Result<Image> {
 /// rest stays zero, as in libvips. Interlaced files are all-or-nothing.
 fn decode_png_once(bytes: &[u8], fail_on: &str) -> Result<Image> {
     let lenient = fail_on == "none";
+    if !png_header_chunk_names_valid(bytes) {
+        return Err(FastpkgError::Decode("PNG: invalid chunk type".into()));
+    }
     let decoder = png_decoder(bytes, fail_on);
     let mut reader = decoder
         .read_info()
@@ -802,7 +860,7 @@ fn decode_png_once(bytes: &[u8], fail_on: &str) -> Result<Image> {
     let out_line = reader.output_line_size(out_width).unwrap_or(0);
     let interlaced = reader.info().interlaced;
     // Interlaced files are read whole by libvips, so there a short stream is fatal at any level.
-    if (!lenient || interlaced) && !png_zlib_complete(bytes) {
+    if (!lenient || interlaced) && !png_zlib_complete(bytes, png_raster_size(reader.info())) {
         return Err(FastpkgError::Decode("PNG: truncated zlib stream".into()));
     }
     let info = match reader.next_frame(&mut buffer) {
