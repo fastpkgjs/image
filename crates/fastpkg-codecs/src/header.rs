@@ -555,3 +555,60 @@ pub fn gif_repair(bytes: &[u8]) -> Vec<u8> {
     out.push(0x3b);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 4x2 GIF at `screen` with one frame of `frame` size and a one-byte LZW payload.
+    fn gif(screen: (u16, u16), frame: (u16, u16)) -> Vec<u8> {
+        let mut out = b"GIF89a".to_vec();
+        out.extend_from_slice(&screen.0.to_le_bytes());
+        out.extend_from_slice(&screen.1.to_le_bytes());
+        out.extend_from_slice(&[0x80, 0, 0, 0, 0, 0, 255, 255, 255]);
+        out.extend_from_slice(&[0x2c, 0, 0, 0, 0]);
+        out.extend_from_slice(&frame.0.to_le_bytes());
+        out.extend_from_slice(&frame.1.to_le_bytes());
+        out.extend_from_slice(&[0, 2, 1, 0x44, 0, 0x3b]);
+        out
+    }
+
+    #[test]
+    fn gif_canvas_follows_libvips() {
+        assert_eq!(gif_canvas(&gif((4, 2), (4, 2))), Some((4, 2)));
+        // a screen smaller than the frame grows to it
+        assert_eq!(gif_canvas(&gif((2, 1), (4, 2))), Some((4, 2)));
+        // an empty or oversized screen is ignored
+        assert_eq!(gif_canvas(&gif((0, 0), (4, 2))), Some((4, 2)));
+        assert_eq!(gif_canvas(&gif((2049, 2), (4, 2))), Some((4, 2)));
+        assert_eq!(gif_canvas(&gif((2048, 2048), (4, 2))), Some((2048, 2048)));
+        let patched = gif_with_canvas(&gif((0, 0), (4, 2))).into_owned();
+        assert_eq!(&patched[6..10], &[4, 0, 2, 0]);
+    }
+
+    #[test]
+    fn gif_truncation_and_frame_data() {
+        let whole = gif((4, 2), (4, 2));
+        assert!(!gif_truncated(&whole));
+        assert!(!gif_truncated(&whole[..whole.len() - 1]));
+        assert!(gif_truncated(&whole[..whole.len() - 3]));
+        assert!(gif_has_frame_data(&whole));
+        assert!(!gif_has_frame_data(&whole[..whole.len() - 4]));
+    }
+
+    #[test]
+    fn avif_trailing_bytes_are_dropped_after_meta_and_mdat() {
+        let mut file = Vec::new();
+        for (kind, size) in [(b"ftyp", 16u32), (b"meta", 12), (b"mdat", 10)] {
+            file.extend_from_slice(&size.to_be_bytes());
+            file.extend_from_slice(kind);
+            file.resize(file.len() + size as usize - 8, 0);
+        }
+        let whole = file.len();
+        assert_eq!(avif_trim_trailing(&file).len(), whole);
+        file.extend_from_slice(&[0x13, 0x37, 0xff, 0xff, 1, 2, 3, 4]);
+        assert_eq!(avif_trim_trailing(&file).len(), whole);
+        // a box that runs past the end before `mdat` is a truncated file, not trailing bytes
+        assert_eq!(avif_trim_trailing(&file[..whole - 6]).len(), whole - 6);
+    }
+}

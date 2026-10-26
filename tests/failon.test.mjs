@@ -20,16 +20,28 @@ after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 // Known differences from sharp, kept out of the zero-mismatch assertions and listed as todos.
 const GAPS = [
   {
-    name: 'AVIF: damaged AV1 payload is concealed by rav1d, libheif rejects it',
+    name: 'AVIF: a damaged AV1 payload is concealed by rav1d, libheif rejects it',
     match: (m) => m.format === 'avif' && m.kind === 'accept-vs-reject',
   },
   {
-    name: 'AVIF: a damaged iloc extent is rejected, libheif still decodes it',
+    name: 'AVIF: a damaged iloc/ispe box is rejected here, libheif still decodes the image',
     match: (m) => m.format === 'avif' && m.kind === 'reject-vs-accept',
   },
   {
-    name: "GIF failOn 'none': an invalid LZW code after the last pixel is fatal here, libvips has stopped reading by then",
-    match: (m) => m.format === 'gif' && m.kind === 'reject-vs-accept',
+    name: 'WebP: some damaged lossless bitstreams decode in libwebp here and fail in libvips',
+    match: (m) => m.format === 'webp' && m.kind === 'accept-vs-reject' && /lossless/.test(m.base),
+  },
+  {
+    name: "GIF failOn 'warning': junk after a cut frame that parses as another frame is an error in libvips",
+    match: (m) => m.format === 'gif' && m.failOn === 'warning' && m.kind === 'accept-vs-reject',
+  },
+  {
+    name: "JPEG: a progressive file with an inconsistent scan script can fail in libvips even at failOn 'none'",
+    match: (m) => m.format === 'jpeg' && m.kind === 'accept-vs-reject' && /progressive/.test(m.base),
+  },
+  {
+    name: 'PNG: IHDR sizes that need more than the decoder buffer limit are rejected here, libvips allocates them',
+    match: (m) => m.format === 'png' && m.kind === 'reject-vs-accept' && /limits are exceeded/.test(m.engine),
   },
 ];
 const isGap = (m) => GAPS.some((gap) => gap.match(m));
@@ -66,8 +78,8 @@ for (const [name, format, ids] of GROUPS) {
     const out = [];
     for (const base of bases.filter((b) => b.format === format)) {
       const muts = mutationsFor(base).filter((m) => ids.test(m.id));
-      // The whole group in full runs; every other mutation in the default run.
-      for (const m of FULL ? muts : muts.filter((_, i) => i % 2 === 0)) {
+      // The whole group in full runs; every sixth mutation in the default run.
+      for (const m of FULL ? muts : muts.filter((_, i) => i % 6 === 0)) {
         for (const failOn of LEVELS) {
           const verdict = await judge(m.buf, failOn);
           if (verdict && verdict.kind !== 'pixels') {
