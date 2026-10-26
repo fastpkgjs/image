@@ -111,16 +111,35 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
 
     let (mut header, mut extras) = probe_bytes(bytes, spec)?;
     check_deadline(deadline)?;
-    // Shrink-on-load is only safe when the resize is the first operation, so the
-    // decoder-space target can be derived from the header alone. The final size is
-    // still computed from the full-resolution dimensions inside the resize op.
-    let swaps_axes = spec.input.auto_orient && matches!(header.orientation, Some(5..=8));
+    // Shrink-on-load is only safe when the resize is the first operation that resamples, so the
+    // decoder-space target can be derived from the header alone. Operations that only move
+    // pixels (auto-orient, quarter turns, flips) may come first: they commute with the shrink and
+    // `apply_one` carries the pre-shrink size through them. The final size is still computed
+    // from the full-resolution dimensions inside the resize op.
+    let mut swaps_axes = spec.input.auto_orient && matches!(header.orientation, Some(5..=8));
+    // The input-level auto-orient has consumed the tag by the time the operations run.
+    let mut orientation = if spec.input.auto_orient {
+        None
+    } else {
+        header.orientation
+    };
+    let mut leading = 0;
+    for op in &spec.operations {
+        let Some(swap) = fastpkg_ops::geometry_swaps_axes(op, orientation) else {
+            break;
+        };
+        swaps_axes ^= swap;
+        if matches!(op, Operation::AutoOrient) {
+            orientation = None;
+        }
+        leading += 1;
+    }
     let (oriented_width, oriented_height) = if swaps_axes {
         (header.height, header.width)
     } else {
         (header.width, header.height)
     };
-    let (hint, fast_shrink) = match spec.operations.first() {
+    let (hint, fast_shrink) = match spec.operations.get(leading) {
         Some(Operation::Resize {
             width,
             height,

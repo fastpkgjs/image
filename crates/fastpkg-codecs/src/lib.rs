@@ -2673,10 +2673,7 @@ fn exif_density(bytes: &[u8]) -> Option<u32> {
 }
 
 fn read_orientation(bytes: &[u8]) -> Option<u32> {
-    let mut cursor = Cursor::new(bytes);
-    let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
-    exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-        .and_then(|field| field.value.get_uint(0))
+    fastpkg_meta::orientation(bytes)
 }
 
 fn jpeg_flags(bytes: &[u8]) -> (bool, bool, bool) {

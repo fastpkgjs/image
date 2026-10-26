@@ -36,6 +36,8 @@ const SCENARIOS = {
   // 16384x16384 PNG (bench/gen-huge-png.mjs): few iterations, one sample each, peak RSS matters.
   'huge-png-800-png': { file: 'huge-256mp.png', parallel: 1, iters: 6, every: 1 },
   'huge-png-800-jpeg': { file: 'huge-256mp.png', parallel: 1, iters: 6, every: 1 },
+  // The usual upload normalisation: auto-orient first, then resize.
+  'huge-png-rotate-800-jpeg': { file: 'huge-256mp.png', parallel: 1, iters: 6, every: 1 },
 };
 
 function run(engine, input, name, overlay) {
@@ -53,6 +55,8 @@ function run(engine, input, name, overlay) {
       return sharpLike(input, { limitInputPixels: false }).resize({ width: 800 }).png().toBuffer();
     case 'huge-png-800-jpeg':
       return sharpLike(input, { limitInputPixels: false }).resize({ width: 800 }).jpeg({ quality: 80 }).toBuffer();
+    case 'huge-png-rotate-800-jpeg':
+      return sharpLike(input, { limitInputPixels: false }).rotate().resize({ width: 800 }).jpeg({ quality: 80 }).toBuffer();
     case 'big-jpeg-1200':
     case 'big-jpeg-1200-x8':
       return sharpLike(input).resize({ width: 1200 }).jpeg({ quality: 85 }).toBuffer();

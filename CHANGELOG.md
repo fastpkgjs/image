@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- WebP: the EXIF orientation is read from WebP files written by libvips/sharp (their EXIF chunk starts with the JPEG-style `Exif\0\0` prefix, which the container reader rejected), so `metadata().orientation`, `rotate()`/`autoOrient()` and `sharp(..., { autoOrient: true })` no longer leave a rotated WebP sideways.
+
+### Memory and speed
+
+- A leading `rotate()` (auto-orient), `rotate(90/180/270)`, `flip()` or `flop()` no longer switches off shrink-on-load for the resize that follows: these operations only move pixels, so the decode hint now looks through them (width and height swapped for quarter turns) and the pre-shrink size travels with the image. A 256 MP PNG through `.rotate().resize(800)` peaks at about 83 MB instead of 2.2 GB (sharp: 308 MB), and JPEGs resized after `rotate()` use DCT scaling again. Added to `bench/mem.mjs` as `huge-png-rotate-800-jpeg`.
+
 ## 0.4.0
 
 ### Memory

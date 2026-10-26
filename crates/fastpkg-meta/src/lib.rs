@@ -72,8 +72,20 @@ fn read_exif(bytes: &[u8]) -> Option<Value> {
 }
 
 fn read_exif_reader(bytes: &[u8]) -> Option<exif::Exif> {
+    // WebP: libvips (hence sharp) writes the EXIF chunk with the JPEG-style `Exif\0\0` prefix,
+    // which the container reader does not accept, so strip it and read the TIFF block directly.
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        let raw = read_exif_raw(bytes)?;
+        let tiff = raw.strip_prefix(b"Exif\x00\x00").unwrap_or(&raw);
+        return exif::Reader::new().read_raw(tiff.to_vec()).ok();
+    }
     let mut cursor = Cursor::new(bytes);
     exif::Reader::new().read_from_container(&mut cursor).ok()
+}
+
+/// The EXIF orientation (1-8) of a JPEG, PNG or WebP file.
+pub fn orientation(bytes: &[u8]) -> Option<u32> {
+    read_orientation(bytes)
 }
 
 fn read_xmp_raw(bytes: &[u8]) -> Option<Vec<u8>> {

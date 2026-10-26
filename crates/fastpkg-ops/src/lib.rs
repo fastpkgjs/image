@@ -30,6 +30,25 @@ pub fn apply(mut image: Image, operations: &[Operation]) -> Result<Image> {
     Ok(image)
 }
 
+/// For operations that move pixels without resampling them (auto-orient, quarter-turn rotations,
+/// flips): whether they swap width and height. Such an operation commutes with a box shrink
+/// done at decode time, so a shrunk image can pass through it with `pre_shrink` swapped along.
+/// `None` for everything else.
+pub fn geometry_swaps_axes(op: &Operation, orientation: Option<u32>) -> Option<bool> {
+    match op {
+        Operation::AutoOrient => Some(matches!(orientation, Some(5..=8))),
+        Operation::Flip { .. } | Operation::Flop { .. } => Some(false),
+        Operation::Rotate { angle, .. } => {
+            let turns = angle / 90.0;
+            if !angle.is_finite() || turns.fract() != 0.0 {
+                return None;
+            }
+            Some((turns as i64).rem_euclid(2) == 1)
+        }
+        _ => None,
+    }
+}
+
 pub fn apply_one(mut image: Image, op: &Operation) -> Result<Image> {
     // Many operations rebuild the image buffer from scratch; carry per-image
     // metadata across so EXIF/ICC/XMP and the single-channel hint survive them.
@@ -37,7 +56,16 @@ pub fn apply_one(mut image: Image, op: &Operation) -> Result<Image> {
     let icc = image.icc.take();
     let exif = image.exif.take();
     let xmp = image.xmp.take();
+    let swaps = geometry_swaps_axes(op, image.orientation);
+    let shrunk = swaps.and_then(|_| image.pre_shrink.take());
     let mut out = apply_op(image, op)?;
+    if let (Some((width, height)), Some(swaps)) = (shrunk, swaps) {
+        out.pre_shrink = Some(if swaps {
+            (height, width)
+        } else {
+            (width, height)
+        });
+    }
     out.gray |= gray;
     out.icc = out.icc.or(icc);
     out.exif = out.exif.or(exif);
