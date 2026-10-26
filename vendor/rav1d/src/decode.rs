@@ -4323,9 +4323,10 @@ pub(crate) fn rav1d_decode_tile_sbrow(
         return Err(());
     }
 
-    if c.strict_std_compliance
-        && (t.b.y >> f.sb_shift) + 1
-            >= f.frame_hdr().tiling.row_start_sb[tile_row as usize + 1].into()
+    // fastpkg patch: libaom (libheif's decoder) always checks the padding after the symbol
+    // coder, so a damaged tile is an error without `strict_std_compliance` too.
+    if (t.b.y >> f.sb_shift) + 1
+        >= f.frame_hdr().tiling.row_start_sb[tile_row as usize + 1].into()
     {
         return check_trailing_bits_after_symbol_coder(&ts.context.try_lock().unwrap().msac);
     }

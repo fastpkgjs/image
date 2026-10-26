@@ -511,6 +511,13 @@ fn decode_avif(bytes: &[u8]) -> Result<Image> {
             (data, w as u32, h as u32, false)
         }
     };
+    // libheif refuses a picture whose size differs from every `ispe` box.
+    let sizes = header::avif_ispe_sizes(bytes);
+    if !sizes.is_empty() && !sizes.contains(&(width, height)) {
+        return Err(FastpkgError::Decode(
+            "heif: decoded image size does not match ispe".into(),
+        ));
+    }
     let mut image = Image::from_rgba(width, height, data)?;
     image.has_alpha = alpha;
     image.format = Format::Avif;
@@ -922,9 +929,37 @@ fn decode_png(bytes: &[u8], fail_on: &str) -> Result<Image> {
     }
 }
 
+/// Decodes the PNG while a second thread checks that its zlib stream is whole (the decoder
+/// stops after the last row), so the check does not add to the wall time of large files.
+fn decode_png_once(bytes: &[u8], fail_on: &str) -> Result<Image> {
+    // Interlaced files are read whole by libvips, so there a short stream is fatal at any level.
+    let raster = png_decoder(bytes, fail_on)
+        .read_info()
+        .ok()
+        .filter(|reader| fail_on != "none" || reader.info().interlaced)
+        .map(|reader| png_raster_size(reader.info()));
+    let Some(raster) = raster else {
+        return decode_png_rows(bytes, fail_on);
+    };
+    if bytes.len() < 1 << 18 {
+        return match png_zlib_complete(bytes, raster) {
+            true => decode_png_rows(bytes, fail_on),
+            false => Err(FastpkgError::Decode("PNG: truncated zlib stream".into())),
+        };
+    }
+    std::thread::scope(|scope| {
+        let check = scope.spawn(|| png_zlib_complete(bytes, raster));
+        let decoded = decode_png_rows(bytes, fail_on);
+        match check.join() {
+            Ok(false) => Err(FastpkgError::Decode("PNG: truncated zlib stream".into())),
+            _ => decoded,
+        }
+    })
+}
+
 /// With `failOn: 'none'` a PNG whose data stream breaks yields the rows decoded so far; the
 /// rest stays zero, as in libvips. Interlaced files are all-or-nothing.
-fn decode_png_once(bytes: &[u8], fail_on: &str) -> Result<Image> {
+fn decode_png_rows(bytes: &[u8], fail_on: &str) -> Result<Image> {
     let lenient = fail_on == "none";
     if !png_chunk_headers_valid(bytes) {
         return Err(FastpkgError::Decode("PNG: invalid chunk header".into()));
@@ -945,10 +980,6 @@ fn decode_png_once(bytes: &[u8], fail_on: &str) -> Result<Image> {
     let (out_width, out_height) = reader.info().size();
     let out_line = reader.output_line_size(out_width).unwrap_or(0);
     let interlaced = reader.info().interlaced;
-    // Interlaced files are read whole by libvips, so there a short stream is fatal at any level.
-    if (!lenient || interlaced) && !png_zlib_complete(bytes, png_raster_size(reader.info())) {
-        return Err(FastpkgError::Decode("PNG: truncated zlib stream".into()));
-    }
     let info = match reader.next_frame(&mut buffer) {
         Ok(info) => info,
         Err(error) if lenient && !interlaced => {

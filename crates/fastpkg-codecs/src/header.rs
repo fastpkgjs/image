@@ -265,6 +265,20 @@ pub fn avif_has_alpha(bytes: &[u8]) -> bool {
         .any(|urn| head.windows(urn.len()).any(|window| window == *urn))
 }
 
+/// Dimensions declared by the `ispe` (image spatial extents) boxes of an AVIF file.
+pub fn avif_ispe_sizes(bytes: &[u8]) -> Vec<(u32, u32)> {
+    const HEAD: [u8; 8] = [0, 0, 0, 20, b'i', b's', b'p', b'e'];
+    let mut sizes = Vec::new();
+    for (at, window) in bytes.windows(HEAD.len()).enumerate() {
+        if window == HEAD && at + 20 <= bytes.len() {
+            let field =
+                |i: usize| u32::from_be_bytes(bytes[at + i..at + i + 4].try_into().unwrap());
+            sizes.push((field(12), field(16)));
+        }
+    }
+    sizes
+}
+
 /// The AVIF bytes up to the first malformed top-level box, once `meta` and a complete `mdat`
 /// have been seen: libheif ignores trailing garbage, the box parser behind the decoder does not.
 pub fn avif_trim_trailing(bytes: &[u8]) -> &[u8] {

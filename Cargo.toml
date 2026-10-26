@@ -57,9 +57,11 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync"] }
 
-# rav1d 1.1.0 with a one-line fix: its frame-decode error path unwrapped an already released
-# frame header inside an `extern "C"` fn, turning corrupt AVIF input into a process abort.
-# See vendor/rav1d/src/decode.rs ("fastpkg patch").
+# rav1d 1.1.0 with two small fixes: its frame-decode error path unwrapped an already released
+# frame header inside an `extern "C"` fn, turning corrupt AVIF input into a process abort; and
+# the padding check after each tile (libaom always does it) no longer needs strict compliance,
+# so a damaged AV1 payload is an error as with libheif. See vendor/rav1d/src/decode.rs
+# ("fastpkg patch").
 [patch.crates-io]
 rav1d = { path = "vendor/rav1d" }
 
