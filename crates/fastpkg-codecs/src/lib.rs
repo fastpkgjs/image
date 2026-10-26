@@ -432,6 +432,7 @@ fn decode_jxl(bytes: &[u8]) -> Result<Image> {
 }
 
 fn decode_avif(bytes: &[u8]) -> Result<Image> {
+    let bytes = header::avif_trim_trailing(bytes);
     let decoder =
         avif_decode::Decoder::from_avif(bytes).map_err(|e| FastpkgError::Decode(e.to_string()))?;
     let decoded = decoder

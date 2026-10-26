@@ -265,6 +265,37 @@ pub fn avif_has_alpha(bytes: &[u8]) -> bool {
         .any(|urn| head.windows(urn.len()).any(|window| window == *urn))
 }
 
+/// The AVIF bytes up to the first malformed top-level box, once `meta` and a complete `mdat`
+/// have been seen: libheif ignores trailing garbage, the box parser behind the decoder does not.
+pub fn avif_trim_trailing(bytes: &[u8]) -> &[u8] {
+    let (mut meta, mut mdat) = (false, false);
+    let mut pos = 0usize;
+    while pos + 8 <= bytes.len() {
+        let kind = &bytes[pos + 4..pos + 8];
+        let size =
+            u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as u64;
+        let (header, total) = match size {
+            0 => (8, (bytes.len() - pos) as u64),
+            1 if pos + 16 <= bytes.len() => {
+                let wide = u64::from_be_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
+                (16, wide)
+            }
+            n => (8, n),
+        };
+        let printable = kind.iter().all(|b| (0x20..0x7f).contains(b));
+        if !printable || total < header || total > (bytes.len() - pos) as u64 {
+            return if meta && mdat { &bytes[..pos] } else { bytes };
+        }
+        match kind {
+            b"meta" => meta = true,
+            b"mdat" => mdat = true,
+            _ => {}
+        }
+        pos += total as usize;
+    }
+    bytes
+}
+
 /// Canvas size libvips (nsgif) works on: the logical screen grown to the extent of every frame;
 /// a screen that is empty or larger than 2048 either way is ignored in favour of the frames.
 fn gif_canvas(bytes: &[u8]) -> Option<(u32, u32)> {
