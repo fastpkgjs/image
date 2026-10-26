@@ -248,6 +248,28 @@ pub fn decode(
     }
 }
 
+/// Whether libwebp's demuxer accepts the RIFF container (sizes, chunk layout): the check libvips
+/// applies before it decodes anything.
+pub fn container_valid(bytes: &[u8]) -> bool {
+    let data = w::WebPData {
+        bytes: bytes.as_ptr(),
+        size: bytes.len(),
+    };
+    let demux = unsafe {
+        w::WebPDemuxInternal(
+            &data,
+            0,
+            std::ptr::null_mut(),
+            w::WEBP_DEMUX_ABI_VERSION as c_int,
+        )
+    };
+    if demux.is_null() {
+        return false;
+    }
+    unsafe { w::WebPDemuxDelete(demux) };
+    true
+}
+
 fn decode_inner(
     bytes: &[u8],
     scale_to: Option<(u32, u32)>,

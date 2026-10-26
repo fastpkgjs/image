@@ -263,6 +263,93 @@ pub fn avif_has_alpha(bytes: &[u8]) -> bool {
         .any(|urn| head.windows(urn.len()).any(|window| window == *urn))
 }
 
+/// Whether the file ends inside a block (a cut header, colour table, descriptor or an
+/// unterminated sub-block chain). A file that merely lacks its trailer is not truncated.
+pub fn gif_truncated(bytes: &[u8]) -> bool {
+    if bytes.len() < 13 {
+        return true;
+    }
+    let blocks_complete = |mut p: usize| -> Option<usize> {
+        while p < bytes.len() {
+            let size = bytes[p] as usize;
+            p += 1 + size;
+            if size == 0 {
+                return Some(p);
+            }
+        }
+        None
+    };
+    let mut at = 13;
+    if bytes[10] & 0x80 != 0 {
+        at += 3 * (1usize << ((bytes[10] & 7) + 1));
+    }
+    if at > bytes.len() {
+        return true;
+    }
+    while at < bytes.len() {
+        match bytes[at] {
+            0x21 => match at.checked_add(2).and_then(blocks_complete) {
+                Some(end) => at = end,
+                None => return true,
+            },
+            0x2c => {
+                if at + 10 > bytes.len() {
+                    return true;
+                }
+                let mut p = at + 10;
+                if bytes[at + 9] & 0x80 != 0 {
+                    p += 3 * (1usize << ((bytes[at + 9] & 7) + 1));
+                }
+                match blocks_complete(p + 1) {
+                    Some(end) if p < bytes.len() => at = end,
+                    _ => return true,
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether some frame has at least one complete, non-empty data sub-block: the minimum libvips
+/// needs before it reports a (partly blank) frame instead of "no frames in GIF".
+pub fn gif_has_frame_data(bytes: &[u8]) -> bool {
+    let mut at = 13usize;
+    if bytes.len() < 13 {
+        return false;
+    }
+    if bytes[10] & 0x80 != 0 {
+        at += 3 * (1usize << ((bytes[10] & 7) + 1));
+    }
+    while at + 2 <= bytes.len() {
+        match bytes[at] {
+            0x21 => {
+                at += 2;
+                loop {
+                    let Some(&size) = bytes.get(at) else {
+                        return false;
+                    };
+                    at += 1 + size as usize;
+                    if size == 0 {
+                        break;
+                    }
+                }
+            }
+            0x2c if at + 10 <= bytes.len() => {
+                let mut p = at + 10;
+                if bytes[at + 9] & 0x80 != 0 {
+                    p += 3 * (1usize << ((bytes[at + 9] & 7) + 1));
+                }
+                return bytes
+                    .get(p + 1)
+                    .is_some_and(|&size| size > 0 && p + 2 + size as usize <= bytes.len());
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Cuts a damaged GIF after its last complete sub-block, terminates the open block and appends
 /// the trailer so that a lenient decoder can read the frames that survived.
 pub fn gif_repair(bytes: &[u8]) -> Vec<u8> {
