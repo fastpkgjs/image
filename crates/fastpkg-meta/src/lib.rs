@@ -155,6 +155,11 @@ fn read_exif_raw(bytes: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// The embedded ICC profile of a JPEG, PNG or WebP file.
+pub fn icc_profile(bytes: &[u8]) -> Option<Vec<u8>> {
+    read_icc_raw(bytes)
+}
+
 fn read_icc_raw(bytes: &[u8]) -> Option<Vec<u8>> {
     if let Some(raw) = read_jpeg_icc_raw(bytes) {
         return Some(raw);

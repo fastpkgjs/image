@@ -18,11 +18,13 @@ flate2.workspace = true
 gamut-core = { workspace = true, optional = true }
 gamut-jxl = { workspace = true, optional = true }
 fastpkg-core = { path = "../fastpkg-core" }
+fastpkg-meta = { path = "../fastpkg-meta" }
 image.workspace = true
 imagesize.workspace = true
 jpeg-decoder.workspace = true
 jpeg-encoder.workspace = true
 jxl-oxide = { workspace = true, features = ["image", "rayon", "moxcms"] }
+moxcms = "0.8"
 mozjpeg.workspace = true
 mozjpeg-sys.workspace = true
 libwebp-sys.workspace = true

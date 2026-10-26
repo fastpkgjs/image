@@ -16,6 +16,7 @@ use image::codecs::webp::WebPEncoder;
 use image::{Delay, DynamicImage, ExtendedColorType, Frame, ImageDecoder, ImageEncoder};
 
 pub mod header;
+pub mod icc;
 pub mod png_enc;
 pub mod png_huff;
 pub mod png_quant;
@@ -176,6 +177,9 @@ fn probe_generic(bytes: &[u8], format: Format) -> Result<HeaderInfo> {
                 header.page_height = h;
                 header.channels = channels;
                 header.is_progressive = progressive;
+                if channels == 4 {
+                    header.space = "cmyk".into();
+                }
             }
             let details = header::jpeg_details(bytes);
             header.chroma_subsampling = details.chroma_subsampling;
@@ -311,7 +315,7 @@ fn decode_with_hint_inner(
         Format::Jxl => decode_jxl(bytes)?,
         Format::Svg => svg::decode(bytes, input.density)?,
         Format::Png => decode_png(bytes, input.fail_on == "none", hint)?,
-        Format::Jpeg => decode_jpeg_scaled(bytes, hint, fast_shrink, &input.fail_on)?,
+        Format::Jpeg => decode_jpeg_scaled(bytes, hint, fast_shrink, input)?,
         Format::Webp => {
             if input.fail_on != "none" && webp_riff_truncated(bytes) {
                 return Err(FastpkgError::Decode(
@@ -337,10 +341,31 @@ fn decode_with_hint_inner(
         }
     };
     image.format = format;
+    // CMYK JPEGs were converted while decoding.
+    if !input.ignore_icc
+        && matches!(format, Format::Jpeg | Format::Png | Format::Webp)
+        && !(format == Format::Jpeg && jpeg_sof(bytes).is_some_and(|sof| sof.2 == 4))
+    {
+        if let Some(profile) = fastpkg_meta::icc_profile(bytes) {
+            icc::convert_embedded(&mut image, &profile, source_is_gray(bytes, format));
+        }
+    }
     if let Some(orientation) = read_orientation(bytes) {
         image.orientation = Some(orientation);
     }
     Ok(image)
+}
+
+/// True if the file holds a single grey channel (plus optional alpha), which pairs with grey
+/// ICC profiles only.
+fn source_is_gray(bytes: &[u8], format: Format) -> bool {
+    match format {
+        Format::Png => bytes
+            .get(25)
+            .is_some_and(|color_type| matches!(color_type, 0 | 4)),
+        Format::Jpeg => jpeg_sof(bytes).is_some_and(|sof| sof.2 == 1),
+        _ => false,
+    }
 }
 
 /// WebP through libwebp (exact fancy upsampling as in sharp, SIMD, optional scaled decode);
@@ -594,9 +619,9 @@ fn decode_jpeg_scaled(
     bytes: &[u8],
     hint: Option<(u32, u32)>,
     fast_shrink: bool,
-    fail_on: &str,
+    input: &InputOptions,
 ) -> Result<Image> {
-    match decode_jpeg_mozjpeg(bytes, hint, fast_shrink, fail_on) {
+    match decode_jpeg_mozjpeg(bytes, hint, fast_shrink, &input.fail_on, input.ignore_icc) {
         Ok(Some(image)) => return Ok(image),
         Ok(None) => {}
         Err(error) => return Err(error),
@@ -620,7 +645,7 @@ pub fn jpeg_scale_numerator(source: (u32, u32), target: (u32, u32), headroom: u3
         .clamp(1, 8) as u8
 }
 
-/// Decodes with libjpeg(-turbo). `Ok(None)` means libjpeg cannot handle the file (CMYK, odd
+/// Decodes with libjpeg(-turbo); CMYK/YCCK files are converted to sRGB. `Ok(None)` means libjpeg cannot handle the file (odd
 /// precisions, fatal errors) and the caller should fall back to another decoder; `Err` is a
 /// `failOn` violation: truncated data always, other warnings only for `failOn: 'warning'`.
 fn decode_jpeg_mozjpeg(
@@ -628,6 +653,7 @@ fn decode_jpeg_mozjpeg(
     hint: Option<(u32, u32)>,
     fast_shrink: bool,
     fail_on: &str,
+    ignore_icc: bool,
 ) -> Result<Option<Image>> {
     JPEG_WARNINGS.with(|counts| counts.set((0, 0)));
     let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -648,11 +674,35 @@ fn decode_jpeg_mozjpeg(
             );
             decompress.scale(scale);
         }
-        let mut started = decompress.rgba().ok()?;
+        let cmyk = matches!(
+            decompress.color_space(),
+            mozjpeg_sys::J_COLOR_SPACE::JCS_CMYK | mozjpeg_sys::J_COLOR_SPACE::JCS_YCCK
+        );
+        let mut started = if cmyk {
+            // libjpeg turns YCCK into CMYK itself.
+            decompress
+                .to_colorspace(mozjpeg_sys::J_COLOR_SPACE::JCS_CMYK)
+                .ok()?
+        } else {
+            decompress.rgba().ok()?
+        };
         let width = started.width() as u32;
         let height = started.height() as u32;
         let pixels: Vec<[u8; 4]> = started.read_scanlines().ok()?;
-        let data: Vec<u8> = bytemuck::cast_vec(pixels);
+        let mut data: Vec<u8> = bytemuck::cast_vec(pixels);
+        if cmyk {
+            // Adobe writes inverted CMYK (255 = no ink); libvips un-inverts whenever the
+            // marker is present.
+            if jpeg_has_adobe_marker(bytes) {
+                data.iter_mut().for_each(|v| *v = 255 - *v);
+            }
+            let embedded = if ignore_icc {
+                None
+            } else {
+                fastpkg_meta::icc_profile(bytes)
+            };
+            data = icc::cmyk_to_rgba(&data, embedded.as_deref())?;
+        }
         let mut image = Image::from_rgba(width, height, data).ok()?;
         image.has_alpha = false;
         image.format = Format::Jpeg;
@@ -2268,6 +2318,37 @@ fn jpeg_sof(bytes: &[u8]) -> Option<(u32, u32, u8, bool)> {
         offset += 2 + length;
     }
     None
+}
+
+/// True if the file has an Adobe APP14 segment.
+fn jpeg_has_adobe_marker(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
+        return false;
+    }
+    let mut offset = 2;
+    while offset + 4 <= bytes.len() {
+        if bytes[offset] != 0xff {
+            offset += 1;
+            continue;
+        }
+        let marker = bytes[offset + 1];
+        if marker == 0xd9 || marker == 0xda {
+            break;
+        }
+        if marker == 0x01 || (0xd0..=0xd8).contains(&marker) {
+            offset += 2;
+            continue;
+        }
+        let length = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+        if length < 2 || offset + 2 + length > bytes.len() {
+            break;
+        }
+        if marker == 0xee && bytes[offset + 4..offset + 2 + length].starts_with(b"Adobe") {
+            return true;
+        }
+        offset += 2 + length;
+    }
+    false
 }
 
 fn webp_alpha(bytes: &[u8]) -> bool {

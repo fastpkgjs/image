@@ -6,6 +6,13 @@
 
 - PNG decoding is now sequential. Non-interlaced files are read row by row straight into the RGBA result (no intermediate full-frame buffer next to it, which held two copies of RGB and 16-bit images), and when a resize comes first and downscales by 4x or more the rows are box-averaged while they arrive (premultiplied for images with alpha, any colour type and bit depth), so only the shrunk image is resident. The factor leaves the Lanczos resize 2x headroom over the target (like libvips' integer pre-shrink, so PNG downscales of 4x and more are also closer to sharp's output than before: for example a 2400 px photo to 100 px is off by 0.3 instead of 2.0 levels on average); `fastShrinkOnLoad` does not apply to PNG. A 16384x16384 (256 MP), 800 KB flat PNG resized to 800 px: peak RSS 1.84 GB to 81 MB (sharp 272-307 MB), 2.2-2.5 s to 0.82 s (sharp 1.0-1.1 s). Interlaced PNGs still decode the whole frame, but 8-bit ones now expand to RGBA inside the decode buffer instead of next to it. `failOn` and `limitInputPixels` behave as before; `bench/mem.mjs` has the 256 MP case (`huge-png-800-png`, `huge-png-800-jpeg`).
 
+### Colour management (sharp parity)
+
+- Embedded ICC profiles are converted to sRGB while decoding, like sharp (perceptual intent, alpha untouched, pixels left alone for corrupt, unsupported or wrong-model profiles and for profiles equivalent to sRGB). `ignoreIcc: true` keeps the stored values, as do `keepIccProfile()` / `keepMetadata()` (the profile describes the pixels); `withMetadata()` converts and embeds sRGB, as in sharp. Untagged images only pay a header-level profile lookup.
+- 16-bit RGB sources are converted to Display P3 (sharp's processing profile), through a 33-point tetrahedral lookup table as in lcms, so colours near the edge of the destination gamut match sharp (the exact transform differed by up to 17 levels there).
+- CMYK/YCCK JPEGs decode to sRGB: Adobe-inverted values are un-inverted, an embedded CMYK profile is used when present and libvips' built-in CMYK profile otherwise; `metadata()` reports `space: 'cmyk'`, `channels: 4` and `chromaSubsampling: '4:4:4:4'` like sharp.
+- Known differences: JPEG DCT-scale and non-integer resize factors differ slightly from libvips with or without a profile (see the resize tolerance in `tests/differential.test.mjs`); profiles of other colour models (Lab, ...) and 16-bit grey data are passed through unconverted, as in libvips.
+
 ## 0.3.0
 
 Output-size, speed and parity release. **PNG and WebP output bytes change** (see below); PNG bytes remain deterministic and independent of thread count, and are pinned by `tests/png-stability.test.mjs`. They are not libvips-identical.
