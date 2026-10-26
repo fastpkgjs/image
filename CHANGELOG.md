@@ -13,6 +13,23 @@
 - CMYK/YCCK JPEGs decode to sRGB: Adobe-inverted values are un-inverted, an embedded CMYK profile is used when present and libvips' built-in CMYK profile otherwise; `metadata()` reports `space: 'cmyk'`, `channels: 4` and `chromaSubsampling: '4:4:4:4'` like sharp.
 - Known differences: JPEG DCT-scale and non-integer resize factors differ slightly from libvips with or without a profile (see the resize tolerance in `tests/differential.test.mjs`); profiles of other colour models (Lab, ...) and 16-bit grey data are passed through unconverted, as in libvips.
 
+### Fixed
+
+- `failOn` is wired for every decoder instead of only JPEG truncation. A differential corpus (`tests/_failon-corpus.mjs`: seeded truncations, byte flips, zeroed and deleted ranges, chunk/segment deletion, bad lengths, CRC damage and trailing garbage over the fixtures and generated JPEG/PNG/WebP/GIF/TIFF/AVIF/SVG files, judged against sharp at all four levels) found 390 corrupt inputs that sharp rejects and fastpkg accepted in its 8,636 cases (four levels; mostly PNG, WebP, GIF, AVIF and JPEG); that count is now 4, one damaged AVIF container per level (see Known differences).
+  - PNG: chunk CRCs are enforced from `failOn: 'error'` up and ignored below it; zlib checksums from `'truncated'` up. A zlib stream that ends early, a bad checksum and an invalid chunk type or length are errors; a data error after the last row, a missing or damaged `IEND`, and data after `IEND` are not, as in libpng. Interlaced files are all-or-nothing under `failOn: 'none'`.
+  - JPEG: a fatal libjpeg error rejects the file at any level instead of falling through to a second decoder that accepted it; metadata keeps working on files with junk between marker segments.
+  - WebP: a damaged container is rejected at any level (the check libvips makes through the demuxer) and damaged bitstreams are an error instead of being decoded by a lenient fallback.
+  - GIF: a file cut inside a block is rejected unless `failOn: 'none'`, which returns the frames that survived; an invalid LZW code is fatal at every level unless it comes after the last pixel or inside a cut sub-block; any `GIF8` signature is accepted; the canvas follows libvips (frames extend a too-small logical screen, a screen over 2048 px or empty is ignored).
+  - AVIF: bytes after the last complete box are ignored; a damaged AV1 tile is an error (rav1d's padding check is always on, as in libaom) and so is a picture whose size matches no `ispe` box.
+- `sharp({ failOn: 'none' })` (options only, input written to the stream) is accepted.
+
+### Known differences
+
+- AVIF: a few damaged container boxes (`hdlr`, `infe`, `ipco`) are accepted where libheif rejects them, and some damaged `iloc`/`ftyp` fields are rejected where libheif decodes them.
+- JPEG: a progressive file with an inconsistent scan script can fail in libvips even at `failOn: 'none'`. PNG: IHDR sizes beyond the decoder buffer limit are rejected here. GIF: under `'warning'` junk after a cut frame that parses as another frame is an error in libvips.
+- WebP: some damaged lossless bitstreams decode here and fail in libvips.
+- Tests: `tests/failon.test.mjs` runs a deterministic subset in `npm test` and the whole corpus with `FAILON_FULL=1`; the differences above are listed there as todos.
+
 ## 0.3.0
 
 Output-size, speed and parity release. **PNG and WebP output bytes change** (see below); PNG bytes remain deterministic and independent of thread count, and are pinned by `tests/png-stability.test.mjs`. They are not libvips-identical.

@@ -1,5 +1,7 @@
 //! Header-only readers used by `probe`/`metadata()`: none of them decode pixel data.
 
+use std::borrow::Cow;
+
 /// Pixels per inch from a JFIF APP0 segment (units 1 = dpi, 2 = dots per cm, 0 = aspect only).
 fn jfif_density(data: &[u8]) -> Option<u32> {
     if data.len() < 12 || !data.starts_with(b"JFIF\0") {
@@ -199,7 +201,7 @@ pub struct GifDetails {
 
 pub fn gif_details(bytes: &[u8]) -> GifDetails {
     let mut details = GifDetails::default();
-    if bytes.len() < 13 || !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+    if bytes.len() < 13 || !bytes.starts_with(b"GIF8") {
         return details;
     }
     let skip_sub_blocks = |mut at: usize| -> usize {
@@ -270,6 +272,247 @@ pub fn avif_has_alpha(bytes: &[u8]) -> bool {
         .any(|urn| head.windows(urn.len()).any(|window| window == *urn))
 }
 
+/// Dimensions declared by the `ispe` (image spatial extents) boxes of an AVIF file.
+pub fn avif_ispe_sizes(bytes: &[u8]) -> Vec<(u32, u32)> {
+    const HEAD: [u8; 8] = [0, 0, 0, 20, b'i', b's', b'p', b'e'];
+    let mut sizes = Vec::new();
+    for (at, window) in bytes.windows(HEAD.len()).enumerate() {
+        if window == HEAD && at + 20 <= bytes.len() {
+            let field =
+                |i: usize| u32::from_be_bytes(bytes[at + i..at + i + 4].try_into().unwrap());
+            sizes.push((field(12), field(16)));
+        }
+    }
+    sizes
+}
+
+/// The AVIF bytes up to the first malformed top-level box, once `meta` and a complete `mdat`
+/// have been seen: libheif ignores trailing garbage, the box parser behind the decoder does not.
+pub fn avif_trim_trailing(bytes: &[u8]) -> &[u8] {
+    let (mut meta, mut mdat) = (false, false);
+    let mut pos = 0usize;
+    while pos + 8 <= bytes.len() {
+        let kind = &bytes[pos + 4..pos + 8];
+        let size =
+            u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as u64;
+        let (header, total) = match size {
+            0 => (8, (bytes.len() - pos) as u64),
+            1 if pos + 16 <= bytes.len() => {
+                let wide = u64::from_be_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
+                (16, wide)
+            }
+            n => (8, n),
+        };
+        let printable = kind.iter().all(|b| (0x20..0x7f).contains(b));
+        if !printable || total < header || total > (bytes.len() - pos) as u64 {
+            return if meta && mdat { &bytes[..pos] } else { bytes };
+        }
+        match kind {
+            b"meta" => meta = true,
+            b"mdat" => mdat = true,
+            _ => {}
+        }
+        pos += total as usize;
+    }
+    bytes
+}
+
+/// Canvas size libvips (nsgif) works on: the logical screen grown to the extent of every frame;
+/// a screen that is empty or larger than 2048 either way is ignored in favour of the frames.
+pub fn gif_canvas(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 13 {
+        return None;
+    }
+    let screen = (
+        u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
+        u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
+    );
+    let mut at = 13usize;
+    if bytes[10] & 0x80 != 0 {
+        at += 3 * (1usize << ((bytes[10] & 7) + 1));
+    }
+    let skip_sub_blocks = |mut p: usize| -> usize {
+        while p < bytes.len() {
+            let size = bytes[p] as usize;
+            p += 1 + size;
+            if size == 0 {
+                break;
+            }
+        }
+        p
+    };
+    let (mut right, mut bottom) = (0u32, 0u32);
+    while at < bytes.len() {
+        match bytes[at] {
+            0x21 => at = skip_sub_blocks(at + 2),
+            0x2c if at + 10 <= bytes.len() => {
+                let field =
+                    |i: usize| u16::from_le_bytes([bytes[at + i], bytes[at + i + 1]]) as u32;
+                right = right.max(field(1) + field(5));
+                bottom = bottom.max(field(3) + field(7));
+                let mut p = at + 10;
+                if bytes[at + 9] & 0x80 != 0 {
+                    p += 3 * (1usize << ((bytes[at + 9] & 7) + 1));
+                }
+                at = skip_sub_blocks(p + 1);
+            }
+            _ => break,
+        }
+    }
+    let valid = screen.0 > 0 && screen.1 > 0 && screen.0 <= 2048 && screen.1 <= 2048;
+    Some(if valid {
+        (screen.0.max(right), screen.1.max(bottom))
+    } else {
+        (right, bottom)
+    })
+}
+
+/// The file with its signature and logical screen rewritten to what libvips would use (any
+/// "GIF8" file, the canvas of `gif_canvas`), so the decoder composites onto the same size.
+pub fn gif_with_canvas(bytes: &[u8]) -> Cow<'_, [u8]> {
+    if bytes.len() < 13 {
+        return Cow::Borrowed(bytes);
+    }
+    let screen = (
+        u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
+        u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
+    );
+    let canvas = gif_canvas(bytes)
+        .filter(|&(w, h)| (1..=u16::MAX as u32).contains(&w) && (1..=u16::MAX as u32).contains(&h))
+        .unwrap_or(screen);
+    let signature = bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a");
+    if signature && canvas == screen {
+        return Cow::Borrowed(bytes);
+    }
+    let mut patched = bytes.to_vec();
+    if !signature {
+        patched[..6].copy_from_slice(b"GIF89a");
+    }
+    patched[6..8].copy_from_slice(&(canvas.0 as u16).to_le_bytes());
+    patched[8..10].copy_from_slice(&(canvas.1 as u16).to_le_bytes());
+    Cow::Owned(patched)
+}
+
+/// Offset of the first frame's LZW minimum code size byte and the frame's dimensions.
+pub fn gif_first_frame(bytes: &[u8]) -> Option<(usize, u32, u32)> {
+    if bytes.len() < 13 {
+        return None;
+    }
+    let mut at = 13usize;
+    if bytes[10] & 0x80 != 0 {
+        at += 3 * (1usize << ((bytes[10] & 7) + 1));
+    }
+    while at < bytes.len() {
+        match bytes[at] {
+            0x21 => {
+                at += 2;
+                while *bytes.get(at)? != 0 {
+                    at += bytes[at] as usize + 1;
+                }
+                at += 1;
+            }
+            0x2c if at + 10 < bytes.len() => {
+                let field =
+                    |i: usize| u16::from_le_bytes([bytes[at + i], bytes[at + i + 1]]) as u32;
+                let mut p = at + 10;
+                if bytes[at + 9] & 0x80 != 0 {
+                    p += 3 * (1usize << ((bytes[at + 9] & 7) + 1));
+                }
+                return (p < bytes.len()).then(|| (p, field(5), field(7)));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether the file ends inside a block (a cut header, colour table, descriptor or an
+/// unterminated sub-block chain). A file that merely lacks its trailer is not truncated.
+pub fn gif_truncated(bytes: &[u8]) -> bool {
+    if bytes.len() < 13 {
+        return true;
+    }
+    let blocks_complete = |mut p: usize| -> Option<usize> {
+        while p < bytes.len() {
+            let size = bytes[p] as usize;
+            p += 1 + size;
+            if size == 0 {
+                return Some(p);
+            }
+        }
+        None
+    };
+    let mut at = 13;
+    if bytes[10] & 0x80 != 0 {
+        at += 3 * (1usize << ((bytes[10] & 7) + 1));
+    }
+    if at > bytes.len() {
+        return true;
+    }
+    while at < bytes.len() {
+        match bytes[at] {
+            0x21 => match at.checked_add(2).and_then(blocks_complete) {
+                Some(end) => at = end,
+                None => return true,
+            },
+            0x2c => {
+                if at + 10 > bytes.len() {
+                    return true;
+                }
+                let mut p = at + 10;
+                if bytes[at + 9] & 0x80 != 0 {
+                    p += 3 * (1usize << ((bytes[at + 9] & 7) + 1));
+                }
+                match blocks_complete(p + 1) {
+                    Some(end) if p < bytes.len() => at = end,
+                    _ => return true,
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether some frame has at least one complete, non-empty data sub-block: the minimum libvips
+/// needs before it reports a (partly blank) frame instead of "no frames in GIF".
+pub fn gif_has_frame_data(bytes: &[u8]) -> bool {
+    let mut at = 13usize;
+    if bytes.len() < 13 {
+        return false;
+    }
+    if bytes[10] & 0x80 != 0 {
+        at += 3 * (1usize << ((bytes[10] & 7) + 1));
+    }
+    while at + 2 <= bytes.len() {
+        match bytes[at] {
+            0x21 => {
+                at += 2;
+                loop {
+                    let Some(&size) = bytes.get(at) else {
+                        return false;
+                    };
+                    at += 1 + size as usize;
+                    if size == 0 {
+                        break;
+                    }
+                }
+            }
+            0x2c if at + 10 <= bytes.len() => {
+                let mut p = at + 10;
+                if bytes[at + 9] & 0x80 != 0 {
+                    p += 3 * (1usize << ((bytes[at + 9] & 7) + 1));
+                }
+                return bytes
+                    .get(p + 1)
+                    .is_some_and(|&size| size > 0 && bytes.len() > p + 2);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Cuts a damaged GIF after its last complete sub-block, terminates the open block and appends
 /// the trailer so that a lenient decoder can read the frames that survived.
 pub fn gif_repair(bytes: &[u8]) -> Vec<u8> {
@@ -318,7 +561,8 @@ pub fn gif_repair(bytes: &[u8]) -> Vec<u8> {
                     at = end;
                     keep = at;
                 } else {
-                    // Keep the complete sub-blocks of this frame and close the chain.
+                    // Keep the complete sub-blocks of this frame and close the chain: libvips
+                    // only decodes whole sub-blocks, so a bad code in the cut one goes unseen.
                     let mut out = bytes[..end].to_vec();
                     out.push(0);
                     out.push(0x3b);
@@ -331,4 +575,61 @@ pub fn gif_repair(bytes: &[u8]) -> Vec<u8> {
     let mut out = bytes[..keep.min(bytes.len())].to_vec();
     out.push(0x3b);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 4x2 GIF at `screen` with one frame of `frame` size and a one-byte LZW payload.
+    fn gif(screen: (u16, u16), frame: (u16, u16)) -> Vec<u8> {
+        let mut out = b"GIF89a".to_vec();
+        out.extend_from_slice(&screen.0.to_le_bytes());
+        out.extend_from_slice(&screen.1.to_le_bytes());
+        out.extend_from_slice(&[0x80, 0, 0, 0, 0, 0, 255, 255, 255]);
+        out.extend_from_slice(&[0x2c, 0, 0, 0, 0]);
+        out.extend_from_slice(&frame.0.to_le_bytes());
+        out.extend_from_slice(&frame.1.to_le_bytes());
+        out.extend_from_slice(&[0, 2, 1, 0x44, 0, 0x3b]);
+        out
+    }
+
+    #[test]
+    fn gif_canvas_follows_libvips() {
+        assert_eq!(gif_canvas(&gif((4, 2), (4, 2))), Some((4, 2)));
+        // a screen smaller than the frame grows to it
+        assert_eq!(gif_canvas(&gif((2, 1), (4, 2))), Some((4, 2)));
+        // an empty or oversized screen is ignored
+        assert_eq!(gif_canvas(&gif((0, 0), (4, 2))), Some((4, 2)));
+        assert_eq!(gif_canvas(&gif((2049, 2), (4, 2))), Some((4, 2)));
+        assert_eq!(gif_canvas(&gif((2048, 2048), (4, 2))), Some((2048, 2048)));
+        let patched = gif_with_canvas(&gif((0, 0), (4, 2))).into_owned();
+        assert_eq!(&patched[6..10], &[4, 0, 2, 0]);
+    }
+
+    #[test]
+    fn gif_truncation_and_frame_data() {
+        let whole = gif((4, 2), (4, 2));
+        assert!(!gif_truncated(&whole));
+        assert!(!gif_truncated(&whole[..whole.len() - 1]));
+        assert!(gif_truncated(&whole[..whole.len() - 3]));
+        assert!(gif_has_frame_data(&whole));
+        assert!(!gif_has_frame_data(&whole[..whole.len() - 4]));
+    }
+
+    #[test]
+    fn avif_trailing_bytes_are_dropped_after_meta_and_mdat() {
+        let mut file = Vec::new();
+        for (kind, size) in [(b"ftyp", 16u32), (b"meta", 12), (b"mdat", 10)] {
+            file.extend_from_slice(&size.to_be_bytes());
+            file.extend_from_slice(kind);
+            file.resize(file.len() + size as usize - 8, 0);
+        }
+        let whole = file.len();
+        assert_eq!(avif_trim_trailing(&file).len(), whole);
+        file.extend_from_slice(&[0x13, 0x37, 0xff, 0xff, 1, 2, 3, 4]);
+        assert_eq!(avif_trim_trailing(&file).len(), whole);
+        // a box that runs past the end before `mdat` is a truncated file, not trailing bytes
+        assert_eq!(avif_trim_trailing(&file[..whole - 6]).len(), whole - 6);
+    }
 }

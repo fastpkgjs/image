@@ -41,7 +41,8 @@ impl Format {
         if bytes.len() >= 3 && &bytes[..3] == b"\xff\xd8\xff" {
             return Self::Jpeg;
         }
-        if bytes.len() >= 6 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a") {
+        // libvips sniffs "GIF8" and ignores the rest of the version.
+        if bytes.len() >= 6 && &bytes[..4] == b"GIF8" {
             return Self::Gif;
         }
         if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {

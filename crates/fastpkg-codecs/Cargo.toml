@@ -33,4 +33,5 @@ qoi.workspace = true
 rayon.workspace = true
 resvg.workspace = true
 serde_json.workspace = true
+weezl = "0.1"
 zlib-rs = { version = "0.6", default-features = false, features = ["std"] }

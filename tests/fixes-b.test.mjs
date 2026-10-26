@@ -540,6 +540,12 @@ test('failOn: damaged JPEG / WebP are rejected unless failOn is none', async () 
       const outcome = (lib) => lib(buf, options).raw().toBuffer().then(() => 'ok', () => 'error');
       assert.equal(await outcome(engine), await outcome(sharp), `${name} failOn=${failOn}`);
     }
+    if (name.startsWith('webp')) {
+      // libvips opens WebP through the demuxer, so a damaged container fails at every level.
+      const outcome = (lib) => lib(buf, { failOn: 'none' }).raw().toBuffer().then(() => 'ok', () => 'error');
+      assert.equal(await outcome(engine), await outcome(sharp), `${name} failOn=none`);
+      continue;
+    }
     const lenient = await engine(buf, { failOn: 'none' }).raw().toBuffer({ resolveWithObject: true });
     assert.ok(lenient.info.width > 0, `${name} failOn=none decodes`);
   }

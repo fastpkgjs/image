@@ -122,17 +122,24 @@ pub fn probe(bytes: &[u8], input: &InputOptions) -> Result<HeaderInfo> {
 }
 
 fn probe_generic(bytes: &[u8], format: Format) -> Result<HeaderInfo> {
-    let size = imagesize::blob_size(bytes).map_err(|e| FastpkgError::Decode(e.to_string()))?;
+    // libjpeg skips junk between marker segments; the size reader gives up on it.
+    let (width, height) = match imagesize::blob_size(bytes) {
+        Ok(size) => (size.width as u32, size.height as u32),
+        Err(error) => match jpeg_sof(bytes) {
+            Some((w, h, ..)) if format == Format::Jpeg => (w, h),
+            _ => return Err(FastpkgError::Decode(error.to_string())),
+        },
+    };
     let mut header = HeaderInfo {
         format,
-        width: size.width as u32,
-        height: size.height as u32,
+        width,
+        height,
         channels: 3,
         has_alpha: format.supports_alpha(),
         depth: "uchar".into(),
         space: "srgb".into(),
         pages: 1,
-        page_height: size.height as u32,
+        page_height: height,
         ..Default::default()
     };
     match format {
@@ -206,6 +213,11 @@ fn probe_generic(bytes: &[u8], format: Format) -> Result<HeaderInfo> {
         }
         Format::Gif => {
             let details = header::gif_details(bytes);
+            if let Some((width, height)) = header::gif_canvas(bytes) {
+                header.width = width;
+                header.height = height;
+                header.page_height = height;
+            }
             header.has_alpha = details.transparent;
             header.channels = if details.transparent { 4 } else { 3 };
             header.is_palette = true;
@@ -314,17 +326,19 @@ fn decode_with_hint_inner(
         Format::Avif => decode_avif(bytes)?,
         Format::Jxl => decode_jxl(bytes)?,
         Format::Svg => svg::decode(bytes, input.density)?,
-        Format::Png => decode_png(bytes, input.fail_on == "none", hint)?,
+        Format::Png => decode_png(bytes, &input.fail_on, hint)?,
         Format::Jpeg => decode_jpeg_scaled(bytes, hint, fast_shrink, input)?,
         Format::Webp => {
-            if input.fail_on != "none" && webp_riff_truncated(bytes) {
+            // libvips opens WebP through the demuxer, which rejects a damaged container
+            // whatever `failOn` says.
+            if !webp::container_valid(bytes) {
                 return Err(FastpkgError::Decode(
-                    "webp: RIFF size is larger than the file (truncated)".into(),
+                    "webp: unable to parse image (damaged RIFF container)".into(),
                 ));
             }
             decode_webp(bytes, input, hint, fast_shrink)?
         }
-        Format::Gif if input.fail_on == "none" => decode_gif_lenient(bytes)?,
+        Format::Gif => decode_gif(bytes, &input.fail_on)?,
         Format::Raw => {
             return Err(FastpkgError::InvalidOptions(
                 "raw input requires raw width/height/channels".into(),
@@ -455,6 +469,7 @@ fn decode_jxl(bytes: &[u8]) -> Result<Image> {
 }
 
 fn decode_avif(bytes: &[u8]) -> Result<Image> {
+    let bytes = header::avif_trim_trailing(bytes);
     let decoder =
         avif_decode::Decoder::from_avif(bytes).map_err(|e| FastpkgError::Decode(e.to_string()))?;
     let decoded = decoder
@@ -521,59 +536,148 @@ fn decode_avif(bytes: &[u8]) -> Result<Image> {
             (data, w as u32, h as u32, false)
         }
     };
+    // libheif refuses a picture whose size differs from every `ispe` box (a rotation swaps the
+    // sides; cropped and tiled images are left alone).
+    let sizes = header::avif_ispe_sizes(bytes);
+    let transformed = [&b"clap"[..], b"grid"]
+        .iter()
+        .any(|tag| bytes.windows(4).any(|window| window == *tag));
+    if !transformed
+        && !sizes.is_empty()
+        && !sizes.contains(&(width, height))
+        && !sizes.contains(&(height, width))
+    {
+        return Err(FastpkgError::Decode(
+            "heif: decoded image size does not match ispe".into(),
+        ));
+    }
     let mut image = Image::from_rgba(width, height, data)?;
     image.has_alpha = alpha;
     image.format = Format::Avif;
     Ok(image)
 }
 
-/// `failOn: 'none'` GIF decoding: a damaged file yields what could be recovered. The data is cut
-/// after the last complete sub-block and closed properly; if the frame still cannot be read an
-/// empty transparent canvas of the logical screen size is returned.
-fn decode_gif_lenient(bytes: &[u8]) -> Result<Image> {
+/// GIF decoding as libvips judges it. A file cut inside a block is an error unless `failOn` is
+/// `none`, which returns what survived; a frame whose LZW data is short decodes to a blank
+/// canvas at any level, while an invalid code is fatal at any level.
+fn decode_gif(bytes: &[u8], fail_on: &str) -> Result<Image> {
+    let lenient = fail_on == "none";
+    if !lenient && header::gif_truncated(bytes) {
+        return Err(FastpkgError::Decode(
+            "gifload: unexpected end of GIF source data".into(),
+        ));
+    }
+    let bytes = header::gif_with_canvas(bytes);
     let decode = |data: &[u8]| -> Result<Image> {
         let dynamic = image::load_from_memory_with_format(data, image::ImageFormat::Gif)
             .map_err(|e| FastpkgError::Decode(format!("image/gif: {e}")))?;
         dynamic_to_image(dynamic, Format::Gif)
     };
-    if let Ok(image) = decode(bytes) {
-        return Ok(image);
+    let invalid = |error: &FastpkgError| error.to_string().contains("invalid code");
+    // libvips stops reading a frame once its last pixel is in, so a bad code after that point
+    // does not matter; the frame is re-encoded from the pixels that were good.
+    let recovered = |result: Result<Image>, data: &[u8]| match &result {
+        Err(error) if invalid(error) => gif_reencode_first_frame(data)
+            .map(|fixed| decode(&fixed))
+            .unwrap_or(result),
+        _ => result,
+    };
+    let mut result = recovered(decode(&bytes), &bytes);
+    if let Err(error) = &result {
+        if !lenient && (invalid(error) || !error.to_string().contains("truncated")) {
+            return result;
+        }
+        if lenient && bytes.len() >= 13 {
+            let repaired = header::gif_repair(&bytes);
+            result = recovered(decode(&repaired), &repaired);
+            if result.as_ref().is_err_and(invalid) {
+                return result;
+            }
+        }
     }
-    if bytes.len() >= 13 {
-        let repaired = header::gif_repair(bytes);
-        if let Ok(image) = decode(&repaired) {
-            return Ok(image);
-        }
-        let (width, height) = (
-            u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
-            u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
-        );
-        if width > 0 && height > 0 {
-            validate_dimensions(width, height, &Limits::default())?;
-            let mut image = Image::from_rgba(
-                width,
-                height,
-                vec![0u8; width as usize * height as usize * 4],
-            )?;
-            image.has_alpha = true;
-            image.format = Format::Gif;
-            return Ok(image);
-        }
+    if result.is_ok() {
+        return result;
+    }
+    let (width, height) = (
+        u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
+        u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
+    );
+    if bytes.len() >= 13 && width > 0 && height > 0 && header::gif_has_frame_data(&bytes) {
+        validate_dimensions(width, height, &Limits::default())?;
+        let mut image = Image::from_rgba(
+            width,
+            height,
+            vec![0u8; width as usize * height as usize * 4],
+        )?;
+        image.has_alpha = true;
+        image.format = Format::Gif;
+        return Ok(image);
     }
     Err(FastpkgError::Decode("image/gif: unreadable data".into()))
 }
 
-fn webp_riff_truncated(bytes: &[u8]) -> bool {
-    bytes.len() >= 12
-        && &bytes[..4] == b"RIFF"
-        && &bytes[8..12] == b"WEBP"
-        && (u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as u64 + 8)
-            > bytes.len() as u64
+/// The file reduced to its first frame with the LZW data re-encoded from the pixels that
+/// decoded cleanly, provided those cover the whole frame.
+fn gif_reencode_first_frame(bytes: &[u8]) -> Option<Vec<u8>> {
+    let (start, width, height) = header::gif_first_frame(bytes)?;
+    let code_size = *bytes.get(start)?;
+    if !(2..=8).contains(&code_size) {
+        return None;
+    }
+    let mut data = Vec::new();
+    let mut at = start + 1;
+    while let Some(&size) = bytes.get(at) {
+        if size == 0 {
+            break;
+        }
+        data.extend_from_slice(bytes.get(at + 1..(at + 1 + size as usize).min(bytes.len()))?);
+        at += 1 + size as usize;
+    }
+    let need = width as usize * height as usize;
+    if need == 0 || need > Limits::default().max_pixels as usize {
+        return None;
+    }
+    let mut decoder = weezl::decode::Decoder::new(weezl::BitOrder::Lsb, code_size);
+    let mut pixels = vec![0u8; need];
+    let (mut input, mut filled) = (&data[..], 0usize);
+    while filled < need {
+        let step = decoder.decode_bytes(input, &mut pixels[filled..]);
+        input = &input[step.consumed_in..];
+        filled += step.consumed_out;
+        if step.status.is_err() || (step.consumed_in == 0 && step.consumed_out == 0) {
+            break;
+        }
+    }
+    if filled < need {
+        return None;
+    }
+    let packed = weezl::encode::Encoder::new(weezl::BitOrder::Lsb, code_size)
+        .encode(&pixels)
+        .ok()?;
+    let mut out = bytes[..start + 1].to_vec();
+    for block in packed.chunks(255) {
+        out.push(block.len() as u8);
+        out.extend_from_slice(block);
+    }
+    out.extend_from_slice(&[0, 0x3b]);
+    Some(out)
 }
 
-// Warnings libjpeg raised while decoding on this thread: (truncation, anything else).
+// Warnings libjpeg raised while decoding on this thread: (truncation, anything else), and the
+// message of the fatal error that aborted the decode, if any.
 thread_local! {
     static JPEG_WARNINGS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+    static JPEG_FATAL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn jpeg_message(cinfo: &mut mozjpeg_sys::jpeg_common_struct) -> Option<String> {
+    let format = unsafe { cinfo.err.as_ref() }.and_then(|err| err.format_message)?;
+    let mut buffer = [0u8; 80];
+    // libjpeg writes the message into the buffer; the sys crate declares it as `&[u8; 80]`.
+    let write: unsafe extern "C-unwind" fn(&mut mozjpeg_sys::jpeg_common_struct, &mut [u8; 80]) =
+        unsafe { std::mem::transmute(format) };
+    unsafe { write(cinfo, &mut buffer) };
+    Some(String::from_utf8_lossy(buffer.split(|&b| b == 0).next().unwrap_or_default()).into_owned())
 }
 
 unsafe extern "C-unwind" fn jpeg_collect_warning(
@@ -583,25 +687,16 @@ unsafe extern "C-unwind" fn jpeg_collect_warning(
     if level >= 0 {
         return; // trace messages
     }
-    let mut truncated = false;
-    if let Some(format) = unsafe { cinfo.err.as_ref() }.and_then(|err| err.format_message) {
-        let mut buffer = [0u8; 80];
-        // libjpeg writes the message into the buffer; the sys crate declares it as `&[u8; 80]`.
-        let write: unsafe extern "C-unwind" fn(
-            &mut mozjpeg_sys::jpeg_common_struct,
-            &mut [u8; 80],
-        ) = unsafe { std::mem::transmute(format) };
-        unsafe { write(cinfo, &mut buffer) };
-        let text = String::from_utf8_lossy(buffer.split(|&b| b == 0).next().unwrap_or_default());
-        truncated = text.contains("Premature end");
-    }
+    let truncated = jpeg_message(cinfo).is_some_and(|text| text.contains("Premature end"));
     JPEG_WARNINGS.with(|counts| {
         let (a, b) = counts.get();
         counts.set(if truncated { (a + 1, b) } else { (a, b + 1) });
     });
 }
 
-unsafe extern "C-unwind" fn jpeg_unwind(_cinfo: &mut mozjpeg_sys::jpeg_common_struct) {
+unsafe extern "C-unwind" fn jpeg_unwind(cinfo: &mut mozjpeg_sys::jpeg_common_struct) {
+    let text = jpeg_message(cinfo).unwrap_or_default();
+    JPEG_FATAL.with(|fatal| *fatal.borrow_mut() = Some(text));
     std::panic::resume_unwind(Box::new("libjpeg fatal error"));
 }
 
@@ -656,6 +751,7 @@ fn decode_jpeg_mozjpeg(
     ignore_icc: bool,
 ) -> Result<Option<Image>> {
     JPEG_WARNINGS.with(|counts| counts.set((0, 0)));
+    JPEG_FATAL.with(|fatal| fatal.borrow_mut().take());
     let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut decompress = mozjpeg::decompress::DecompressBuilder::new()
             .with_err(jpeg_error_manager())
@@ -714,7 +810,14 @@ fn decode_jpeg_mozjpeg(
     .ok()
     .flatten();
     let Some(image) = decoded else {
-        return Ok(None);
+        // A fatal libjpeg error is a damaged file, whatever `failOn` says; an unsupported
+        // colour conversion (CMYK and friends) is left to the fallback decoder.
+        return match JPEG_FATAL.with(|fatal| fatal.borrow_mut().take()) {
+            Some(text) if !text.contains("onversion") => {
+                Err(FastpkgError::Decode(format!("VipsJpeg: {text}")))
+            }
+            _ => Ok(None),
+        };
     };
     let (truncated, other) = JPEG_WARNINGS.with(|counts| counts.get());
     if fail_on != "none" && (truncated > 0 || (other > 0 && fail_on == "warning")) {
@@ -963,15 +1066,21 @@ fn read_png_rows<T: PngSample>(
 /// analogue of JPEG DCT scaling). `fastShrinkOnLoad` does not apply: libvips never shrinks PNG
 /// on load, so the resampler always keeps `PNG_SHRINK_HEADROOM` times the target. Interlaced
 /// files need the whole frame to de-interlace and use the buffered decoder.
-fn decode_png(bytes: &[u8], lenient: bool, hint: Option<(u32, u32)>) -> Result<Image> {
-    let mut decoder = png::Decoder::new(Cursor::new(bytes));
-    decoder.set_transformations(png::Transformations::EXPAND);
-    let mut reader = decoder
+fn decode_png_stream(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> Result<Image> {
+    let lenient = fail_on == "none";
+    if !png_chunk_headers_valid(bytes) {
+        return Err(FastpkgError::Decode("PNG: invalid chunk header".into()));
+    }
+    let mut reader = png_decoder(bytes, fail_on)
         .read_info()
         .map_err(|e| FastpkgError::Decode(e.to_string()))?;
+    // libpng refuses a palette image without PLTE up front, even when it is told to be lenient.
+    if reader.info().color_type == png::ColorType::Indexed && reader.info().palette.is_none() {
+        return Err(FastpkgError::Decode("PNG: missing PLTE chunk".into()));
+    }
     let (color, depth) = reader.output_color_type();
     if reader.info().interlaced || color == png::ColorType::Indexed {
-        return decode_png_buffered(bytes, lenient);
+        return decode_png_buffered(bytes, fail_on);
     }
     let (width, height) = reader.info().size();
     let factor = hint.map_or(1, |hint| {
@@ -1001,14 +1110,206 @@ fn decode_png(bytes: &[u8], lenient: bool, hint: Option<(u32, u32)>) -> Result<I
     Ok(image)
 }
 
-/// Whole-frame PNG decode (interlaced files). With `lenient` (`failOn: 'none'`) a PNG whose
-/// data stream breaks yields the rows decoded so far; the rest stays zero, as in libvips.
-fn decode_png_buffered(bytes: &[u8], lenient: bool) -> Result<Image> {
-    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+/// Decoder configured like libpng under libvips: chunk CRCs are only enforced from
+/// `failOn: 'error'` up, zlib checksums from `'truncated'` up.
+fn png_decoder<'a>(bytes: &'a [u8], fail_on: &str) -> png::Decoder<Cursor<&'a [u8]>> {
+    let mut options = png::DecodeOptions::default();
+    options.set_ignore_crc(matches!(fail_on, "none" | "truncated"));
+    options.set_ignore_adler32(fail_on == "none");
+    let mut decoder = png::Decoder::new_with_options(Cursor::new(bytes), options);
     decoder.set_transformations(png::Transformations::EXPAND);
+    decoder
+}
+
+/// libpng refuses a chunk whose type is not four ASCII letters or whose length exceeds 2^31 - 1
+/// while it reads the header chunks and the IDAT run, whatever `failOn` says.
+fn png_chunk_headers_valid(bytes: &[u8]) -> bool {
+    let mut pos = 8usize;
+    let mut seen_idat = false;
+    while pos + 12 <= bytes.len() {
+        let kind = &bytes[pos + 4..pos + 8];
+        let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]);
+        if !kind.iter().all(u8::is_ascii_alphabetic) || len > 0x7fff_ffff {
+            return false;
+        }
+        if kind == b"IDAT" {
+            seen_idat = true;
+        } else if seen_idat {
+            break;
+        }
+        match pos
+            .checked_add(12)
+            .and_then(|p| p.checked_add(len as usize))
+        {
+            Some(next) => pos = next,
+            None => break,
+        }
+    }
+    true
+}
+
+/// End offset of the last complete IDAT chunk when the data before it parses as a chunk list.
+fn png_idat_end(bytes: &[u8]) -> Option<usize> {
+    let mut pos = 8;
+    let mut end = None;
+    while pos + 12 <= bytes.len() {
+        let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+            as usize;
+        let next = pos.checked_add(12)?.checked_add(len)?;
+        if next > bytes.len() {
+            break;
+        }
+        match &bytes[pos + 4..pos + 8] {
+            b"IDAT" => end = Some(next),
+            b"IEND" => break,
+            _ if end.is_some() => break,
+            _ => {}
+        }
+        pos = next;
+    }
+    end
+}
+
+/// Size of the filtered raster (filter bytes included) a PNG header describes.
+fn png_raster_size(info: &png::Info) -> u64 {
+    let bits = u64::from(info.bit_depth as u8) * info.color_type.samples() as u64;
+    let pass = |width: u64, height: u64| match (width, height) {
+        (0, _) | (_, 0) => 0,
+        _ => height * (1 + (width * bits).div_ceil(8)),
+    };
+    let (width, height) = (u64::from(info.width), u64::from(info.height));
+    if !info.interlaced {
+        return pass(width, height);
+    }
+    const PASSES: [(u64, u64, u64, u64); 7] = [
+        (0, 0, 8, 8),
+        (4, 0, 8, 8),
+        (0, 4, 4, 8),
+        (2, 0, 4, 4),
+        (0, 2, 2, 4),
+        (1, 0, 2, 2),
+        (0, 1, 1, 2),
+    ];
+    PASSES
+        .iter()
+        .map(|&(x0, y0, dx, dy)| {
+            pass(
+                width.saturating_sub(x0).div_ceil(dx),
+                height.saturating_sub(y0).div_ceil(dy),
+            )
+        })
+        .sum()
+}
+
+/// Whether the zlib stream spread over the IDAT run ends properly (final block, checksum): the
+/// decoder stops after the last row and never notices a stream that was cut short. A stream
+/// that breaks once the raster is complete is let through: libpng has stopped inflating by then
+/// and treats the error as benign (a bad checksum right at the end is not).
+fn png_zlib_complete(bytes: &[u8], raster: u64) -> bool {
+    let mut inflate = flate2::Decompress::new(true);
+    let mut sink = vec![0u8; 1 << 16];
+    let mut pos = 8usize;
+    let mut seen = false;
+    while pos + 12 <= bytes.len() {
+        let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+            as usize;
+        let is_idat = &bytes[pos + 4..pos + 8] == b"IDAT";
+        if seen && !is_idat {
+            break;
+        }
+        if is_idat {
+            seen = true;
+            let end = pos.saturating_add(8).saturating_add(len).min(bytes.len());
+            let mut input = &bytes[pos + 8..end];
+            loop {
+                let (before_in, before_out) = (inflate.total_in(), inflate.total_out());
+                match inflate.decompress(input, &mut sink, flate2::FlushDecompress::None) {
+                    Ok(flate2::Status::StreamEnd) => return true,
+                    Ok(_) => {}
+                    Err(error) => {
+                        let total = inflate.total_out();
+                        let checksum = error.message() == Some("incorrect data check");
+                        return total > raster || (total == raster && !checksum);
+                    }
+                }
+                input = &input[(inflate.total_in() - before_in) as usize..];
+                if inflate.total_in() == before_in && inflate.total_out() == before_out {
+                    break;
+                }
+            }
+        }
+        match pos.checked_add(12).and_then(|p| p.checked_add(len)) {
+            Some(next) => pos = next,
+            None => break,
+        }
+    }
+    false
+}
+
+/// libpng stops once the last row is read, so a missing or damaged tail (IEND, trailing chunks)
+/// is not an error: a failed decode is retried with the data cut after the IDAT run and a
+/// synthetic IEND appended.
+fn decode_png(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> Result<Image> {
+    match decode_png_once(bytes, fail_on, hint) {
+        Err(error) => {
+            if let Some(end) = png_idat_end(bytes) {
+                let mut cut = bytes[..end].to_vec();
+                cut.extend_from_slice(&[
+                    0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+                ]);
+                if let Ok(image) = decode_png_once(&cut, fail_on, hint) {
+                    return Ok(image);
+                }
+            }
+            Err(error)
+        }
+        ok => ok,
+    }
+}
+
+/// Decodes the PNG while a second thread checks that its zlib stream is whole (the decoder
+/// stops after the last row), so the check does not add to the wall time of large files.
+fn decode_png_once(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> Result<Image> {
+    // Interlaced files are read whole by libvips, so there a short stream is fatal at any level.
+    let raster = png_decoder(bytes, fail_on)
+        .read_info()
+        .ok()
+        .filter(|reader| fail_on != "none" || reader.info().interlaced)
+        .map(|reader| png_raster_size(reader.info()));
+    let Some(raster) = raster else {
+        return decode_png_stream(bytes, fail_on, hint);
+    };
+    if bytes.len() < 1 << 18 {
+        return match png_zlib_complete(bytes, raster) {
+            true => decode_png_stream(bytes, fail_on, hint),
+            false => Err(FastpkgError::Decode("PNG: truncated zlib stream".into())),
+        };
+    }
+    std::thread::scope(|scope| {
+        let check = scope.spawn(|| png_zlib_complete(bytes, raster));
+        let decoded = decode_png_stream(bytes, fail_on, hint);
+        match check.join() {
+            Ok(false) => Err(FastpkgError::Decode("PNG: truncated zlib stream".into())),
+            _ => decoded,
+        }
+    })
+}
+
+/// With `failOn: 'none'` a PNG whose data stream breaks yields the rows decoded so far; the
+/// rest stays zero, as in libvips. Interlaced files are all-or-nothing.
+fn decode_png_buffered(bytes: &[u8], fail_on: &str) -> Result<Image> {
+    let lenient = fail_on == "none";
+    if !png_chunk_headers_valid(bytes) {
+        return Err(FastpkgError::Decode("PNG: invalid chunk header".into()));
+    }
+    let decoder = png_decoder(bytes, fail_on);
     let mut reader = decoder
         .read_info()
         .map_err(|e| FastpkgError::Decode(e.to_string()))?;
+    // libpng refuses a palette image without PLTE up front, even when it is told to be lenient.
+    if reader.info().color_type == png::ColorType::Indexed && reader.info().palette.is_none() {
+        return Err(FastpkgError::Decode("PNG: missing PLTE chunk".into()));
+    }
     let buffer_size = reader
         .output_buffer_size()
         .ok_or_else(|| FastpkgError::Decode("PNG output buffer is too large".into()))?;
@@ -1028,23 +1329,18 @@ fn decode_png_buffered(bytes: &[u8], lenient: bool) -> Result<Image> {
     let interlaced = reader.info().interlaced;
     let info = match reader.next_frame(&mut buffer) {
         Ok(info) => info,
-        Err(error) if lenient => {
+        Err(error) if lenient && !interlaced => {
             // Re-read row by row (a failed `next_frame` leaves the reader unusable).
             buffer.fill(0);
-            if !interlaced {
-                let mut decoder = png::Decoder::new(Cursor::new(bytes));
-                decoder.set_transformations(png::Transformations::EXPAND);
-                if let Ok(mut rows) = decoder.read_info() {
-                    for y in 0..out_height as usize {
-                        match rows.next_row() {
-                            Ok(Some(row)) => {
-                                let data = row.data();
-                                let len = data.len().min(out_line);
-                                buffer[y * out_line..y * out_line + len]
-                                    .copy_from_slice(&data[..len]);
-                            }
-                            _ => break,
+            if let Ok(mut rows) = png_decoder(bytes, fail_on).read_info() {
+                for y in 0..out_height as usize {
+                    match rows.next_row() {
+                        Ok(Some(row)) => {
+                            let data = row.data();
+                            let len = data.len().min(out_line);
+                            buffer[y * out_line..y * out_line + len].copy_from_slice(&data[..len]);
                         }
+                        _ => break,
                     }
                 }
             }
