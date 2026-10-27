@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { sharp } from './_util.mjs';
 import { W, H, encode, cases } from './_png-encode.mjs';
 import { writePng } from '../bench/png-fixtures.mjs';
@@ -16,7 +17,7 @@ import { writePng } from '../bench/png-fixtures.mjs';
 const linux = process.platform === 'linux';
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fastpkg-stream-resize-'));
 test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-const child = new URL('./_png-stream-resize-child.mjs', import.meta.url).pathname;
+const child = fileURLToPath(new URL('./_png-stream-resize-child.mjs', import.meta.url));
 const enginePath = new URL('../packages/image/index.js', import.meta.url).href;
 
 const ON = { FASTPKG_PNG_STREAM_MIN_BYTES: '0' };
@@ -202,7 +203,7 @@ function measure(file, pipeline, lib = 'engine') {
     const cpu = process.cpuUsage(cpu0);
     console.log(JSON.stringify({ length: out.length, ms: performance.now() - t0, cpuMs: (cpu.user + cpu.system) / 1000, rss: Number(/VmHWM:\\s+(\\d+)/.exec(fs.readFileSync('/proc/self/status', 'utf8'))[1]) / 1024 }));
   `;
-  const out = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', cwd: path.dirname(new URL(import.meta.url).pathname), maxBuffer: 1 << 26 });
+  const out = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', cwd: path.dirname(fileURLToPath(import.meta.url)), maxBuffer: 1 << 26 });
   assert.equal(out.status, 0, out.stderr);
   return JSON.parse(out.stdout);
 }
