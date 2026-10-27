@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use fastpkg_codecs::{decode, decode_with_hint, encode, output_is_16, probe};
+use fastpkg_codecs::{decode, decode_with_hint, encode, output_is_16, probe, ShrinkHint};
 use fastpkg_core::options::Operation;
 use fastpkg_core::{
     FastpkgError, Format, HeaderInfo, Image, OutputInfo, PipelineSpec, Result, Stats,
@@ -124,10 +124,18 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
         header.orientation
     };
     let mut leading = 0;
+    // sharp does not shrink on load when the pixels are turned or flipped before the resize
+    // (`rotateBefore`); the decode hint still looks through such operations here, and the
+    // output size is then derived from the full-resolution dimensions like sharp does.
+    let mut moved_before_resize = false;
     for op in &spec.operations {
         let Some(swap) = fastpkg_ops::geometry_swaps_axes(op, orientation) else {
             break;
         };
+        moved_before_resize |= matches!(
+            op,
+            Operation::Rotate { .. } | Operation::Flip { .. } | Operation::Flop { .. }
+        );
         swaps_axes ^= swap;
         if matches!(op, Operation::AutoOrient) {
             orientation = None;
@@ -158,8 +166,21 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
                 *without_enlargement,
                 *without_reduction,
             );
-            let hint = if swaps_axes { (th, tw) } else { (tw, th) };
-            (Some(hint), *fast_shrink_on_load)
+            let (xf, yf) = fastpkg_core::pipeline::resolve_shrink(
+                oriented_width,
+                oriented_height,
+                *width,
+                *height,
+                *fit,
+                *without_enlargement,
+                *without_reduction,
+            );
+            // sharp never lets an axis shrink to nothing.
+            let shrink = xf
+                .min(oriented_width as f64)
+                .min(yf.min(oriented_height as f64));
+            let target = if swaps_axes { (th, tw) } else { (tw, th) };
+            (Some(ShrinkHint { target, shrink }), *fast_shrink_on_load)
         }
         _ => (None, false),
     };
@@ -173,6 +194,12 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
     input.ignore_icc |= keeps_input_icc;
     let mut image = decode_with_hint(bytes, header.format, &input, hint, fast_shrink)?;
     check_deadline(deadline)?;
+    if image.format == Format::Jpeg && !moved_before_resize && !fastpkg_codecs::jpeg_rule_eighths()
+    {
+        // sharp sizes the resize from the shrunk image it decoded (libjpeg rounds the
+        // dimensions up), not from the original; forget the original size to do the same.
+        image.pre_shrink = None;
+    }
 
     let keep_metadata = spec.output.keep_metadata
         || spec.output.keep_exif

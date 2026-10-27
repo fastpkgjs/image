@@ -457,10 +457,8 @@ fn resize(
     without_reduction: bool,
     defer_canvas: bool,
 ) -> Result<Image> {
-    let (source_width, source_height) = image
-        .pre_shrink
-        .take()
-        .unwrap_or((image.width, image.height));
+    let shrunk = image.pre_shrink.take();
+    let (source_width, source_height) = shrunk.unwrap_or((image.width, image.height));
     if width.is_none() && height.is_none() {
         return Ok(image);
     }
@@ -473,7 +471,22 @@ fn resize(
         without_enlargement,
         without_reduction,
     );
-    let resized = resize_plain(image, rw, rh, kernel)?;
+    // libvips resamples with the shrink factors themselves, not with the ratio of the rounded
+    // input and output sizes, so an output size that was rounded moves the sampling grid of
+    // the axis it was derived for by up to half a pixel across the image. Only a resize that
+    // starts from the pixels it was sized for can reproduce that.
+    let scales = shrunk.is_none().then(|| {
+        fastpkg_core::pipeline::resolve_shrink(
+            source_width,
+            source_height,
+            width,
+            height,
+            fit,
+            without_enlargement,
+            without_reduction,
+        )
+    });
+    let resized = resize_plain(image, rw, rh, kernel, scales)?;
     if defer_canvas {
         return Ok(resized);
     }
@@ -563,18 +576,95 @@ fn finish_canvas(
     }
 }
 
-fn resize_plain(image: Image, width: u32, height: u32, kernel: Kernel) -> Result<Image> {
+fn resize_plain(
+    image: Image,
+    width: u32,
+    height: u32,
+    kernel: Kernel,
+    scales: Option<(f64, f64)>,
+) -> Result<Image> {
     if width == image.width && height == image.height {
         return Ok(image);
     }
     let source_has_alpha = image.has_alpha;
-    let mut out = resize_raw(image, width, height, kernel)?;
+    let mut out = resize_raw_opts(image, width, height, kernel, scales)?;
     out.has_alpha = source_has_alpha || out.has_transparency();
     Ok(out)
 }
 
-fn resize_raw(image: Image, width: u32, height: u32, kernel: Kernel) -> Result<Image> {
-    resize_raw_opts(image, width, height, kernel, None)
+/// The part of the source a resize with explicit shrink factors samples. libvips resamples
+/// with the shrink factors themselves, so an output size that was rounded leaves
+/// `out * shrink - in` pixels over or short, which it spreads evenly over both sides of each
+/// axis: the sampled region is `out * shrink` wide and centred on the source, and runs past the
+/// edges (repeating the last row or column) when the output size was rounded up. The region is
+/// given in the coordinates of the padded source, whose size is `canvas`. `None` when the region
+/// is the whole source anyway.
+struct SampledRegion {
+    pad: (u32, u32),
+    canvas: (u32, u32),
+    /// Left, top, width and height of the region on the canvas.
+    crop: [f64; 4],
+}
+
+fn sampled_region(
+    source: (u32, u32),
+    output: (u32, u32),
+    scales: Option<(f64, f64)>,
+) -> Option<SampledRegion> {
+    let (sx, sy) = scales?;
+    // A factor below one is an enlargement, which libvips does with another interpolator.
+    if sx < 1.0 || sy < 1.0 {
+        return None;
+    }
+    let snap = |v: f64| {
+        let r = v.round();
+        if (v - r).abs() < 1e-6 {
+            r
+        } else {
+            v
+        }
+    };
+    let span = (snap(output.0 as f64 * sx), snap(output.1 as f64 * sy));
+    if span == (source.0 as f64, source.1 as f64) {
+        return None;
+    }
+    // Pixels to add on each side so that the region (centred on the source) fits.
+    let pad = |span: f64, source: u32| (((span - source as f64) / 2.0).ceil().max(0.0)) as u32;
+    let pad = (pad(span.0, source.0), pad(span.1, source.1));
+    let canvas = (source.0 + 2 * pad.0, source.1 + 2 * pad.1);
+    let left = pad.0 as f64 + snap((source.0 as f64 - span.0) / 2.0);
+    let top = pad.1 as f64 + snap((source.1 as f64 - span.1) / 2.0);
+    Some(SampledRegion {
+        pad,
+        canvas,
+        crop: [left, top, span.0, span.1],
+    })
+}
+
+/// `data` (`width` x `height` pixels of four samples) on a larger canvas, `pad` pixels bigger on
+/// each side horizontally and vertically, whose extra columns and rows repeat the edge ones.
+fn pad_replicate<T: Copy + Send + Sync>(
+    data: &[T],
+    (width, height): (usize, usize),
+    (pad_x, pad_y): (usize, usize),
+) -> Vec<T> {
+    let new_width = width + 2 * pad_x;
+    let new_height = height + 2 * pad_y;
+    let mut out = vec![data[0]; new_width * new_height * 4];
+    out.par_chunks_mut(new_width * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let src = &data[y.saturating_sub(pad_y).min(height - 1) * width * 4..][..width * 4];
+            row[pad_x * 4..(pad_x + width) * 4].copy_from_slice(src);
+            let (left, right) = (&src[..4], &src[(width - 1) * 4..]);
+            for px in row[..pad_x * 4].chunks_exact_mut(4) {
+                px.copy_from_slice(left);
+            }
+            for px in row[(pad_x + width) * 4..].chunks_exact_mut(4) {
+                px.copy_from_slice(right);
+            }
+        });
+    out
 }
 
 fn resize_raw_opts(
@@ -582,23 +672,30 @@ fn resize_raw_opts(
     width: u32,
     height: u32,
     kernel: Kernel,
-    centering: Option<(f64, f64)>,
+    scales: Option<(f64, f64)>,
 ) -> Result<Image> {
+    let region = sampled_region((image.width, image.height), (width, height), scales);
     if image.has_wide() {
-        return resize_raw_wide(image, width, height, kernel, centering);
+        return resize_raw_wide(image, width, height, kernel, region);
     }
-    let src = FirImage::from_vec_u8(
-        image.width,
-        image.height,
-        std::mem::take(&mut image.data),
-        PixelType::U8x4,
-    )
-    .map_err(|e| FastpkgError::Operation(e.to_string()))?;
-    let mut dst = FirImage::new(width, height, PixelType::U8x4);
+    let mut data = std::mem::take(&mut image.data);
     let mut options = resize_options(kernel, image.has_alpha);
-    if let Some(centering) = centering {
-        options = options.fit_into_destination(Some(centering));
+    let (mut src_width, mut src_height) = (image.width, image.height);
+    if let Some(region) = &region {
+        if region.pad != (0, 0) {
+            data = pad_replicate(
+                &data,
+                (src_width as usize, src_height as usize),
+                (region.pad.0 as usize, region.pad.1 as usize),
+            );
+        }
+        (src_width, src_height) = region.canvas;
+        let [left, top, w, h] = region.crop;
+        options = options.crop(left, top, w, h);
     }
+    let src = FirImage::from_vec_u8(src_width, src_height, data, PixelType::U8x4)
+        .map_err(|e| FastpkgError::Operation(e.to_string()))?;
+    let mut dst = FirImage::new(width, height, PixelType::U8x4);
     Resizer::new()
         .resize(&src, &mut dst, Some(&options))
         .map_err(|e| FastpkgError::Operation(e.to_string()))?;
@@ -613,20 +710,30 @@ fn resize_raw_wide(
     width: u32,
     height: u32,
     kernel: Kernel,
-    centering: Option<(f64, f64)>,
+    region: Option<SampledRegion>,
 ) -> Result<Image> {
-    let wide = image.to_rgba16();
+    let mut wide = image.to_rgba16();
+    let mut options = resize_options(kernel, image.has_alpha);
+    let (mut src_width, mut src_height) = (image.width, image.height);
+    if let Some(region) = &region {
+        if region.pad != (0, 0) {
+            wide = pad_replicate(
+                &wide,
+                (src_width as usize, src_height as usize),
+                (region.pad.0 as usize, region.pad.1 as usize),
+            );
+        }
+        (src_width, src_height) = region.canvas;
+        let [left, top, w, h] = region.crop;
+        options = options.crop(left, top, w, h);
+    }
     let pixels = wide
         .chunks_exact(4)
         .map(|px| U16x4::new([px[0], px[1], px[2], px[3]]))
         .collect::<Vec<_>>();
-    let src = TypedImage::from_pixels(image.width, image.height, pixels)
+    let src = TypedImage::from_pixels(src_width, src_height, pixels)
         .map_err(|e| FastpkgError::Operation(e.to_string()))?;
     let mut dst = TypedImage::<U16x4>::new(width, height);
-    let mut options = resize_options(kernel, image.has_alpha);
-    if let Some(centering) = centering {
-        options = options.fit_into_destination(Some(centering));
-    }
     Resizer::new()
         .resize_typed(&src, &mut dst, Some(&options))
         .map_err(|e| FastpkgError::Operation(e.to_string()))?;

@@ -67,13 +67,12 @@ fn validate_operation(op: &Operation) -> Result<()> {
     Ok(())
 }
 
-/// Size the source is resampled to before any `cover` crop or `contain` padding.
-///
-/// Mirrors sharp/libvips: per-axis shrink factors are derived from the fit, then
-/// `withoutReduction` clamps each factor to at most 1 and `withoutEnlargement` to at least 1.
-/// When both flags are given only `withoutReduction` applies. `fill` with a single
-/// dimension keeps the source size on the other axis.
-pub fn compute_target(
+/// Per-axis shrink factors (source size over resampled size) of a resize, before any `cover`
+/// crop or `contain` padding. Mirrors sharp's `ResolveShrink`: the factors are derived from the
+/// fit, then `withoutReduction` clamps each to at most 1 and `withoutEnlargement` to at least 1
+/// (when both flags are given only `withoutReduction` applies). `fill` with a single dimension
+/// keeps the other axis.
+pub fn resolve_shrink(
     width: u32,
     height: u32,
     target_width: Option<u32>,
@@ -81,7 +80,7 @@ pub fn compute_target(
     fit: Fit,
     without_enlargement: bool,
     without_reduction: bool,
-) -> (u32, u32) {
+) -> (f64, f64) {
     let (iw, ih) = (width.max(1) as f64, height.max(1) as f64);
     let fill = fit == Fit::Fill;
     let (mut xf, mut yf) = (1.0f64, 1.0f64);
@@ -124,9 +123,32 @@ pub fn compute_target(
         xf = xf.max(1.0);
         yf = yf.max(1.0);
     }
+    (xf, yf)
+}
+
+/// Size the source is resampled to before any `cover` crop or `contain` padding (see
+/// [`resolve_shrink`]).
+pub fn compute_target(
+    width: u32,
+    height: u32,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+    fit: Fit,
+    without_enlargement: bool,
+    without_reduction: bool,
+) -> (u32, u32) {
+    let (xf, yf) = resolve_shrink(
+        width,
+        height,
+        target_width,
+        target_height,
+        fit,
+        without_enlargement,
+        without_reduction,
+    );
     (
-        ((iw / xf).round() as u32).max(1),
-        ((ih / yf).round() as u32).max(1),
+        ((width.max(1) as f64 / xf).round() as u32).max(1),
+        ((height.max(1) as f64 / yf).round() as u32).max(1),
     )
 }
 

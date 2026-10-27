@@ -283,7 +283,7 @@ pub fn decode_with_hint(
     bytes: &[u8],
     format: Format,
     input: &InputOptions,
-    hint: Option<(u32, u32)>,
+    hint: Option<ShrinkHint>,
     fast_shrink: bool,
 ) -> Result<Image> {
     let mut image = decode_with_hint_inner(bytes, format, input, hint, fast_shrink)?;
@@ -297,7 +297,7 @@ fn decode_with_hint_inner(
     bytes: &[u8],
     format: Format,
     input: &InputOptions,
-    hint: Option<(u32, u32)>,
+    hint: Option<ShrinkHint>,
     fast_shrink: bool,
 ) -> Result<Image> {
     if let Some(raw) = &input.raw {
@@ -326,7 +326,7 @@ fn decode_with_hint_inner(
         Format::Avif => decode_avif(bytes)?,
         Format::Jxl => decode_jxl(bytes)?,
         Format::Svg => svg::decode(bytes, input.density)?,
-        Format::Png => decode_png(bytes, &input.fail_on, hint)?,
+        Format::Png => decode_png(bytes, &input.fail_on, hint.map(|hint| hint.target))?,
         Format::Jpeg => decode_jpeg_scaled(bytes, hint, fast_shrink, input)?,
         Format::Webp => {
             // libvips opens WebP through the demuxer, which rejects a damaged container
@@ -388,7 +388,7 @@ fn source_is_gray(bytes: &[u8], format: Format) -> bool {
 fn decode_webp(
     bytes: &[u8],
     input: &InputOptions,
-    hint: Option<(u32, u32)>,
+    hint: Option<ShrinkHint>,
     fast_shrink: bool,
 ) -> Result<Image> {
     let max_pixels = if input.unlimited {
@@ -398,7 +398,7 @@ fn decode_webp(
     };
     // Keep 2x headroom for the resampler unless `fastShrinkOnLoad` allows decoding straight to
     // the target size.
-    let scale_to = hint.map(|(w, h)| {
+    let scale_to = hint.map(|ShrinkHint { target: (w, h), .. }| {
         let headroom = if fast_shrink { 1 } else { 2 };
         (w.saturating_mul(headroom), h.saturating_mul(headroom))
     });
@@ -712,7 +712,7 @@ fn jpeg_error_manager() -> mozjpeg_sys::jpeg_error_mgr {
 
 fn decode_jpeg_scaled(
     bytes: &[u8],
-    hint: Option<(u32, u32)>,
+    hint: Option<ShrinkHint>,
     fast_shrink: bool,
     input: &InputOptions,
 ) -> Result<Image> {
@@ -724,6 +724,45 @@ fn decode_jpeg_scaled(
     let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
         .map_err(|e| FastpkgError::Decode(e.to_string()))?;
     dynamic_to_image(image, Format::Jpeg)
+}
+
+/// What a shrink-on-load decode needs to know about the resize that follows it.
+#[derive(Clone, Copy, Debug)]
+pub struct ShrinkHint {
+    /// Size of the first resample's output, in decoder space (axes swapped when a quarter turn
+    /// comes first).
+    pub target: (u32, u32),
+    /// sharp's common shrink factor for that resample: the smaller of the two axis factors,
+    /// source size over output size.
+    pub shrink: f64,
+}
+
+/// libjpeg DCT scale denominator (the decoder output is `1/d` of the source) that sharp picks
+/// for a JPEG that is going to be shrunk by `shrink`: only 1, 2, 4 or 8, the largest that
+/// still leaves the resampler a factor of one (`fast_shrink`) or two (otherwise), lowered once
+/// more when it equals the integer part of `shrink` (libvips' guard against libjpeg rounding
+/// errors). The same rule as `pipeline.cc` in sharp, so that what remains for the resampler
+/// is the same residual as in libvips.
+pub fn jpeg_scale_denominator(shrink: f64, fast_shrink: bool) -> u8 {
+    let factor = if fast_shrink { 1.0 } else { 2.0 };
+    let mut denominator = if shrink >= 8.0 * factor {
+        8
+    } else if shrink >= 4.0 * factor {
+        4
+    } else if shrink >= 2.0 * factor {
+        2
+    } else {
+        1
+    };
+    if denominator > 1 && shrink as u32 == denominator as u32 {
+        denominator /= 2;
+    }
+    denominator
+}
+
+pub fn jpeg_rule_eighths() -> bool {
+    static EIGHTHS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EIGHTHS.get_or_init(|| std::env::var("FASTPKG_JPEG_RULE").is_ok_and(|rule| rule == "eighths"))
 }
 
 /// Smallest DCT scale numerator `n` (output is `n/8` of the source) whose
@@ -745,7 +784,7 @@ pub fn jpeg_scale_numerator(source: (u32, u32), target: (u32, u32), headroom: u3
 /// `failOn` violation: truncated data always, other warnings only for `failOn: 'warning'`.
 fn decode_jpeg_mozjpeg(
     bytes: &[u8],
-    hint: Option<(u32, u32)>,
+    hint: Option<ShrinkHint>,
     fast_shrink: bool,
     fail_on: &str,
     ignore_icc: bool,
@@ -763,11 +802,15 @@ fn decode_jpeg_mozjpeg(
             return None;
         }
         if let Some(hint) = hint {
-            let scale = jpeg_scale_numerator(
-                (source_width, source_height),
-                hint,
-                if fast_shrink { 1 } else { 2 },
-            );
+            let scale = if jpeg_rule_eighths() {
+                jpeg_scale_numerator(
+                    (source_width, source_height),
+                    hint.target,
+                    if fast_shrink { 1 } else { 2 },
+                )
+            } else {
+                8 / jpeg_scale_denominator(hint.shrink, fast_shrink)
+            };
             decompress.scale(scale);
         }
         let cmyk = matches!(
