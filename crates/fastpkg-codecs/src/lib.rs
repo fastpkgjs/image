@@ -814,7 +814,7 @@ pub fn decode_footprint(
             }
         }
         // The decoders keep planes or float samples next to the RGBA result.
-        Format::Avif => bytes_per_pixel = 16,
+        Format::Avif => bytes_per_pixel = 8,
         Format::Jxl => bytes_per_pixel = 20,
         Format::Svg => bytes_per_pixel = 8,
         _ => {}

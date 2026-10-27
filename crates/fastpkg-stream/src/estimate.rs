@@ -26,8 +26,8 @@ const DECODE_PERCENT: u64 = 125;
 /// A pipeline step that is not in place copies or widens the frame: how many frames it holds.
 const COPYING_OP_FRAMES: u64 = 3;
 
-/// Linear-light and other pipeline colourspaces work on float samples.
-const COLOURSPACE_FRAMES: u64 = 4;
+/// A pipeline colourspace (linear light and the like) converts the frames it works on: percent.
+const COLOURSPACE_PERCENT: u64 = 150;
 
 /// Bytes of encoder working memory per pixel, on top of the frame that is being encoded.
 fn encoder_bytes_per_pixel(format: Format) -> u64 {
@@ -116,11 +116,12 @@ pub fn estimate_header(header: &HeaderInfo, spec: &PipelineSpec, encodes: bool) 
     // Bytes per pixel of the frame between the operations: 8-bit RGBA, or 16-bit samples.
     let frame_bpp: u64 = if header.depth == "ushort" { 8 } else { 4 };
     let pixels = |size: (u32, u32)| u64::from(size.0) * u64::from(size.1) * frames;
-    let float_frames = if spec.pipeline_colourspace.is_some() {
-        COLOURSPACE_FRAMES
+    let colourspace_percent = if spec.pipeline_colourspace.is_some() {
+        COLOURSPACE_PERCENT
     } else {
-        1
+        100
     };
+    let scaled = |bytes: u64| bytes * colourspace_percent / 100;
 
     let mut peak = pixels(footprint.size) * footprint.bytes_per_pixel * DECODE_PERCENT / 100
         + footprint.extra;
@@ -143,7 +144,7 @@ pub fn estimate_header(header: &HeaderInfo, spec: &PipelineSpec, encodes: bool) 
             // The first pass makes a frame as wide as the output and as tall as the input.
             let middle = pixels((resized.0, held.1)).min(pixels((held.0, resized.1))) * frame_bpp;
             let output = pixels(resized) * frame_bpp;
-            peak = peak.max((source + middle + output) * float_frames);
+            peak = peak.max(scaled(source + middle + output));
             logical = canvas;
             held = canvas;
             continue;
@@ -171,7 +172,7 @@ pub fn estimate_header(header: &HeaderInfo, spec: &PipelineSpec, encodes: bool) 
                     grown(held.1, *height, *top, *bottom),
                 );
                 logical = held;
-                peak = peak.max((frame + pixels(held) * frame_bpp) * float_frames);
+                peak = peak.max(scaled(frame + pixels(held) * frame_bpp));
             }
             Operation::Rotate { angle, .. } => {
                 let turns = angle / 90.0;
@@ -190,7 +191,7 @@ pub fn estimate_header(header: &HeaderInfo, spec: &PipelineSpec, encodes: bool) 
                     );
                     held = rotated;
                     logical = rotated;
-                    peak = peak.max((frame + pixels(held) * frame_bpp) * float_frames);
+                    peak = peak.max(scaled(frame + pixels(held) * frame_bpp));
                 }
             }
             Operation::Composite { input, source, .. } => {
@@ -201,7 +202,7 @@ pub fn estimate_header(header: &HeaderInfo, spec: &PipelineSpec, encodes: bool) 
                 } else {
                     (input.len() as u64 * 6).min(frame * 4)
                 };
-                peak = peak.max((frame * 2 + overlay) * float_frames);
+                peak = peak.max(scaled(frame * 2 + overlay));
             }
             Operation::AutoOrient
             | Operation::Flip { .. }
@@ -219,19 +220,25 @@ pub fn estimate_header(header: &HeaderInfo, spec: &PipelineSpec, encodes: bool) 
             | Operation::Solarize { .. }
             | Operation::RemoveAlpha
             | Operation::EnsureAlpha { .. } => {}
-            _ => peak = peak.max(frame * COPYING_OP_FRAMES * float_frames),
+            _ => peak = peak.max(scaled(frame * COPYING_OP_FRAMES)),
         }
     }
 
     if !encodes {
         return peak;
     }
-    // Encode: the frame, and the encoder's own planes.
+    // Encode: the frame, and the encoder's own planes. A 16-bit output keeps the wide samples.
     let format = spec.output.resolved_format(header.format);
-    let wide_output = spec.output.depth.as_deref() == Some("ushort")
-        || spec.output.depth.as_deref() == Some("16");
-    let encoded = pixels(held) * (frame_bpp.max(4) + encoder_bytes_per_pixel(format));
-    peak = peak.max(encoded * if wide_output { 2 } else { 1 });
+    let wide_output = match spec.output.depth.as_deref() {
+        Some(depth) => depth == "ushort" || depth == "16",
+        None => frame_bpp == 8 && format == Format::Png,
+    };
+    let encoded = if wide_output {
+        pixels(held) * (8 + encoder_bytes_per_pixel(format) + 4)
+    } else {
+        pixels(held) * (4 + encoder_bytes_per_pixel(format))
+    };
+    peak = peak.max(encoded);
     peak
 }
 
@@ -247,4 +254,111 @@ pub fn estimate_path(path: &str, spec: &PipelineSpec, encodes: bool) -> Result<u
     // Mapping an empty file fails; a file this small is not an image either.
     let mmap = unsafe { Mmap::map(&file)? };
     estimate_bytes(&mmap, spec, encodes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastpkg_core::options::Kernel;
+
+    const MB: u64 = 1_000_000;
+
+    fn header(format: Format, width: u32, height: u32) -> HeaderInfo {
+        HeaderInfo {
+            format,
+            width,
+            height,
+            channels: 3,
+            depth: "uchar".into(),
+            pages: 1,
+            page_height: height,
+            ..Default::default()
+        }
+    }
+
+    fn resize(width: u32) -> Operation {
+        Operation::Resize {
+            width: Some(width),
+            height: None,
+            fit: Fit::Cover,
+            position: "centre".into(),
+            background: "#000000".into(),
+            kernel: Kernel::Lanczos3,
+            without_enlargement: false,
+            without_reduction: false,
+            fast_shrink_on_load: true,
+            defer_canvas: false,
+        }
+    }
+
+    fn spec(operations: Vec<Operation>, format: Format) -> PipelineSpec {
+        let mut spec = PipelineSpec::default();
+        spec.operations = operations;
+        spec.output.format = Some(format);
+        spec
+    }
+
+    #[test]
+    fn a_png_below_the_shrink_threshold_is_held_whole() {
+        // 31 MP of RGBA is 124 MB, under the 128 MB where the decode-time shrink starts: about
+        // what was measured (150 MB).
+        let png = header(Format::Png, 6200, 5000);
+        let bytes = estimate_header(&png, &spec(vec![resize(1200)], Format::Jpeg), true);
+        assert!((130 * MB..180 * MB).contains(&bytes), "{bytes}");
+    }
+
+    #[test]
+    fn a_large_downscale_of_a_big_png_shrinks_on_load() {
+        let png = header(Format::Png, 6325, 6325);
+        let shrunk = estimate_header(&png, &spec(vec![resize(1200)], Format::Jpeg), true);
+        let kept = estimate_header(&png, &spec(vec![resize(3000)], Format::Jpeg), true);
+        let plain = estimate_header(&png, &spec(vec![], Format::Jpeg), true);
+        assert!(shrunk < 140 * MB, "{shrunk}");
+        assert!(kept > 200 * MB, "{kept}");
+        assert!(plain > kept, "{plain}");
+    }
+
+    #[test]
+    fn jpegs_decode_scaled() {
+        let jpeg = header(Format::Jpeg, 4000, 3000);
+        let thumb = estimate_header(&jpeg, &spec(vec![resize(200)], Format::Jpeg), true);
+        let medium = estimate_header(&jpeg, &spec(vec![resize(1200)], Format::Jpeg), true);
+        let whole = estimate_header(&jpeg, &spec(vec![], Format::Jpeg), true);
+        assert!(thumb < 8 * MB, "{thumb}");
+        assert!(medium < 40 * MB, "{medium}");
+        assert!((100 * MB..150 * MB).contains(&whole), "{whole}");
+        // Progressive files keep their coefficients for the whole source.
+        let mut progressive = jpeg.clone();
+        progressive.is_progressive = true;
+        let coefficients = estimate_header(&progressive, &spec(vec![resize(1200)], Format::Jpeg), true);
+        assert!(coefficients > medium + 30 * MB, "{coefficients}");
+    }
+
+    #[test]
+    fn stats_only_decodes() {
+        let jpeg = header(Format::Jpeg, 4000, 3000);
+        let plain = spec(vec![], Format::Jpeg);
+        assert!(estimate_header(&jpeg, &plain, false) < estimate_header(&jpeg, &plain, true));
+    }
+
+    #[test]
+    fn sixteen_bit_pngs_are_twice_as_wide() {
+        let mut wide = header(Format::Png, 3000, 3000);
+        wide.depth = "ushort".into();
+        let narrow = header(Format::Png, 3000, 3000);
+        let plain = spec(vec![], Format::Png);
+        assert!(estimate_header(&wide, &plain, true) > estimate_header(&narrow, &plain, true));
+    }
+
+    #[test]
+    fn heavy_formats_and_operations_cost_more() {
+        let jpeg = header(Format::Jpeg, 4000, 3000);
+        let jpeg_out = estimate_header(&jpeg, &spec(vec![], Format::Jpeg), true);
+        let avif_out = estimate_header(&jpeg, &spec(vec![], Format::Avif), true);
+        assert!(avif_out > jpeg_out);
+        let blur: Operation = serde_json::from_str(r#"{"op":"blur","sigma":5.0}"#).unwrap();
+        let blurred = estimate_header(&jpeg, &spec(vec![blur], Format::Jpeg), true);
+        // A blur of the whole frame holds copies next to it; it also exceeds the plain encode.
+        assert!(blurred > jpeg_out, "{blurred} {jpeg_out}");
+    }
 }

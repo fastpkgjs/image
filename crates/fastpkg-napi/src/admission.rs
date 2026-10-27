@@ -161,20 +161,6 @@ struct Gate {
     free_below: u64,
 }
 
-fn gate() -> &'static Gate {
-    static GATE: OnceLock<Gate> = OnceLock::new();
-    GATE.get_or_init(|| {
-        let (budget_mb, source) = detect();
-        let permits = budget_mb.map_or(0, |mb| mb.min(u32::MAX as u64 >> 1) as usize);
-        Gate {
-            budget_mb,
-            source,
-            semaphore: Arc::new(Semaphore::new(permits)),
-            free_below: budget_mb.map_or(u64::MAX, |mb| FREE_BELOW.min(mb * MIB / 8)),
-        }
-    })
-}
-
 /// MiB being claimed right now, the most that was claimed at once, and how many claims had to wait.
 static IN_FLIGHT_MB: AtomicU64 = AtomicU64::new(0);
 static PEAK_IN_FLIGHT_MB: AtomicU64 = AtomicU64::new(0);
@@ -196,47 +182,69 @@ impl Drop for Claim {
     }
 }
 
-/// The MiB a job estimated at `bytes` claims: nothing for a small one, otherwise the estimate
-/// rounded up and capped at the whole budget.
-pub fn weight_mb(bytes: u64) -> u64 {
-    let gate = gate();
-    match gate.budget_mb {
-        Some(budget) if bytes >= gate.free_below => bytes.div_ceil(MIB).clamp(1, budget),
-        _ => 0,
+impl Gate {
+    fn new(budget_mb: Option<u64>, source: BudgetSource) -> Self {
+        let permits = budget_mb.map_or(0, |mb| mb.min(u32::MAX as u64 >> 1) as usize);
+        Gate {
+            budget_mb,
+            source,
+            semaphore: Arc::new(Semaphore::new(permits)),
+            free_below: budget_mb.map_or(u64::MAX, |mb| FREE_BELOW.min(mb * MIB / 8)),
+        }
     }
+
+    /// The MiB a job estimated at `bytes` claims: nothing for a small one, otherwise the estimate
+    /// rounded up and capped at the whole budget.
+    fn weight_mb(&self, bytes: u64) -> u64 {
+        match self.budget_mb {
+            Some(budget) if bytes >= self.free_below => bytes.div_ceil(MIB).clamp(1, budget),
+            _ => 0,
+        }
+    }
+
+    async fn claim(&self, bytes: u64) -> Claim {
+        let mb = self.weight_mb(bytes);
+        if mb == 0 {
+            return Claim {
+                _permit: None,
+                mb: 0,
+            };
+        }
+        let permits = mb as u32;
+        // `try_acquire` only succeeds when nobody is queued ahead (queued claims are handed the
+        // permits as they come back), so the fast path keeps the order too.
+        let permit = match Arc::clone(&self.semaphore).try_acquire_many_owned(permits) {
+            Ok(permit) => permit,
+            Err(_) => {
+                WAITS.fetch_add(1, Ordering::Relaxed);
+                // The semaphore is never closed, so acquiring only fails if that stops being true.
+                Arc::clone(&self.semaphore)
+                    .acquire_many_owned(permits)
+                    .await
+                    .expect("memory budget closed")
+            }
+        };
+        CLAIMS.fetch_add(1, Ordering::Relaxed);
+        let now = IN_FLIGHT_MB.fetch_add(mb, Ordering::AcqRel) + mb;
+        PEAK_IN_FLIGHT_MB.fetch_max(now, Ordering::AcqRel);
+        Claim {
+            _permit: Some(permit),
+            mb,
+        }
+    }
+}
+
+fn gate() -> &'static Gate {
+    static GATE: OnceLock<Gate> = OnceLock::new();
+    GATE.get_or_init(|| {
+        let (budget_mb, source) = detect();
+        Gate::new(budget_mb, source)
+    })
 }
 
 /// Waits for `bytes` of the memory budget (see the module documentation).
 pub async fn claim(bytes: u64) -> Claim {
-    let mb = weight_mb(bytes);
-    if mb == 0 {
-        return Claim {
-            _permit: None,
-            mb: 0,
-        };
-    }
-    let semaphore = &gate().semaphore;
-    let permits = mb as u32;
-    // `try_acquire` only succeeds when nobody is queued ahead (queued claims are served the
-    // permits as they come back), so the fast path keeps the order too.
-    let permit = match Arc::clone(semaphore).try_acquire_many_owned(permits) {
-        Ok(permit) => permit,
-        Err(_) => {
-            WAITS.fetch_add(1, Ordering::Relaxed);
-            // The semaphore is never closed, so acquiring only fails if that stops being true.
-            Arc::clone(semaphore)
-                .acquire_many_owned(permits)
-                .await
-                .expect("memory budget closed")
-        }
-    };
-    CLAIMS.fetch_add(1, Ordering::Relaxed);
-    let now = IN_FLIGHT_MB.fetch_add(mb, Ordering::AcqRel) + mb;
-    PEAK_IN_FLIGHT_MB.fetch_max(now, Ordering::AcqRel);
-    Claim {
-        _permit: Some(permit),
-        mb,
-    }
+    gate().claim(bytes).await
 }
 
 /// The state of the limiter, for diagnostics and tests.
@@ -333,5 +341,102 @@ mod tests {
         assert_eq!(cgroup_limit(&mount, text), None);
         assert_eq!(cgroup_limit(&mount, "0::/\n"), None);
         let _ = std::fs::remove_dir_all(&mount);
+    }
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[test]
+    fn small_jobs_claim_nothing() {
+        let gate = Gate::new(Some(1024), BudgetSource::Env);
+        assert_eq!(gate.weight_mb(0), 0);
+        assert_eq!(gate.weight_mb(FREE_BELOW - 1), 0);
+        assert_eq!(gate.weight_mb(FREE_BELOW), 8);
+        assert_eq!(gate.weight_mb(100 * MIB + 1), 101);
+        // A small budget lowers the line to an eighth of itself.
+        let small = Gate::new(Some(64), BudgetSource::Env);
+        assert_eq!(small.weight_mb(7 * MIB), 0);
+        assert_eq!(small.weight_mb(8 * MIB), 8);
+        // Without a budget nothing is claimed at all.
+        let off = Gate::new(None, BudgetSource::Off);
+        assert_eq!(off.weight_mb(u64::MAX), 0);
+    }
+
+    #[test]
+    fn a_claim_above_the_budget_takes_all_of_it_and_runs_alone() {
+        block_on(async {
+            let gate = Arc::new(Gate::new(Some(100), BudgetSource::Env));
+            assert_eq!(gate.weight_mb(300 * MIB), 100);
+            let huge = gate.claim(300 * MIB).await;
+            assert_eq!(gate.semaphore.available_permits(), 0);
+            let started = Arc::new(AtomicU64::new(0));
+            let waiting = tokio::spawn({
+                let (gate, started) = (Arc::clone(&gate), Arc::clone(&started));
+                async move {
+                    let _claim = gate.claim(20 * MIB).await;
+                    started.store(1, Ordering::SeqCst);
+                }
+            });
+            settle().await;
+            assert_eq!(started.load(Ordering::SeqCst), 0, "ran next to the huge job");
+            drop(huge);
+            waiting.await.unwrap();
+            assert_eq!(started.load(Ordering::SeqCst), 1);
+            assert_eq!(gate.semaphore.available_permits(), 100);
+        });
+    }
+
+    #[test]
+    fn claims_are_served_in_order() {
+        block_on(async {
+            let gate = Arc::new(Gate::new(Some(100), BudgetSource::Env));
+            let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let first = gate.claim(60 * MIB).await;
+            let spawn = |name: &'static str, mb: u64| {
+                let (gate, order) = (Arc::clone(&gate), Arc::clone(&order));
+                tokio::spawn(async move {
+                    let claim = gate.claim(mb * MIB).await;
+                    order.lock().unwrap().push(name);
+                    tokio::task::yield_now().await;
+                    drop(claim);
+                })
+            };
+            // `big` cannot start next to `first`; `later` would fit next to it, but not ahead of
+            // `big`.
+            let big = spawn("big", 90);
+            settle().await;
+            let later = spawn("later", 30);
+            settle().await;
+            assert!(order.lock().unwrap().is_empty(), "a claim jumped the queue");
+            drop(first);
+            big.await.unwrap();
+            later.await.unwrap();
+            assert_eq!(*order.lock().unwrap(), ["big", "later"]);
+        });
+    }
+
+    #[test]
+    fn claims_come_back_when_the_job_panics() {
+        block_on(async {
+            let gate = Gate::new(Some(100), BudgetSource::Env);
+            let claim = gate.claim(80 * MIB).await;
+            assert_eq!(gate.semaphore.available_permits(), 20);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _claim = claim;
+                panic!("job failed");
+            }));
+            assert!(outcome.is_err());
+            assert_eq!(gate.semaphore.available_permits(), 100);
+        });
     }
 }
