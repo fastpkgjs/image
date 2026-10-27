@@ -10,6 +10,9 @@
 //! With alpha the colour channels are averaged premultiplied (as the resizer does) and
 //! un-premultiplied again on output.
 
+// The per-pixel loops index several arrays of a pixel by a const channel count.
+#![allow(clippy::needless_range_loop)]
+
 /// How the pixels of one axis fall into output cells. Cell `k` covers the source interval
 /// `[k * span, (k + 1) * span)` with `span = src / out`; every cell's weights sum to one.
 ///

@@ -830,7 +830,7 @@ mod tests {
                     let want = one_shot(&data, (sw, sh), (rw, rh), plan.as_ref(), kernel, alpha);
                     for window in [1usize << 12, 1 << 16] {
                         let mut engine =
-                            Engine::<u8>::with_window(g.clone(), options.clone(), false, window);
+                            Engine::<u8>::with_window(g.clone(), options, false, window);
                         for row in data.chunks_exact(sw as usize * 4) {
                             engine.push_row(row).unwrap();
                         }
@@ -848,7 +848,7 @@ mod tests {
                     let want = one_shot(&wide, (sw, sh), (rw, rh), plan.as_ref(), kernel, alpha);
                     for narrow in [false, true] {
                         let mut engine =
-                            Engine::<u16>::with_window(g.clone(), options.clone(), narrow, 1 << 13);
+                            Engine::<u16>::with_window(g.clone(), options, narrow, 1 << 13);
                         for row in wide.chunks_exact(sw as usize * 4) {
                             engine.push_row(row).unwrap();
                         }
@@ -874,7 +874,7 @@ mod tests {
                         }
                     }
                     // A frame in memory goes through the parallel box shrink.
-                    let got = resize_frame(&data, g.clone(), options.clone()).unwrap();
+                    let got = resize_frame(&data, g.clone(), options).unwrap();
                     let want = one_shot(&data, (sw, sh), (rw, rh), plan.as_ref(), kernel, alpha);
                     let worst = got.iter().zip(&want).map(|(a, b)| a.abs_diff(*b)).max();
                     assert!(

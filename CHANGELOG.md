@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+### Memory and speed
+
+A big PNG whose first resampling step is a plain downscale is now resampled while it is decoded; the exact resize of 0.6.0 no longer costs the speed and memory it did.
+
+- **Streamed resize.** Rows go from the PNG decoder (after the decode-time shrink, for a big downscale) into a row sink (`fastpkg-core::sink`, implemented by `fastpkg-ops::streaming`) that applies libvips' integer box shrink, the edge padding and the kernel in bands of destination rows as soon as the source rows they read exist, with the crop construction the banded resize already used (same filter weights; output within one level of the whole-frame resize, two for 16-bit, covered by `tests/png-stream-resize.test.mjs` and the Rust `stream_matches_one_shot`). Only a window of about `5 x scale` source rows plus the destination are resident; the frame, the shrunk intermediate and the box-shrunk and padded copies never exist. Conditions: non-interlaced, nothing before the first `resize` touches the pixels (`rotate()` with no orientation to apply is fine), no embedded profile to convert, not `kernel: 'nearest'`, at least 16 MiB decoded (`FASTPKG_PNG_STREAM_MIN_BYTES` overrides it; `FASTPKG_RESIZE_STREAM_MIN_BYTES` is the same threshold for frames already in memory). Everything else takes the whole-frame path as before. `fit` cover/contain/inside/fill, kernels, `failOn` on truncated files and lenient blank rows behave as before. When nothing after the resize needs 16-bit samples (JPEG/WebP/8-bit PNG output), they are narrowed to 8 bits band by band.
+- **Shrink accumulation is cheap again.** The decode-time shrink summed RGBA doubles per pixel after expanding every row (45% slower than 0.5.0 on a 256 MP file). It now accumulates the decoder's own rows (no expansion): rows inside a cell row are added with plain integer adds (AVX2 selected at run time), only the two edge rows are weighted in floats, and the horizontal reduction runs once per cell row. Numbers are unchanged by construction (same weights).
+- **Exact resize CPU.** The libvips-style integer box shrink (0.6.0) divided every channel of every block by the block area with a 64-bit divide; it now sums rows vertically first and divides by reciprocal multiplication (exact, checked against plain division), and the resize of a big in-memory frame no longer builds the box-shrunk and padded copies. A 4096x4096 PNG to 1024 px costs 375 ms CPU (0.6.0: 561, 0.5.0: 441, sharp 390).
+- **Fallback shrink budget.** When the shrunk intermediate has to be collected (profile to convert, non-streamable resize, `nearest`), the best headroom is picked against a 48 MiB budget instead of 128 MiB (interlaced files keep 128 MiB: their accumulator is four `f32` per pixel).
+- **PNG encoder** filters a group of 4 MiB blocks at a time while it deflates them instead of keeping a filtered copy of the whole frame (and writes the IDAT chunks as the stream is produced). Output bytes are identical (`tests/png-stability.test.mjs`, Rust `filtered_stream_equals_the_filtered_frame`).
+
+Fresh process each (`node bench/png-ab.mjs <file> --pipeline <name> --base <0.6.0 build> --runs 5`, four rayon threads unless noted), wall / CPU / peak RSS (VmHWM). Fixtures from `bench/gen-huge-png.mjs`; sharp 0.35.5:
+
+| case | 0.5.0 | 0.6.0 | now | sharp |
+|---|---|---|---|---|
+| 256 MP non-interlaced RGB to 1200 px, JPEG | 1.09 s, 106 MB | 1.54 s, 175 MB | 0.83 s, 77 MB | 1.16 s, 171 MB |
+| the same, one thread | 1.03 s | 1.54 s | 0.78 s | 1.14 s |
+| 8192x8192 RGB art to 1024 px, PNG | 0.36 s, 90 MB | 0.60 s, 144 MB | 0.34 s, 77 MB | 0.27 s, 122 MB |
+| 4096x4096 RGB photo to 1024 px, PNG (CPU) | 441 ms | 561 ms | 375 ms | 390 ms |
+| 16-bit RGB 40 MP (6325x6325) to 3000 px, JPEG | 1341 MB | 466 MB | 147 MB | 176 MB |
+| 16-bit RGB 31 MP (5568x5568) to 3000 px, JPEG | 949 MB | 395 MB | 148 MB | 169 MB |
+| 8192x8192 RGBA to 4096 px, PNG | | 458 MB | 144 MB | 134 MB |
+| 8192x8192 RGBA to 4096 px, JPEG | | 458 MB | 286 MB (64 of it the flattened copy JPEG needs) | 226 MB |
+
+(0.5.0 for the 16-bit rows is from the 0.6.0 table below, gradient fixtures.) The 4096 px CPU regression was the box shrink and resize copies of 0.6.0, not the decoder (the zlib end-of-stream check from 0.6.0 still avoids the second inflate); a raw 4096x4096 RGB resize to 1024 px costs 205-230 ms CPU after the box shrink work, against 275 ms in 0.6.0 and 125 ms in 0.5.0 (which resampled from 4096 px with a wider kernel but no libvips box-shrink emulation) - the rest of the gap is the box shrink that makes the output match libvips, and it is paid back by the cheaper convolution.
+
+### Accuracy
+
+Unchanged: the decode-time shrink has the same weights and headroom ladder, and a streamed resize equals the whole-frame one to float rounding. PSNR in dB against an f64 Lanczos3 resample of the full-resolution pixels (`node bench/png-shrink-psnr.mjs --old <0.6.0 build>`, 3600x2400; "old" is 0.6.0 itself here, identical to "new"; exact = whole image resampled):
+
+| picture | downscale | exact | 0.6.0 | now | sharp |
+|---|---|---|---|---|---|
+| photo-like | 4.5x / 9x / 18x / 36x | 55.2 / 56.5 / 56.4 / 56.1 | 55.2 / 57.8 / 57.8 / 57.8 | 55.2 / 57.8 / 57.8 / 57.8 | 52.5 / 55.7 / 54.9 / 55.9 |
+| textured | 4.5x / 9x / 18x / 36x | 46.0 / 50.4 / 53.2 / 53.6 | 46.0 / 55.9 / 56.9 / 57.4 | 46.0 / 55.9 / 56.9 / 57.4 | 45.6 / 50.1 / 52.4 / 53.7 |
+| hard edges | 4.5x / 9x / 18x / 36x | 32.8 / 32.6 / 36.7 / 41.0 | 32.8 / 39.4 / 41.9 / 45.1 | 32.8 / 39.4 / 41.9 / 45.1 | 32.8 / 32.6 / 36.3 / 40.2 |
+
+The 48 MiB fallback budget only matters when the intermediate is collected and large (7200x4800 to 1200x800: photo 57.7 -> 56.7, textured 55.2 -> 50.8, hard edges 36.8 -> 35.0 dB with a 2.5x intermediate instead of 4x at 32 MiB; still at or above sharp and the exact path).
+
+Tests: interlaced-versus-row shrink comparison tolerates one more level (the row path now sums whole rows exactly in integers, the Adam7 one in f32 in pass order; the mean difference stays below 0.02).
+
 ## 0.6.0
 
 ### Memory and speed
