@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Memory-aware job admission
+
+Jobs were admitted by count only (`max(4, cores)` at a time), however large each one was: twelve 31 MP PNG decodes held about 2 GB at once (468 MB for sharp). Every job now also claims its estimated peak working set from a memory budget before it starts, in a first come, first served queue, and returns it when it ends, however it ends.
+
+- The estimate comes from the header and the pipeline alone (format, size, depth, interlacing, the decode-time shrink the first resize allows, the resize's intermediate, the encoder) and is within -10% to +30% of the measured peak RSS of a lone job over 40 cases (`node bench/admission-calibrate.mjs <fixtures>`): 31 MP 8-bit PNG to 1200 px 148 MB estimated / 150 MB measured, 40 MP 8-bit PNG (shrinks while decoding) 115 / 117, 40 MP 16-bit PNG 129 / 112, 12 MP JPEG to 1200 px 16 / 16, 12 MP progressive JPEG 54 / 41, 12 MP JPEG unresized to PNG 137 / 150, 3 MP AVIF 29 / 26.
+- Budget: half of the cgroup memory limit (v2 or v1, tightest ancestor), a quarter of the RAM when unlimited, at least 512 MB (4096 MB where neither can be read); `FASTPKG_MEMORY_BUDGET_MB` overrides it, `0`/`off` disables it. A job estimated above the whole budget claims all of it and runs alone. Jobs under 8 MB claim nothing.
+- `fastpkg-napi` gains `estimateJob` and `admissionInfo` (internal, `image._admission()`, `pipeline._jobEstimate()`); `fastpkg-codecs` gains `decode_footprint` and `probe_layout`, `fastpkg-stream` gains the estimator.
+
+Burst of 50 parallel jobs (`node bench/admission-burst.mjs`; every job `resize(1200).jpeg()`, `rotate()` first for PNG; 12 cores; peak RSS of the process / wall time), 0.6.0 against this build, with sharp 0.35.5:
+
+| burst | host, no limit: 0.6.0 | now (default budget, not reached) | 1 GB container: 0.6.0 | now (512 MB budget) | sharp |
+|---|---|---|---|---|---|
+| 50 x 31 MP 8-bit PNG (93 MB, noise) | 2071 MB, 5.2 s | 1993 MB, 5.0 s | killed (OOM) | 646 MB, 7.0 s | 470 MB, 3.5 s |
+| same, `FASTPKG_MEMORY_BUDGET_MB=768`, no container | | 950 MB, 5.3 s | | | |
+| 50 x 40 MP 16-bit PNG | 883 MB, 5.7 s | 833 MB, 5.7 s | 801 MB, 5.2 s | 380 MB, 10.8 s | 896 MB, 21.7 s |
+| 50 x 12 MP JPEG | 286 MB, 0.73 s | 274 MB, 0.68 s | 270 MB, 0.63 s | 277 MB, 0.64 s | 187 MB, 1.26 s |
+| 200 x 800x600 JPEG | 262 MB, 0.84 s | 282 MB, 0.91 s | 256 MB, 0.74 s | 268 MB, 0.68 s | 150 MB, 4.3 s |
+| mixed 50 (10% 31 MP PNG, 20% 12 MP JPEG, 70% small) | 946 MB, 0.81 s | 893 MB, 0.96 s | 952 MB, 0.82 s | 662 MB, 1.12 s | 314 MB, 1.3 s |
+
+On a host without a limit the default budget (a quarter of the RAM) is far above what a burst needs, so nothing changes there; set `FASTPKG_MEMORY_BUDGET_MB` to bound the process on such a host. Memory is bought with parallelism: three 31 MP decodes at a time under a 512 MB budget take 7.0 s for the 50 instead of 5.0 s. Small-job latency is unchanged (alternating A/B in one process, 8 concurrent 800x600 resizes: -0.5% to +1.8%; Buffer inputs +0.3% to +2.4%; a file path input pays one more `open`/`read`, +1.3% to +3.8% for the `bench/run.mjs` "8 concurrent resizes" row).
+
 ## 0.6.0
 
 ### Memory and speed
