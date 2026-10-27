@@ -2,6 +2,7 @@
 // decoded (shrink-on-load analogue). Every colour type and bit depth must agree with the
 // full-decode result (and with sharp) within a small tolerance; without a downscale the rows
 // decode exactly like sharp. Memory is checked in a child process.
+import './_png-shrink-env.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import zlib from 'node:zlib';

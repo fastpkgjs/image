@@ -835,6 +835,20 @@ fn decode_jpeg_mozjpeg(
 /// (1.97 with a single full-resolution Lanczos pass, 1.1 and 1.5 with headroom 3 and 4).
 const PNG_SHRINK_HEADROOM: u32 = 2;
 
+/// Images below this many pixels decode at full size even when a large downscale follows: the
+/// resampler is exact there and runs in parallel, whereas the row-by-row box shrink is a single
+/// thread and costs accuracy. The shrink only pays for itself when the decoded image would be
+/// big (32 MP is 128 MiB as RGBA). `FASTPKG_PNG_SHRINK_MIN_PIXELS` overrides it (tests).
+fn png_shrink_min_pixels() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("FASTPKG_PNG_SHRINK_MIN_PIXELS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(32_000_000)
+    })
+}
+
 /// Integer box factor for decode-time PNG shrinking: the largest `f` that still leaves the
 /// resampler `headroom` times the target on both axes (the PNG analogue of
 /// [`jpeg_scale_numerator`]). 1 means "decode at full size".
@@ -1083,9 +1097,11 @@ fn decode_png_stream(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> R
         return decode_png_buffered(bytes, fail_on);
     }
     let (width, height) = reader.info().size();
-    let factor = hint.map_or(1, |hint| {
-        png_shrink_factor((width, height), hint, PNG_SHRINK_HEADROOM)
-    }) as usize;
+    let factor = hint
+        .filter(|_| width as u64 * height as u64 >= png_shrink_min_pixels())
+        .map_or(1, |hint| {
+            png_shrink_factor((width, height), hint, PNG_SHRINK_HEADROOM)
+        }) as usize;
     let has_alpha = matches!(color, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
     let mut image = if depth == png::BitDepth::Sixteen {
         let (w, h, wide) = read_png_rows::<u16>(&mut reader, color, factor, lenient)?;

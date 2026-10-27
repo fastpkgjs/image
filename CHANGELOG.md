@@ -8,6 +8,7 @@
 
 ### Memory and speed
 
+- PNG downscales no longer lose accuracy or wall time below 32 MP: the row-by-row box pre-shrink now only applies to images of at least 32 MP (128 MiB as RGBA), where it saves memory; smaller files decode at full size and the parallel Lanczos resize sees every pixel again, as in 0.3.0 (a 4096x4096 PNG to 1024 px is 349 ms against 393 ms in 0.3.0, sharp 302 ms). `FASTPKG_PNG_SHRINK_MIN_PIXELS` overrides the threshold.
 - A leading `rotate()` (auto-orient), `rotate(90/180/270)`, `flip()` or `flop()` no longer switches off shrink-on-load for the resize that follows: these operations only move pixels, so the decode hint now looks through them (width and height swapped for quarter turns) and the pre-shrink size travels with the image. A 256 MP PNG through `.rotate().resize(800)` peaks at about 83 MB instead of 2.2 GB (sharp: 308 MB), and JPEGs resized after `rotate()` use DCT scaling again. Added to `bench/mem.mjs` as `huge-png-rotate-800-jpeg`.
 
 ## 0.4.0

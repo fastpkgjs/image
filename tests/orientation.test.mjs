@@ -1,6 +1,7 @@
 // EXIF orientation: WebP files carry it too (libvips writes the EXIF chunk with an `Exif\0\0`
 // prefix, which broke the container reader), and a leading rotate()/autoOrient()/flip/flop must
 // not disable shrink-on-load for the resize that follows.
+import './_png-shrink-env.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
