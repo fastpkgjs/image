@@ -15,6 +15,10 @@ use fastpkg_ops::{
 };
 use memmap2::Mmap;
 
+mod estimate;
+
+pub use estimate::{estimate_bytes, estimate_header, estimate_path};
+
 pub struct RunResult {
     pub data: Vec<u8>,
     pub format: Format,
@@ -100,17 +104,17 @@ pub fn stats_path(path: &str, spec: &PipelineSpec) -> Result<Stats> {
     stats_bytes(&mmap, spec)
 }
 
-pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
-    fastpkg_core::pipeline::validate_spec(spec)?;
-    let started = Instant::now();
-    let deadline = spec
-        .output
-        .timeout
-        .filter(|seconds| *seconds > 0.0)
-        .map(|seconds| started + Duration::from_secs_f64(seconds));
+/// What the leading operations of a pipeline tell the decoder about the first resize.
+struct DecodePlan {
+    hint: Option<ShrinkHint>,
+    fast_shrink: bool,
+    /// The decoded pixels are turned by a quarter before the first resample.
+    swaps_axes: bool,
+    /// The pixels are rotated or flipped before the resize (sharp does not shrink on load then).
+    moved_before_resize: bool,
+}
 
-    let (mut header, mut extras) = probe_bytes(bytes, spec)?;
-    check_deadline(deadline)?;
+fn decode_plan(header: &HeaderInfo, spec: &PipelineSpec) -> DecodePlan {
     // Shrink-on-load is only safe when the resize is the first operation that resamples, so the
     // decoder-space target can be derived from the header alone. Operations that only move
     // pixels (auto-orient, quarter turns, flips) may come first: they commute with the shrink and
@@ -189,6 +193,31 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
         }
         _ => (None, false),
     };
+    DecodePlan {
+        hint,
+        fast_shrink,
+        swaps_axes,
+        moved_before_resize,
+    }
+}
+
+pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
+    fastpkg_core::pipeline::validate_spec(spec)?;
+    let started = Instant::now();
+    let deadline = spec
+        .output
+        .timeout
+        .filter(|seconds| *seconds > 0.0)
+        .map(|seconds| started + Duration::from_secs_f64(seconds));
+
+    let (mut header, mut extras) = probe_bytes(bytes, spec)?;
+    check_deadline(deadline)?;
+    let DecodePlan {
+        hint,
+        fast_shrink,
+        swaps_axes,
+        moved_before_resize,
+    } = decode_plan(&header, spec);
     // sharp keeps the pixels as stored when the input profile is to be kept (the profile
     // describes them); otherwise an embedded profile is converted to sRGB while decoding.
     let keeps_input_icc =

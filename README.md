@@ -226,6 +226,10 @@ Also included: `gradientMap`, `gradientRecolor`, `fill`, `paletteSwap`, `alphaFr
 
 glibc raises its mmap threshold every time a large mmapped block is freed, so after a few iterations megabyte-sized pixel buffers are served from per-thread arenas and are never returned to the OS; a long-running service decoding and encoding 1024x1024 RGBA images then settles at about twice the memory it needs. On `linux-*-gnu` the addon pins the threshold at 4 MiB when it loads (`mallopt(M_MMAP_THRESHOLD)`), which turns the dynamic behaviour off for the whole process. musl, macOS and Windows do not have this behaviour and are left alone. Set `FASTPKG_MALLOC_TUNING=0` to skip it; an explicit `MALLOC_MMAP_THRESHOLD_`, `MALLOC_TOP_PAD_` or `GLIBC_TUNABLES` in the environment also takes precedence. `node bench/mem.mjs` measures steady-state RSS against sharp.
 
+### Memory-aware job admission
+
+Besides the job count limit (`max(4, cores)`), every job claims its estimated peak working set (from the header and the pipeline) from a memory budget before it runs, so a burst of large images queues instead of holding all of them at once: fifty 31 MP PNGs processed at once used to peak at about 2 GB (sharp: 470 MB); in a 1 GB container they now peak at about 650 MB, where 0.6.0 is killed. The budget is half of the cgroup memory limit (or a quarter of the RAM when unlimited), at least 512 MB; `FASTPKG_MEMORY_BUDGET_MB=<n>` sets it (`off` disables it). Small images claim nothing. See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md#concurrency-queueing-and-memory).
+
 ## Parallel JPEG encoding (opt-in)
 
 ```js
