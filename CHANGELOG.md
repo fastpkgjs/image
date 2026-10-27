@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Memory and speed
+
+- The decode-time shrink also looks through `flatten()` and `greyscale()` between `rotate()` and `resize()` (they are linear on the premultiplied samples the shrink averages), so listing and background-removal pipelines (`rotate().flatten().resize()`) keep the low-memory path: a 256 MP PNG peaks at 82 MB (sharp 308 MB) instead of about 1.15 GB. `bench/mem.mjs` case `huge-png-rotate-flatten-800-jpeg`.
+
 ## 0.5.0
 
 ### Fixed

@@ -38,6 +38,8 @@ const SCENARIOS = {
   'huge-png-800-jpeg': { file: 'huge-256mp.png', parallel: 1, iters: 6, every: 1 },
   // The usual upload normalisation: auto-orient first, then resize.
   'huge-png-rotate-800-jpeg': { file: 'huge-256mp.png', parallel: 1, iters: 6, every: 1 },
+  // Listing / background-removal normalisation: auto-orient, flatten, resize.
+  'huge-png-rotate-flatten-800-jpeg': { file: 'huge-256mp.png', parallel: 1, iters: 6, every: 1 },
 };
 
 function run(engine, input, name, overlay) {
@@ -55,6 +57,8 @@ function run(engine, input, name, overlay) {
       return sharpLike(input, { limitInputPixels: false }).resize({ width: 800 }).png().toBuffer();
     case 'huge-png-800-jpeg':
       return sharpLike(input, { limitInputPixels: false }).resize({ width: 800 }).jpeg({ quality: 80 }).toBuffer();
+    case 'huge-png-rotate-flatten-800-jpeg':
+      return sharpLike(input, { limitInputPixels: false }).rotate().flatten({ background: '#ffffff' }).resize({ width: 800 }).jpeg({ quality: 80 }).toBuffer();
     case 'huge-png-rotate-800-jpeg':
       return sharpLike(input, { limitInputPixels: false }).rotate().resize({ width: 800 }).jpeg({ quality: 80 }).toBuffer();
     case 'big-jpeg-1200':

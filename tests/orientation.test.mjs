@@ -56,6 +56,21 @@ for (const [format, options] of Object.entries(sources)) {
   });
 }
 
+test('rotate().flatten().greyscale() before resize matches sharp on an RGBA PNG (shrink looks through them)', async () => {
+  const alphaRaw = pattern(W, H, 4, { alpha: true });
+  const base = await sharp(alphaRaw, { raw: { width: W, height: H, channels: 4 } }).png().withMetadata({ orientation: 6 }).toBuffer();
+  for (const [name, build] of Object.entries({
+    flatten: (x) => x.rotate().flatten({ background: '#336699' }).resize(40),
+    'flatten + greyscale': (x) => x.rotate().flatten({ background: '#ff8800' }).greyscale().resize(40),
+    greyscale: (x) => x.rotate().greyscale().resize(40),
+  })) {
+    const [s, e] = await Promise.all([pixels(sharp, base, build), pixels(engine, base, build)]);
+    assert.deepEqual([e.info.width, e.info.height, e.info.channels], [s.info.width, s.info.height, s.info.channels], name);
+    const d = diffStats(e.data, s.data);
+    assert.ok(d.mad < 3 && d.max < 80, `${name}: mad ${d.mad} max ${d.max}`);
+  }
+});
+
 test('a rotate() before a fit-constrained resize keeps the final size', async () => {
   const input = await tagged('png', 6);
   const build = (x) => x.rotate().resize({ width: 50, height: 50, fit: 'inside' });
@@ -64,7 +79,7 @@ test('a rotate() before a fit-constrained resize keeps the final size', async ()
 });
 
 // Spawned so VmHWM is the child's own peak.
-test('rotate() before resize keeps the low-memory PNG path', { skip: process.platform !== 'linux' }, async () => {
+test('rotate().flatten() before resize keeps the low-memory PNG path', { skip: process.platform !== 'linux' }, async () => {
   const size = 8192;
   const row = Buffer.alloc(1 + size * 3);
   const zlib = await import('node:zlib');
@@ -98,7 +113,7 @@ test('rotate() before resize keeps the low-memory PNG path', { skip: process.pla
     import engine from ${JSON.stringify(new URL('../packages/image/index.js', import.meta.url).href)};
     const chunks = [];
     for await (const part of process.stdin) chunks.push(part);
-    const out = await engine(Buffer.concat(chunks), { limitInputPixels: false }).rotate().resize(400).jpeg().toBuffer({ resolveWithObject: true });
+    const out = await engine(Buffer.concat(chunks), { limitInputPixels: false }).rotate().flatten({ background: '#ffffff' }).resize(400).jpeg().toBuffer({ resolveWithObject: true });
     console.log(JSON.stringify({ info: out.info, rss: Number(/VmHWM:\\s+(\\d+)/.exec(fs.readFileSync('/proc/self/status', 'utf8'))[1]) / 1024 }));
   `;
   const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], { input: png, encoding: 'utf8', maxBuffer: 1 << 26 });
