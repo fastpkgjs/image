@@ -30,12 +30,15 @@ pub fn apply(mut image: Image, operations: &[Operation]) -> Result<Image> {
     Ok(image)
 }
 
-/// For operations that move pixels without resampling them (auto-orient, quarter-turn rotations,
-/// flips): whether they swap width and height. Such an operation commutes with a box shrink
-/// done at decode time, so a shrunk image can pass through it with `pre_shrink` swapped along.
-/// `None` for everything else.
+/// For operations that commute with a box shrink done at decode time (the shrunk image can pass
+/// through them with `pre_shrink` carried along): whether they swap width and height. These are
+/// the operations that move pixels without resampling them (auto-orient, quarter-turn rotations,
+/// flips) and the per-pixel linear ones (flatten, greyscale: the shrink averages premultiplied
+/// samples, and a linear map of those equals the average of the mapped pixels). `None` for
+/// everything else.
 pub fn geometry_swaps_axes(op: &Operation, orientation: Option<u32>) -> Option<bool> {
     match op {
+        Operation::Flatten { .. } | Operation::Greyscale | Operation::Grayscale => Some(false),
         Operation::AutoOrient => Some(matches!(orientation, Some(5..=8))),
         Operation::Flip { .. } | Operation::Flop { .. } => Some(false),
         Operation::Rotate { angle, .. } => {
