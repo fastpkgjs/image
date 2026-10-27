@@ -39,8 +39,11 @@ fn configured_threads() -> usize {
     }
 }
 
+/// Read once: `available_parallelism` re-reads the affinity mask and the cgroup limits on every
+/// call, which is far too slow for something every job asks.
 fn cores() -> usize {
-    std::thread::available_parallelism().map_or(1, |value| value.get())
+    static CORES: OnceLock<usize> = OnceLock::new();
+    *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |value| value.get()))
 }
 
 /// Most jobs that run at once: the cores, but at least four (sharp's libuv pool has four threads).
@@ -57,10 +60,18 @@ fn thread_budget() -> usize {
     (2 * cores()).max(configured_threads())
 }
 
-/// Threads for a job that starts while `active` jobs (itself included) run: `concurrency()` when
-/// it runs alone, the budget split between the running jobs when it does not.
+/// Threads for a job that starts while `active` jobs (itself included) run. Up to two jobs (more
+/// when `concurrency()` is small) get the full `concurrency()` threads each, which is all the
+/// budget allows; with more jobs running, each gets its share of the budget with every
+/// `max_jobs()` slot filled. Two pool sizes only, so the pools that finish a job fit the next.
 fn pool_threads(active: usize) -> usize {
-    (thread_budget() / active.max(1)).clamp(1, configured_threads())
+    let configured = configured_threads();
+    let budget = thread_budget();
+    if active.saturating_mul(configured) <= budget {
+        configured
+    } else {
+        (budget / max_jobs()).clamp(1, configured)
+    }
 }
 
 /// A running job's claim on the limiter: the permit goes back when this is dropped, on error and
@@ -96,7 +107,7 @@ struct IdlePool {
 /// Rayon pools that no job is using. A job takes one of the size it wants or builds one, and
 /// hands it back when done, so pools exist for the running jobs only (plus a few idle ones) and
 /// not for every blocking-pool thread that ever ran a job. The oldest idle pool is the first one
-/// to go: when the list holds more than a budget's worth of threads, and after the idle timeout.
+/// to go: when the list holds more than two budgets' worth of threads, and after the idle timeout.
 struct PoolList {
     idle: Vec<IdlePool>,
     reaper_running: bool,
@@ -139,7 +150,8 @@ impl Drop for LeasedPool {
         if self.generation != POOL_GENERATION.load(Ordering::Acquire) {
             return;
         }
-        let mut dropped = Vec::new();
+        let capacity = 2 * thread_budget();
+        let mut evicted = Vec::new();
         let mut list = lock_pools();
         list.idle.push(IdlePool {
             generation: self.generation,
@@ -147,12 +159,11 @@ impl Drop for LeasedPool {
             since: Instant::now(),
             pool,
         });
-        let budget = thread_budget();
         let mut idle_threads: usize = list.idle.iter().map(|idle| idle.threads).sum();
-        while idle_threads > budget && !list.idle.is_empty() {
+        while idle_threads > capacity && !list.idle.is_empty() {
             let oldest = list.idle.remove(0);
             idle_threads -= oldest.threads;
-            dropped.push(oldest);
+            evicted.push(oldest);
         }
         if !list.reaper_running {
             list.reaper_running = std::thread::Builder::new()
@@ -161,7 +172,7 @@ impl Drop for LeasedPool {
                 .is_ok();
         }
         drop(list);
-        drop(dropped);
+        drop(evicted);
     }
 }
 
@@ -171,15 +182,18 @@ fn reap_idle_pools() {
     let timeout = pool_idle_timeout();
     loop {
         std::thread::sleep((timeout / 2).max(Duration::from_millis(5)));
-        let expired: Vec<IdlePool>;
+        let mut expired = Vec::new();
         {
             let mut list = lock_pools();
             let now = Instant::now();
-            let (stale, fresh): (Vec<_>, Vec<_>) = std::mem::take(&mut list.idle)
-                .into_iter()
-                .partition(|idle| now.duration_since(idle.since) >= timeout);
-            list.idle = fresh;
-            expired = stale;
+            let mut index = 0;
+            while index < list.idle.len() {
+                if now.duration_since(list.idle[index].since) >= timeout {
+                    expired.push(list.idle.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
             if list.idle.is_empty() {
                 list.reaper_running = false;
                 break;
@@ -191,21 +205,17 @@ fn reap_idle_pools() {
 
 fn lease_pool(threads: usize) -> LeasedPool {
     let generation = POOL_GENERATION.load(Ordering::Acquire);
-    let mut stale = Vec::new();
     let recycled = {
         let mut list = lock_pools();
-        let (current, old): (Vec<_>, Vec<_>) = std::mem::take(&mut list.idle)
-            .into_iter()
-            .partition(|idle| idle.generation == generation);
-        list.idle = current;
-        stale.extend(old);
-        // Newest first: the pools that keep being used stay warm, the others age out.
-        list.idle
+        // Newest first: the pools that keep being used stay warm, the others age out. A pool of
+        // an older generation (one that went idle while `concurrency()` changed) is never taken;
+        // the reaper drops it.
+        let found = list
+            .idle
             .iter()
-            .rposition(|idle| idle.threads == threads)
-            .map(|index| list.idle.remove(index).pool)
+            .rposition(|idle| idle.generation == generation && idle.threads == threads);
+        found.map(|index| list.idle.remove(index).pool)
     };
-    drop(stale);
     let pool = recycled.or_else(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -222,7 +232,7 @@ fn lease_pool(threads: usize) -> LeasedPool {
 
 /// Runs `job` with every rayon operation inside it on a pool of its own (`concurrency` threads
 /// per image, as in sharp; rayon's global pool cannot be resized once it exists), shrunk to its
-/// share of the thread budget while other jobs run.
+/// share of the thread budget while many jobs run.
 fn in_job_pool<T: Send>(job: impl FnOnce() -> T + Send) -> T {
     let lease = lease_pool(pool_threads(ACTIVE_JOBS.load(Ordering::Acquire)));
     match lease.pool.as_ref() {
