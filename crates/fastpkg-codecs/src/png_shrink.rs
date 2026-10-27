@@ -10,14 +10,22 @@
 //! With alpha the colour channels are averaged premultiplied (as the resizer does) and
 //! un-premultiplied again on output.
 
-/// How the pixels of one axis fall into output cells: pixel `i` adds `w0[i]` to cell `cell[i]`
-/// and `w1[i]` (zero when the pixel lies inside one cell) to the next one. Every cell's weights
-/// sum to one.
+/// How the pixels of one axis fall into output cells. Cell `k` covers the source interval
+/// `[k * span, (k + 1) * span)` with `span = src / out`; every cell's weights sum to one.
+///
+/// Seen from a pixel (`at`): it adds `w0` of itself to cell `cell` and `w1` (zero when the pixel
+/// lies inside one cell) to the next one. Seen from a cell (`lo`/`hi`/`edges`): the pixels
+/// `lo..hi`, of which only the first and last are cut by the cell's edges.
 pub struct Axis {
     pub out: usize,
     cell: Vec<u32>,
     w0: Vec<f32>,
     w1: Vec<f32>,
+    lo: Vec<u32>,
+    hi: Vec<u32>,
+    left: Vec<f32>,
+    right: Vec<f32>,
+    inner: f32,
 }
 
 impl Axis {
@@ -42,7 +50,36 @@ impl Axis {
                 w1.push(0.0);
             }
         }
-        Self { out, cell, w0, w1 }
+        let mut lo = Vec::with_capacity(out);
+        let mut hi = Vec::with_capacity(out);
+        let mut left = Vec::with_capacity(out);
+        let mut right = Vec::with_capacity(out);
+        for k in 0..out {
+            let start = k as f64 * span;
+            let end = ((k + 1) as f64 * span).min(src as f64);
+            let a = ((k as u128 * src as u128) / out as u128) as usize;
+            let b = (((k + 1) as u128 * src as u128).div_ceil(out as u128) as usize).min(src);
+            lo.push(a as u32);
+            hi.push(b as u32);
+            if b - a == 1 {
+                left.push(((end - start) / span) as f32);
+                right.push(0.0);
+            } else {
+                left.push((((a + 1) as f64 - start) / span) as f32);
+                right.push(((end - (b - 1) as f64) / span) as f32);
+            }
+        }
+        Self {
+            out,
+            cell,
+            w0,
+            w1,
+            lo,
+            hi,
+            left,
+            right,
+            inner: (1.0 / span) as f32,
+        }
     }
 
     /// Cell and weights of source pixel `i`.
@@ -56,6 +93,7 @@ impl Axis {
 pub trait Sample: Copy + Default {
     const MAX: f32;
     fn to_f32(self) -> f32;
+    fn to_u64(self) -> u64;
     fn from_f32(v: f32) -> Self;
 }
 
@@ -64,6 +102,10 @@ impl Sample for u8 {
     #[inline(always)]
     fn to_f32(self) -> f32 {
         self as f32
+    }
+    #[inline(always)]
+    fn to_u64(self) -> u64 {
+        self as u64
     }
     #[inline(always)]
     fn from_f32(v: f32) -> Self {
@@ -78,6 +120,10 @@ impl Sample for u16 {
         self as f32
     }
     #[inline(always)]
+    fn to_u64(self) -> u64 {
+        self as u64
+    }
+    #[inline(always)]
     fn from_f32(v: f32) -> Self {
         (v + 0.5).clamp(0.0, 65_535.0) as u16
     }
@@ -89,6 +135,7 @@ pub struct Core {
     pub xs: Axis,
     pub ys: Axis,
     has_alpha: bool,
+    src_width: usize,
     hrow: Vec<f32>,
 }
 
@@ -98,6 +145,7 @@ impl Core {
             xs: Axis::new(src.0, out.0),
             ys: Axis::new(src.1, out.1),
             has_alpha,
+            src_width: src.0,
             hrow: vec![0.0; out.0 * 4],
         }
     }
@@ -105,26 +153,75 @@ impl Core {
     /// Reduces a row of RGBA pixels, the `n`-th of which sits at source column `x0 + n * dx`,
     /// into `self.hrow`.
     fn reduce<T: Sample>(&mut self, row: &[T], x0: usize, dx: usize) {
-        self.hrow.fill(0.0);
-        let hrow = &mut self.hrow;
-        let xs = &self.xs;
-        for (n, px) in row.chunks_exact(4).enumerate() {
-            let (cell, w0, w1) = xs.at(x0 + n * dx);
-            let (mut r, mut g, mut b) = (px[0].to_f32(), px[1].to_f32(), px[2].to_f32());
-            let mut a = 0.0;
-            if self.has_alpha {
-                a = px[3].to_f32();
-                r *= a;
-                g *= a;
-                b *= a;
+        if x0 == 0 && dx == 1 && row.len() == self.src_width * 4 {
+            self.reduce_dense(row);
+        } else {
+            self.reduce_sparse(row, x0, dx);
+        }
+    }
+
+    /// `[r, g, b, a]` of a pixel, premultiplied when the image has alpha.
+    #[inline(always)]
+    fn weigh<T: Sample>(&self, px: &[T]) -> [f32; 4] {
+        let (r, g, b) = (px[0].to_f32(), px[1].to_f32(), px[2].to_f32());
+        if self.has_alpha {
+            let a = px[3].to_f32();
+            [r * a, g * a, b * a, a]
+        } else {
+            [r, g, b, 0.0]
+        }
+    }
+
+    /// A whole row: each cell sums the pixels it fully contains in integers and adds its two cut
+    /// edge pixels with their fractional weights.
+    fn reduce_dense<T: Sample>(&mut self, row: &[T]) {
+        for k in 0..self.xs.out {
+            let (lo, hi) = (self.xs.lo[k] as usize, self.xs.hi[k] as usize);
+            let px = &row[lo * 4..hi * 4];
+            if hi - lo == 1 {
+                let v = self.weigh(px);
+                self.hrow[k * 4..k * 4 + 4].copy_from_slice(&v.map(|c| c * self.xs.left[k]));
+                continue;
             }
-            let v = [r, g, b, a];
-            let d = &mut hrow[cell * 4..cell * 4 + 4];
+            let first = self.weigh(&px[..4]);
+            let last = self.weigh(&px[px.len() - 4..]);
+            let mut sum = [0u64; 4];
+            let inner = &px[4..px.len() - 4];
+            if self.has_alpha {
+                for p in inner.chunks_exact(4) {
+                    let a = p[3].to_u64();
+                    sum[0] += p[0].to_u64() * a;
+                    sum[1] += p[1].to_u64() * a;
+                    sum[2] += p[2].to_u64() * a;
+                    sum[3] += a;
+                }
+            } else {
+                for p in inner.chunks_exact(4) {
+                    sum[0] += p[0].to_u64();
+                    sum[1] += p[1].to_u64();
+                    sum[2] += p[2].to_u64();
+                }
+            }
+            let (wl, wr, wi) = (self.xs.left[k], self.xs.right[k], self.xs.inner);
+            let d = &mut self.hrow[k * 4..k * 4 + 4];
+            for c in 0..4 {
+                d[c] = wl * first[c] + wr * last[c] + wi * sum[c] as f32;
+            }
+        }
+    }
+
+    /// Some pixels of a row (Adam7 passes): every pixel is scattered into its one or two cells.
+    fn reduce_sparse<T: Sample>(&mut self, row: &[T], x0: usize, dx: usize) {
+        self.hrow.fill(0.0);
+        for (n, px) in row.chunks_exact(4).enumerate() {
+            let (cell, w0, w1) = self.xs.at(x0 + n * dx);
+            let v = self.weigh(px);
+            let d = &mut self.hrow[cell * 4..cell * 4 + 4];
             for k in 0..4 {
                 d[k] += v[k] * w0;
             }
             if w1 != 0.0 {
-                let d = &mut hrow[cell * 4 + 4..cell * 4 + 8];
+                let d = &mut self.hrow[cell * 4 + 4..cell * 4 + 8];
                 for k in 0..4 {
                     d[k] += v[k] * w1;
                 }
@@ -261,8 +358,9 @@ impl InterlacedShrink {
 /// Headrooms to try, best accuracy first: the resampler keeps this many times the target size
 /// after the shrink. Against a full-resolution float Lanczos reference, 4 comes within about a
 /// dB of resampling the whole image and beats sharp (libvips shrinks by an integer factor to
-/// 2x and is several dB off on thin lines); 2 is the floor, where it ties with sharp.
-const HEADROOMS: [f64; 4] = [4.0, 3.0, 2.5, 2.0];
+/// 2x and is several dB off on thin lines); 2 is the floor, where it ties with sharp. (3 is skipped: it is erratically worse than 2.5 on
+/// thin lines, an aliasing resonance of the box with an exactly 3x Lanczos.)
+const HEADROOMS: [f64; 4] = [4.0, 3.5, 2.5, 2.0];
 
 /// Smallest source-to-intermediate ratio worth shrinking an axis for.
 const MIN_RATIO: f64 = 1.25;
@@ -369,6 +467,22 @@ mod tests {
             let b: Vec<u8> = inter.finish();
             let worst = a.iter().zip(&b).map(|(p, q)| p.abs_diff(*q)).max();
             assert!(worst <= Some(1), "alpha {alpha}: {worst:?}");
+        }
+    }
+
+    #[test]
+    fn dense_reduction_matches_scattering() {
+        for (w, out) in [(97, 10), (100, 10), (64, 63), (53, 11), (40, 40)] {
+            let px = picture(w, 1);
+            for alpha in [false, true] {
+                let mut core = Core::new((w, 1), (out, 1), alpha);
+                core.reduce_dense(&px[..w * 4]);
+                let dense = core.hrow.clone();
+                core.reduce_sparse(&px[..w * 4], 0, 1);
+                for (a, b) in dense.iter().zip(&core.hrow) {
+                    assert!((a - b).abs() <= 1e-3 * b.abs().max(1.0), "{w}->{out} alpha {alpha}: {a} vs {b}");
+                }
+            }
         }
     }
 
