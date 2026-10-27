@@ -133,11 +133,7 @@ pub fn probe(bytes: &[u8], input: &InputOptions) -> Result<HeaderInfo> {
 /// What the memory estimate of a job needs from the header: format, size, channels, depth,
 /// interlacing, pages. The same answers as [`probe`] gives for those, without the parts that read
 /// more of the file (density, EXIF); the orientation is only read when `orientation` asks for it.
-pub fn probe_layout(
-    bytes: &[u8],
-    input: &InputOptions,
-    orientation: bool,
-) -> Result<HeaderInfo> {
+pub fn probe_layout(bytes: &[u8], input: &InputOptions, orientation: bool) -> Result<HeaderInfo> {
     if let Some(header) = probe_synthetic(bytes, input) {
         return Ok(header);
     }
@@ -838,7 +834,8 @@ pub fn decode_footprint(
                 None if wide => {
                     // The 8-bit twin only exists next to the wide samples when no resize follows;
                     // an interlaced file is read whole into a buffer of its own first.
-                    bytes_per_pixel = if hint.is_some() { 8 } else { 12 } + 8 * u64::from(interlaced);
+                    bytes_per_pixel =
+                        if hint.is_some() { 8 } else { 12 } + 8 * u64::from(interlaced);
                 }
                 None => {}
             }
@@ -846,7 +843,11 @@ pub fn decode_footprint(
         Format::Jpeg => {
             if let Some(hint) = hint {
                 size = if jpeg_rule_eighths() {
-                    let n = u64::from(jpeg_scale_numerator(source, hint.target, if fast_shrink { 1 } else { 2 }));
+                    let n = u64::from(jpeg_scale_numerator(
+                        source,
+                        hint.target,
+                        if fast_shrink { 1 } else { 2 },
+                    ));
                     let scaled = |side: u32| (u64::from(side) * n).div_ceil(8) as u32;
                     (scaled(source.0), scaled(source.1))
                 } else {

@@ -283,15 +283,33 @@ mod tests {
     fn derived_budget() {
         let gib = 1u64 << 30;
         // Half a container's limit, a quarter of unlimited RAM.
-        assert_eq!(derive_budget_mb(Some(4 * gib), Some(64 * gib)), (2048, BudgetSource::Cgroup));
-        assert_eq!(derive_budget_mb(None, Some(32 * gib)), (8192, BudgetSource::Ram));
+        assert_eq!(
+            derive_budget_mb(Some(4 * gib), Some(64 * gib)),
+            (2048, BudgetSource::Cgroup)
+        );
+        assert_eq!(
+            derive_budget_mb(None, Some(32 * gib)),
+            (8192, BudgetSource::Ram)
+        );
         // A limit above the RAM is no limit.
-        assert_eq!(derive_budget_mb(Some(128 * gib), Some(32 * gib)), (8192, BudgetSource::Ram));
+        assert_eq!(
+            derive_budget_mb(Some(128 * gib), Some(32 * gib)),
+            (8192, BudgetSource::Ram)
+        );
         // Never below 512 MB.
-        assert_eq!(derive_budget_mb(Some(gib), Some(32 * gib)), (512, BudgetSource::Cgroup));
-        assert_eq!(derive_budget_mb(Some(256 << 20), None), (512, BudgetSource::Cgroup));
+        assert_eq!(
+            derive_budget_mb(Some(gib), Some(32 * gib)),
+            (512, BudgetSource::Cgroup)
+        );
+        assert_eq!(
+            derive_budget_mb(Some(256 << 20), None),
+            (512, BudgetSource::Cgroup)
+        );
         assert_eq!(derive_budget_mb(None, Some(gib)), (512, BudgetSource::Ram));
-        assert_eq!(derive_budget_mb(None, None), (FALLBACK_BUDGET_MB, BudgetSource::Fallback));
+        assert_eq!(
+            derive_budget_mb(None, None),
+            (FALLBACK_BUDGET_MB, BudgetSource::Fallback)
+        );
     }
 
     #[test]
@@ -302,7 +320,8 @@ mod tests {
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("fastpkg-cgroup-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("fastpkg-cgroup-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -316,8 +335,15 @@ mod tests {
         std::fs::write(mount.join("user.slice/app.scope/memory.max"), "max\n").unwrap();
         let limit = cgroup_limit(&mount, "0::/user.slice/app.scope\n");
         assert_eq!(limit, Some(8589934592));
-        std::fs::write(mount.join("user.slice/app.scope/memory.max"), "1073741824\n").unwrap();
-        assert_eq!(cgroup_limit(&mount, "0::/user.slice/app.scope\n"), Some(1073741824));
+        std::fs::write(
+            mount.join("user.slice/app.scope/memory.max"),
+            "1073741824\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cgroup_limit(&mount, "0::/user.slice/app.scope\n"),
+            Some(1073741824)
+        );
         // Inside a container the process sees its own cgroup as the root.
         std::fs::write(mount.join("memory.max"), "536870912\n").unwrap();
         assert_eq!(cgroup_limit(&mount, "0::/\n"), Some(536870912));
@@ -334,10 +360,18 @@ mod tests {
             "9223372036854771712\n",
         )
         .unwrap();
-        std::fs::write(mount.join("memory/docker/abc/memory.limit_in_bytes"), "2147483648\n").unwrap();
+        std::fs::write(
+            mount.join("memory/docker/abc/memory.limit_in_bytes"),
+            "2147483648\n",
+        )
+        .unwrap();
         let text = "12:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n1:name=systemd:/docker/abc\n";
         assert_eq!(cgroup_limit(&mount, text), Some(2147483648));
-        std::fs::write(mount.join("memory/docker/abc/memory.limit_in_bytes"), "9223372036854771712\n").unwrap();
+        std::fs::write(
+            mount.join("memory/docker/abc/memory.limit_in_bytes"),
+            "9223372036854771712\n",
+        )
+        .unwrap();
         assert_eq!(cgroup_limit(&mount, text), None);
         assert_eq!(cgroup_limit(&mount, "0::/\n"), None);
         let _ = std::fs::remove_dir_all(&mount);
@@ -388,7 +422,11 @@ mod tests {
                 }
             });
             settle().await;
-            assert_eq!(started.load(Ordering::SeqCst), 0, "ran next to the huge job");
+            assert_eq!(
+                started.load(Ordering::SeqCst),
+                0,
+                "ran next to the huge job"
+            );
             drop(huge);
             waiting.await.unwrap();
             assert_eq!(started.load(Ordering::SeqCst), 1);

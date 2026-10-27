@@ -48,10 +48,7 @@ fn encoder_bytes_per_pixel(format: Format) -> u64 {
 
 /// Output size (width, height) of the resize step, as the resize computes it, and the size of
 /// the frame after the `cover` crop / `contain` padding that follows it.
-fn resize_sizes(
-    source: (u32, u32),
-    operation: &Operation,
-) -> Option<((u32, u32), (u32, u32))> {
+fn resize_sizes(source: (u32, u32), operation: &Operation) -> Option<((u32, u32), (u32, u32))> {
     let Operation::Resize {
         width,
         height,
@@ -124,8 +121,8 @@ pub fn estimate_header(header: &HeaderInfo, spec: &PipelineSpec, encodes: bool) 
     };
     let scaled = |bytes: u64| bytes * colourspace_percent / 100;
 
-    let mut peak = pixels(footprint.size) * footprint.bytes_per_pixel * DECODE_PERCENT / 100
-        + footprint.extra;
+    let mut peak =
+        pixels(footprint.size) * footprint.bytes_per_pixel * DECODE_PERCENT / 100 + footprint.extra;
 
     // `logical` is the size the operations compute their targets from (the full-resolution size,
     // as the resize does after a shrink on load), `held` the size of the pixels in memory.
@@ -165,9 +162,10 @@ pub fn estimate_header(header: &HeaderInfo, spec: &PipelineSpec, encodes: bool) 
                 right,
                 ..
             } => {
-                let grown = |size: u32, given: Option<u32>, before: Option<u32>, after: Option<u32>| {
-                    given.unwrap_or(size + before.unwrap_or(0) + after.unwrap_or(0))
-                };
+                let grown =
+                    |size: u32, given: Option<u32>, before: Option<u32>, after: Option<u32>| {
+                        given.unwrap_or(size + before.unwrap_or(0) + after.unwrap_or(0))
+                    };
                 held = (
                     grown(held.0, *width, *left, *right),
                     grown(held.1, *height, *top, *bottom),
@@ -282,7 +280,7 @@ pub fn estimate_path(path: &str, spec: &PipelineSpec, encodes: bool) -> Result<u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastpkg_core::options::Kernel;
+    use fastpkg_core::options::{Kernel, OutputOptions};
 
     const MB: u64 = 1_000_000;
 
@@ -315,10 +313,14 @@ mod tests {
     }
 
     fn spec(operations: Vec<Operation>, format: Format) -> PipelineSpec {
-        let mut spec = PipelineSpec::default();
-        spec.operations = operations;
-        spec.output.format = Some(format);
-        spec
+        PipelineSpec {
+            operations,
+            output: OutputOptions {
+                format: Some(format),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -353,7 +355,8 @@ mod tests {
         // Progressive files keep their coefficients for the whole source.
         let mut progressive = jpeg.clone();
         progressive.is_progressive = true;
-        let coefficients = estimate_header(&progressive, &spec(vec![resize(1200)], Format::Jpeg), true);
+        let coefficients =
+            estimate_header(&progressive, &spec(vec![resize(1200)], Format::Jpeg), true);
         assert!(coefficients > medium + 30 * MB, "{coefficients}");
     }
 
