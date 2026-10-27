@@ -6,6 +6,11 @@
 
 - WebP: the EXIF orientation is read from WebP files written by libvips/sharp (their EXIF chunk starts with the JPEG-style `Exif\0\0` prefix, which the container reader rejected), so `metadata().orientation`, `rotate()`/`autoOrient()` and `sharp(..., { autoOrient: true })` no longer leave a rotated WebP sideways.
 
+### Fixed (continued)
+
+- `concurrency(n)` now takes effect after the library has been used. Each image job runs on a rayon pool of `n` threads (sharp's meaning: threads per image) that is rebuilt on the first job after the value changes; it used to size rayon's global pool once and ignore later changes. `concurrency(0)` or no argument restores the default (the number of cores). Concurrent jobs still run in parallel whatever `n` is. Tiny concurrent jobs cost about 10% more at the default thread count (8 concurrent 200 px resizes: 2.3 ms against 2.1 ms).
+- `versions.vips` reported `fastpkg 0.1.0`; it now follows `versions.fastpkg`, and a test pins both to the package version so a stale native binary fails the release tests.
+
 ### Memory and speed
 
 - PNG downscales no longer lose accuracy or wall time below 32 MP: the row-by-row box pre-shrink now only applies to images of at least 32 MP (128 MiB as RGBA), where it saves memory; smaller files decode at full size and the parallel Lanczos resize sees every pixel again, as in 0.3.0 (a 4096x4096 PNG to 1024 px is 349 ms against 393 ms in 0.3.0, sharp 302 ms). `FASTPKG_PNG_SHRINK_MIN_PIXELS` overrides the threshold.

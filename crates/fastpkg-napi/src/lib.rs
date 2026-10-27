@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 mod alloc;
 
@@ -18,6 +19,48 @@ fn init() {
 }
 
 static CONCURRENCY: AtomicUsize = AtomicUsize::new(0);
+/// Bumped by every `concurrency(n)`: a pool built under an older value is replaced by the next job.
+static POOL_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// The rayon pool of this blocking-pool thread: `concurrency` threads per image, as in sharp
+    /// (rayon's global pool cannot be resized once it exists). It lives as long as the thread, so
+    /// jobs on a warm thread pay nothing for it; idle blocking threads exit and take it along.
+    static JOB_POOL: RefCell<Option<(u64, std::sync::Arc<rayon::ThreadPool>)>> = const { RefCell::new(None) };
+}
+
+fn configured_threads() -> usize {
+    match CONCURRENCY.load(Ordering::Relaxed) {
+        0 => std::thread::available_parallelism().map_or(1, |value| value.get()),
+        threads => threads,
+    }
+}
+
+/// Runs `job` with every rayon operation inside it on this thread's pool of `concurrency`
+/// threads, rebuilding the pool first if `concurrency()` changed since it was made.
+fn in_job_pool<T: Send>(job: impl FnOnce() -> T + Send) -> T {
+    let generation = POOL_GENERATION.load(Ordering::Acquire);
+    let pool = JOB_POOL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_ref() {
+            Some((built, pool)) if *built == generation => Some(pool.clone()),
+            _ => {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(configured_threads())
+                    .thread_name(|index| format!("fastpkg-{index}"))
+                    .build()
+                    .ok()
+                    .map(std::sync::Arc::new);
+                *slot = pool.clone().map(|pool| (generation, pool));
+                pool
+            }
+        }
+    });
+    match pool {
+        Some(pool) => pool.install(job),
+        None => job(),
+    }
+}
 static SIMD_ENABLED: AtomicBool = AtomicBool::new(true);
 
 #[napi(object)]
@@ -68,10 +111,12 @@ fn run_input(input: Either<Buffer, String>, spec: PipelineSpec) -> Result<RunRes
 pub async fn process(input: Either<Buffer, String>, spec: Value) -> Result<JsOutput> {
     let spec = parse_spec(spec)?;
     let result = tokio::task::spawn_blocking(move || {
-        let result = run_input(input, spec).map_err(|e| e.to_string())?;
-        let info = serde_json::to_value(&result.info).map_err(|e| e.to_string())?;
-        let metadata = serde_json::to_value(&result.header).map_err(|e| e.to_string())?;
-        Ok::<_, String>((result.data, info, metadata))
+        in_job_pool(move || {
+            let result = run_input(input, spec).map_err(|e| e.to_string())?;
+            let info = serde_json::to_value(&result.info).map_err(|e| e.to_string())?;
+            let metadata = serde_json::to_value(&result.header).map_err(|e| e.to_string())?;
+            Ok::<_, String>((result.data, info, metadata))
+        })
     })
     .await
     .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?
@@ -86,9 +131,11 @@ pub async fn process(input: Either<Buffer, String>, spec: Value) -> Result<JsOut
 #[napi]
 pub async fn metadata(input: Either<Buffer, String>, spec: Value) -> Result<Value> {
     let spec = parse_spec(spec)?;
-    tokio::task::spawn_blocking(move || match input {
-        Either::A(buffer) => metadata_bytes(&buffer, &spec).map_err(map_error),
-        Either::B(path) => metadata_path(&path, &spec).map_err(map_error),
+    tokio::task::spawn_blocking(move || {
+        in_job_pool(move || match input {
+            Either::A(buffer) => metadata_bytes(&buffer, &spec).map_err(map_error),
+            Either::B(path) => metadata_path(&path, &spec).map_err(map_error),
+        })
     })
     .await
     .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?
@@ -128,12 +175,15 @@ pub fn probe_sync(input: Either<Buffer, String>, spec: Value) -> Result<Value> {
 pub async fn stats(input: Either<Buffer, String>, spec: Value) -> Result<Value> {
     let spec = parse_spec(spec)?;
     tokio::task::spawn_blocking(move || {
-        let result = match input {
-            Either::A(buffer) => stats_bytes(&buffer, &spec),
-            Either::B(path) => stats_path(&path, &spec),
-        }
-        .map_err(map_error)?;
-        serde_json::to_value(result).map_err(|e| Error::new(Status::GenericFailure, e.to_string()))
+        in_job_pool(move || {
+            let result = match input {
+                Either::A(buffer) => stats_bytes(&buffer, &spec),
+                Either::B(path) => stats_path(&path, &spec),
+            }
+            .map_err(map_error)?;
+            serde_json::to_value(result)
+                .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))
+        })
     })
     .await
     .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?
@@ -143,22 +193,24 @@ pub async fn stats(input: Either<Buffer, String>, spec: Value) -> Result<Value> 
 pub async fn probe(input: Either<Buffer, String>, spec: Value) -> Result<Value> {
     let spec = parse_spec(spec)?;
     tokio::task::spawn_blocking(move || {
-        let (header, extras) = match input {
-            Either::A(buffer) => probe_bytes(&buffer, &spec),
-            Either::B(path) => probe_path(&path, &spec),
-        }
-        .map_err(map_error)?;
-        let mut value = serde_json::to_value(&header)
-            .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
-        if let Some(object) = value.as_object_mut() {
-            if let Some(orientation) = extras.orientation {
-                object.insert("orientation".into(), json!(orientation));
+        in_job_pool(move || {
+            let (header, extras) = match input {
+                Either::A(buffer) => probe_bytes(&buffer, &spec),
+                Either::B(path) => probe_path(&path, &spec),
             }
-            if let Some(exif) = extras.exif {
-                object.insert("exif".into(), exif);
+            .map_err(map_error)?;
+            let mut value = serde_json::to_value(&header)
+                .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
+            if let Some(object) = value.as_object_mut() {
+                if let Some(orientation) = extras.orientation {
+                    object.insert("orientation".into(), json!(orientation));
+                }
+                if let Some(exif) = extras.exif {
+                    object.insert("exif".into(), exif);
+                }
             }
-        }
-        Ok(value)
+            Ok(value)
+        })
     })
     .await
     .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?
@@ -168,10 +220,12 @@ pub async fn probe(input: Either<Buffer, String>, spec: Value) -> Result<Value> 
 pub async fn to_file(input: Either<Buffer, String>, path: String, spec: Value) -> Result<Value> {
     let spec = parse_spec(spec)?;
     tokio::task::spawn_blocking(move || {
-        let result = run_input(input, spec)?;
-        write_file(&path, &result).map_err(map_error)?;
-        serde_json::to_value(&result.info)
-            .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))
+        in_job_pool(move || {
+            let result = run_input(input, spec)?;
+            write_file(&path, &result).map_err(map_error)?;
+            serde_json::to_value(&result.info)
+                .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))
+        })
     })
     .await
     .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?
@@ -179,31 +233,25 @@ pub async fn to_file(input: Either<Buffer, String>, path: String, spec: Value) -
 
 #[napi]
 pub fn set_concurrency(value: Option<u32>) -> u32 {
-    let requested = value.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|v| v.get() as u32)
-            .unwrap_or(1)
-    });
-    let requested = requested.max(1);
-    let previous = CONCURRENCY.swap(requested as usize, Ordering::Relaxed);
-    if previous == 0 {
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(requested as usize)
-            .build_global();
-    }
-    rayon::current_num_threads() as u32
+    let requested = value.map_or(0, |threads| threads.max(1) as usize);
+    CONCURRENCY.store(requested, Ordering::Relaxed);
+    // Every job pool is rebuilt at its next job, so this takes effect even after the library
+    // has been in use. Jobs already running finish on the pool they started with.
+    POOL_GENERATION.fetch_add(1, Ordering::AcqRel);
+    configured_threads() as u32
+}
+
+/// Threads of the pool a job started now would run on (diagnostics and tests).
+#[napi]
+pub async fn job_pool_threads() -> Result<u32> {
+    tokio::task::spawn_blocking(|| in_job_pool(|| rayon::current_num_threads() as u32))
+        .await
+        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))
 }
 
 #[napi]
 pub fn get_concurrency() -> u32 {
-    let configured = CONCURRENCY.load(Ordering::Relaxed);
-    if configured > 0 {
-        configured as u32
-    } else {
-        std::thread::available_parallelism()
-            .map(|value| value.get() as u32)
-            .unwrap_or(1)
-    }
+    configured_threads() as u32
 }
 
 #[napi]

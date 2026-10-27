@@ -2741,11 +2741,14 @@ image.simd = function simd(value) {
 };
 
 image.format = native.formats();
+const nativeVersions = native.versions();
 image.versions = {
-  ...native.versions(),
+  ...nativeVersions,
   jpeg: 'MozJPEG + jpeg-decoder fallback',
-  vips: 'fastpkg 0.1.0',
+  vips: `fastpkg ${nativeVersions.fastpkg}`,
 };
+// Internal: the thread count of the pool the next job runs on (tests, diagnostics).
+Object.defineProperty(image, '_jobPoolThreads', { value: () => native.jobPoolThreads(), enumerable: false });
 image.interpolators = {
   nearest: 'nearest',
   bilinear: 'bilinear',
