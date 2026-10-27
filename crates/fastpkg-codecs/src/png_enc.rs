@@ -117,25 +117,9 @@ pub fn encode(p: &Params, samples: &[u8], out: &mut Vec<u8>) {
         choose_plan(&passes, bpp, level, p.color_type == 3, p.adaptive)
     };
     let direct = !p.interlace && plan.strategy == Strategy::None && plan.method != Method::Stored;
-    let filtered;
-    let src = if direct {
-        // Unfiltered rows go straight to the compressor.
-        Source::Plain {
-            data: samples,
-            row_bytes,
-            rows: h,
-        }
-    } else {
-        let mut f = Vec::with_capacity(passes.iter().map(|(rb, r, _)| (rb + 1) * r).sum());
-        for (rb, rows, data) in &passes {
-            filter_into(data, *rb, *rows, bpp, plan.strategy, &mut f);
-        }
-        filtered = f;
-        Source::Flat(&filtered)
-    };
-    let z = zlib(&src, plan.method);
-
-    out.reserve(z.len() + z.len() / 4096 * 12 + 512);
+    // Filtered rows of a plain (non-Adam7) image are made block by block while it is deflated,
+    // so the filtered copy of the whole frame never exists.
+    let lazy = !p.interlace && plan.strategy != Strategy::None && plan.method != Method::Stored;
     out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
     let mut header = Vec::with_capacity(13);
     header.extend_from_slice(&p.width.to_be_bytes());
@@ -148,10 +132,82 @@ pub fn encode(p: &Params, samples: &[u8], out: &mut Vec<u8>) {
     if let Some(trns) = p.trns {
         crc_chunk(out, b"tRNS", trns);
     }
-    for part in z.chunks(IDAT_CHUNK) {
-        crc_chunk(out, b"IDAT", part);
+    let mut idat = IdatWriter::new(out);
+    if lazy {
+        zlib_filtered(samples, row_bytes, h, bpp, plan.strategy, plan.method, &mut |bytes| {
+            idat.write(bytes)
+        });
+    } else {
+        let filtered;
+        let src = if direct {
+            // Unfiltered rows go straight to the compressor.
+            Source::Plain {
+                data: samples,
+                row_bytes,
+                rows: h,
+            }
+        } else {
+            let mut f = Vec::with_capacity(passes.iter().map(|(rb, r, _)| (rb + 1) * r).sum());
+            for (rb, rows, data) in &passes {
+                filter_into(data, *rb, *rows, bpp, plan.strategy, &mut f);
+            }
+            filtered = f;
+            Source::Flat(&filtered)
+        };
+        idat.write(&zlib(&src, plan.method));
     }
+    idat.finish();
     crc_chunk(out, b"IEND", &[]);
+}
+
+/// Writes a byte stream as IDAT chunks of at most `IDAT_CHUNK` bytes, as it arrives.
+struct IdatWriter<'a> {
+    out: &'a mut Vec<u8>,
+    /// Offset of the open chunk's length field, and how much payload it holds.
+    start: usize,
+    len: usize,
+}
+
+impl<'a> IdatWriter<'a> {
+    fn new(out: &'a mut Vec<u8>) -> Self {
+        Self {
+            out,
+            start: 0,
+            len: 0,
+        }
+    }
+
+    fn write(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            if self.len == 0 {
+                self.start = self.out.len();
+                self.out.extend_from_slice(&[0, 0, 0, 0]);
+                self.out.extend_from_slice(b"IDAT");
+            }
+            let n = (IDAT_CHUNK - self.len).min(bytes.len());
+            self.out.extend_from_slice(&bytes[..n]);
+            self.len += n;
+            bytes = &bytes[n..];
+            if self.len == IDAT_CHUNK {
+                self.close();
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        if self.len > 0 {
+            self.out[self.start..self.start + 4].copy_from_slice(&(self.len as u32).to_be_bytes());
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&self.out[self.start + 4..]);
+            let crc = hasher.finalize();
+            self.out.extend_from_slice(&crc.to_be_bytes());
+            self.len = 0;
+        }
+    }
+
+    fn finish(mut self) {
+        self.close();
+    }
 }
 
 fn adam7_passes(samples: &[u8], w: usize, h: usize, bpp: usize) -> Vec<(usize, usize, Vec<u8>)> {
@@ -796,19 +852,103 @@ fn stored_blocks(data: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Complete zlib stream. Large inputs are deflated as fixed-size blocks, in parallel, each
-/// primed with the previous 32 KiB (LZ methods) and concatenated, so the bytes are identical
-/// at any thread count.
-pub fn zlib(src: &Source, method: Method) -> Vec<u8> {
-    let total = src.len();
+fn zlib_header(method: Method) -> [u8; 2] {
     let flg = match method {
         Method::Lz(2..=5) => 0x5e,
         Method::Lz(6) => 0x9c,
         Method::Lz(7..) => 0xda,
         _ => 0x01,
     };
+    [0x78, flg]
+}
+
+/// Blocks of `SPLIT_BLOCK` bytes filtered (and then deflated) at a time by [`zlib_filtered`].
+const FILTER_BLOCKS: usize = 16;
+
+/// The zlib stream of the filtered rows of `data`, handed to `emit` in order as it is made:
+/// the bytes of [`zlib`] over `Source::Flat` of the filtered rows, without that copy. The rows
+/// are filtered a group of blocks at a time (in parallel), the blocks of the group are deflated
+/// in parallel, and each group keeps the last 32 KiB of the one before as dictionary.
+fn zlib_filtered(
+    data: &[u8],
+    row_bytes: usize,
+    rows: usize,
+    bpp: usize,
+    strategy: Strategy,
+    method: Method,
+    emit: &mut dyn FnMut(&[u8]),
+) {
+    let stride = row_bytes + 1;
+    let total = stride * rows;
+    let filter = |first: usize, end: usize| -> Vec<u8> {
+        let mut out = vec![0u8; (end - first) * stride];
+        out.par_chunks_mut(stride * ROWS_PER_TASK)
+            .enumerate()
+            .for_each(|(task, chunk)| {
+                let start = first + task * ROWS_PER_TASK;
+                let stop = (start + ROWS_PER_TASK).min(end);
+                filter_range(data, row_bytes, bpp, start, stop, strategy, chunk);
+            });
+        out
+    };
+    emit(&zlib_header(method));
+    if total < SPLIT_MIN {
+        let filtered = filter(0, rows);
+        let src = Source::Flat(&filtered);
+        emit(&deflate_raw(&src, 0, total, method, true));
+        emit(&src.adler(0, total).to_be_bytes());
+        return;
+    }
+    let count = total.div_ceil(SPLIT_BLOCK);
+    let mut adler = 1u32;
+    let mut tail: Vec<u8> = Vec::new();
+    let mut first_block = 0;
+    while first_block < count {
+        let last_block = (first_block + FILTER_BLOCKS).min(count);
+        let (from, to) = (first_block * SPLIT_BLOCK, (last_block * SPLIT_BLOCK).min(total));
+        let (first_row, end_row) = (from / stride, to.div_ceil(stride));
+        let filtered = filter(first_row, end_row);
+        let mut window = Vec::with_capacity(tail.len() + (to - from));
+        window.extend_from_slice(&tail);
+        window.extend_from_slice(&filtered[from - first_row * stride..to - first_row * stride]);
+        drop(filtered);
+        let prefix = tail.len();
+        let parts: Vec<(Vec<u8>, u32)> = (first_block..last_block)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * SPLIT_BLOCK;
+                let end = (start + SPLIT_BLOCK).min(total);
+                let src = Source::Flat(&window);
+                let (local_start, local_end) = (start - from + prefix, end - from + prefix);
+                (
+                    deflate_raw(&src, local_start, local_end, method, i + 1 == count),
+                    src.adler(local_start, local_end),
+                )
+            })
+            .collect();
+        for (k, (bytes, a)) in parts.iter().enumerate() {
+            let i = first_block + k;
+            emit(bytes);
+            let len = SPLIT_BLOCK.min(total - i * SPLIT_BLOCK);
+            adler = if i == 0 {
+                *a
+            } else {
+                adler32_combine(adler, *a, len)
+            };
+        }
+        tail = window[window.len().saturating_sub(32768)..].to_vec();
+        first_block = last_block;
+    }
+    emit(&adler.to_be_bytes());
+}
+
+/// Complete zlib stream. Large inputs are deflated as fixed-size blocks, in parallel, each
+/// primed with the previous 32 KiB (LZ methods) and concatenated, so the bytes are identical
+/// at any thread count.
+pub fn zlib(src: &Source, method: Method) -> Vec<u8> {
+    let total = src.len();
     let mut out = Vec::with_capacity(total / 2 + 64);
-    out.extend_from_slice(&[0x78, flg]);
+    out.extend_from_slice(&zlib_header(method));
     if method == Method::Stored {
         let data = src.bytes(0, total);
         stored_blocks(&data, &mut out);
@@ -890,6 +1030,30 @@ mod tests {
                     .read_to_end(&mut back)
                     .unwrap_or_else(|e| panic!("n={n} method={level:?}: {e}"));
                 assert_eq!(back, data, "n={n} method={level:?}");
+            }
+        }
+    }
+
+    /// Filtering while deflating gives the stream of deflating the filtered frame, byte for byte,
+    /// for frames of one block to several groups of blocks, with rows that do not divide them.
+    #[test]
+    fn filtered_stream_equals_the_filtered_frame() {
+        for (row_bytes, rows, bpp) in [
+            (3usize * 31, 17usize, 3usize),
+            (4 * 1000, 40, 4),
+            (3 * 997, 1500, 3),
+            (4 * 1531, 2300, 4),
+        ] {
+            let data = sample(row_bytes * rows);
+            for method in [Method::Entropy, Method::Lz(1), Method::Lz(4)] {
+                let mut flat = Vec::new();
+                filter_into(&data, row_bytes, rows, bpp, Strategy::Adaptive, &mut flat);
+                let want = zlib(&Source::Flat(&flat), method);
+                let mut got = Vec::new();
+                zlib_filtered(&data, row_bytes, rows, bpp, Strategy::Adaptive, method, &mut |b| {
+                    got.extend_from_slice(b)
+                });
+                assert!(got == want, "{row_bytes}x{rows} {method:?}: {} vs {} bytes", got.len(), want.len());
             }
         }
     }
