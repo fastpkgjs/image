@@ -15,6 +15,11 @@ const maxAbs = (a, b) => {
   for (let i = 0; i < a.length; i++) worst = Math.max(worst, Math.abs(a[i] - b[i]));
   return worst;
 };
+const meanAbs = (a, b) => {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += Math.abs(a[i] - b[i]);
+  return sum / a.length;
+};
 
 for (const [name, spec] of Object.entries(cases)) {
   test(`interlaced shrink equals the non-interlaced shrink: ${name}`, async () => {
@@ -24,9 +29,10 @@ for (const [name, spec] of Object.entries(cases)) {
       const a = await raw4(engine(flat).resize({ width }));
       const b = await raw4(engine(adam7).resize({ width }));
       assert.deepEqual([a.info.width, a.info.height], [b.info.width, b.info.height]);
-      // The two accumulate in different orders in f32; the shrunk rows may differ by a rounding
-      // step, which the resampler after them can turn into one level.
-      assert.ok(maxAbs(a.data, b.data) <= 1, `${name} @${width}: ${maxAbs(a.data, b.data)}`);
+      // The two accumulate in different orders in f32, so a value on a rounding tie can land on
+      // either side; the resampler after them (negative lobes) can turn that into two levels.
+      assert.ok(maxAbs(a.data, b.data) <= 2, `${name} @${width}: ${maxAbs(a.data, b.data)}`);
+      assert.ok(meanAbs(a.data, b.data) <= 0.1, `${name} @${width}: mean ${meanAbs(a.data, b.data)}`);
     }
   });
 }

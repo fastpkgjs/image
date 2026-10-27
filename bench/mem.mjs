@@ -34,10 +34,26 @@ const SCENARIOS = {
   'big-jpeg-1200': { file: 'photo-4000.jpg', parallel: 1 },
   'big-jpeg-1200-x8': { file: 'photo-4000.jpg', parallel: 8 },
   // 16384x16384 PNG (bench/gen-huge-png.mjs): few iterations, one sample each, peak RSS matters.
+  // (More big fixtures: 16-bit and interlaced ones below.)
   'huge-png-800-png': { file: 'huge-256mp.png', parallel: 1, iters: 6, every: 1 },
   'huge-png-800-jpeg': { file: 'huge-256mp.png', parallel: 1, iters: 6, every: 1 },
   // The usual upload normalisation: auto-orient first, then resize.
   'huge-png-rotate-800-jpeg': { file: 'huge-256mp.png', parallel: 1, iters: 6, every: 1 },
+  // 16-bit RGB: 40 MP (a typical upload limit) and 31 MP (just under 32 MP), resized to 1200 px;
+  // and 40 MP to 3000 px, a mild downscale that cannot shrink while decoding.
+  'png16-40mp-rotate-1200-jpeg': { file: 'rgb16-40mp.png', parallel: 1, iters: 6, every: 1 },
+  'png16-31mp-rotate-1200-jpeg': { file: 'rgb16-31mp.png', parallel: 1, iters: 6, every: 1 },
+  'png16-40mp-rotate-3000-jpeg': { file: 'rgb16-40mp.png', parallel: 1, iters: 6, every: 1 },
+  // 16384x16384 Adam7 (interlaced) 8-bit RGB.
+  'huge-adam7-800-jpeg': { file: 'huge-256mp-adam7.png', parallel: 1, iters: 6, every: 1 },
+};
+
+// Big fixtures, written by gen-huge-png.mjs on first use (kept out of git under .cache).
+const FIXTURES = {
+  'huge-256mp.png': [],
+  'rgb16-40mp.png': ['--size', '6325', '--depth', '16'],
+  'rgb16-31mp.png': ['--size', '5568', '--depth', '16'],
+  'huge-256mp-adam7.png': ['--interlace'],
 };
 
 function run(engine, input, name, overlay) {
@@ -57,6 +73,13 @@ function run(engine, input, name, overlay) {
       return sharpLike(input, { limitInputPixels: false }).resize({ width: 800 }).jpeg({ quality: 80 }).toBuffer();
     case 'huge-png-rotate-800-jpeg':
       return sharpLike(input, { limitInputPixels: false }).rotate().resize({ width: 800 }).jpeg({ quality: 80 }).toBuffer();
+    case 'png16-40mp-rotate-1200-jpeg':
+    case 'png16-31mp-rotate-1200-jpeg':
+      return sharpLike(input, { limitInputPixels: false }).rotate().resize({ width: 1200 }).jpeg({ quality: 80 }).toBuffer();
+    case 'png16-40mp-rotate-3000-jpeg':
+      return sharpLike(input, { limitInputPixels: false }).rotate().resize({ width: 3000 }).jpeg({ quality: 80 }).toBuffer();
+    case 'huge-adam7-800-jpeg':
+      return sharpLike(input, { limitInputPixels: false }).resize({ width: 800 }).jpeg({ quality: 80 }).toBuffer();
     case 'big-jpeg-1200':
     case 'big-jpeg-1200-x8':
       return sharpLike(input).resize({ width: 1200 }).jpeg({ quality: 85 }).toBuffer();
@@ -108,9 +131,12 @@ async function child() {
 
 async function prepare() {
   fs.mkdirSync(cache, { recursive: true });
-  const huge = path.join(cache, 'huge-256mp.png');
-  if (!fs.existsSync(huge) && (opt('scenarios', 'huge') + '').includes('huge')) {
-    spawnSync(process.execPath, [path.join(here, 'gen-huge-png.mjs'), huge], { stdio: 'inherit' });
+  const wanted = new Set((opt('scenarios', Object.keys(SCENARIOS).join(',')) + '').split(',').map((name) => SCENARIOS[name]?.file));
+  for (const [name, args] of Object.entries(FIXTURES)) {
+    const file = path.join(cache, name);
+    if (wanted.has(name) && !fs.existsSync(file)) {
+      spawnSync(process.execPath, [path.join(here, 'gen-huge-png.mjs'), file, ...args], { stdio: 'inherit' });
+    }
   }
   if (fs.existsSync(path.join(cache, 'sprite-256.png'))) return;
   const sharp = (await import('sharp')).default;
