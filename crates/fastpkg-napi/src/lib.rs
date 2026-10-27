@@ -2,12 +2,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+mod admission;
 mod alloc;
 
 use fastpkg_core::PipelineSpec;
 use fastpkg_stream::{
-    execute_bytes, execute_path, metadata_bytes, metadata_path, probe_bytes, probe_path,
-    stats_bytes, stats_path, write_file, RunResult,
+    estimate_bytes, estimate_path, execute_bytes, execute_path, metadata_bytes, metadata_path,
+    probe_bytes, probe_path, stats_bytes, stats_path, write_file, RunResult,
 };
 use napi::bindgen_prelude::{Buffer, Either};
 use napi::{Error, Result, Status};
@@ -74,10 +75,11 @@ fn pool_threads(active: usize) -> usize {
     }
 }
 
-/// A running job's claim on the limiter: the permit goes back when this is dropped, on error and
-/// panic included.
+/// A running job's claim on the limiters: the count permit and its share of the memory budget
+/// go back when this is dropped, on error and panic included.
 struct Admission {
     _permit: OwnedSemaphorePermit,
+    _memory: admission::Claim,
 }
 
 impl Drop for Admission {
@@ -86,15 +88,32 @@ impl Drop for Admission {
     }
 }
 
-async fn admit() -> Admission {
+/// Waits for a job slot and then for `bytes` of the memory budget. The two are always taken in
+/// this order, so jobs queueing for memory never wait on a slot someone else needs to finish.
+async fn admit(bytes: u64) -> Admission {
     let semaphore = ADMISSION.get_or_init(|| Arc::new(Semaphore::new(max_jobs())));
     // The semaphore is never closed, so acquiring only fails if that stops being true.
     let permit = Arc::clone(semaphore)
         .acquire_owned()
         .await
         .expect("job limiter closed");
+    let memory = admission::claim(bytes).await;
     ACTIVE_JOBS.fetch_add(1, Ordering::AcqRel);
-    Admission { _permit: permit }
+    Admission {
+        _permit: permit,
+        _memory: memory,
+    }
+}
+
+/// Peak memory the job is going to need, from the header of its input (see
+/// `fastpkg_stream::estimate_header`). Anything that cannot be read is free: the job fails on
+/// its own right away.
+fn estimate_input(input: &Either<Buffer, String>, spec: &PipelineSpec, encodes: bool) -> u64 {
+    let estimate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match input {
+        Either::A(buffer) => estimate_bytes(buffer, spec, encodes),
+        Either::B(path) => estimate_path(path, spec, encodes),
+    }));
+    estimate.ok().and_then(|bytes| bytes.ok()).unwrap_or(0)
 }
 
 struct IdlePool {
@@ -241,16 +260,25 @@ fn in_job_pool<T: Send>(job: impl FnOnce() -> T + Send) -> T {
     }
 }
 
-/// Admits the job (at most `max_jobs()` run at once, the rest wait here, not on a thread), runs
-/// it on the blocking pool inside its rayon pool, and gives the permit back when it ends.
-async fn run_job<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> Result<T> {
-    let admission = admit().await;
+/// Admits the job (at most `max_jobs()` run at once, and together they stay within the memory
+/// budget; the rest wait here, not on a thread), runs it on the blocking pool inside its rayon
+/// pool, and gives its claims back when it ends. `bytes` is the job's estimated peak memory.
+async fn run_sized<T: Send + 'static>(
+    bytes: u64,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let admission = admit(bytes).await;
     tokio::task::spawn_blocking(move || {
         let _admission = admission;
         in_job_pool(job)
     })
     .await
     .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))
+}
+
+/// A job that reads headers only: it needs a slot but no share of the memory budget.
+async fn run_job<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    run_sized(0, job).await
 }
 
 static SIMD_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -302,7 +330,8 @@ fn run_input(input: Either<Buffer, String>, spec: PipelineSpec) -> Result<RunRes
 #[napi]
 pub async fn process(input: Either<Buffer, String>, spec: Value) -> Result<JsOutput> {
     let spec = parse_spec(spec)?;
-    let result = run_job(move || {
+    let bytes = estimate_input(&input, &spec, true);
+    let result = run_sized(bytes, move || {
         let result = run_input(input, spec).map_err(|e| e.to_string())?;
         let info = serde_json::to_value(&result.info).map_err(|e| e.to_string())?;
         let metadata = serde_json::to_value(&result.header).map_err(|e| e.to_string())?;
@@ -360,7 +389,8 @@ pub fn probe_sync(input: Either<Buffer, String>, spec: Value) -> Result<Value> {
 #[napi]
 pub async fn stats(input: Either<Buffer, String>, spec: Value) -> Result<Value> {
     let spec = parse_spec(spec)?;
-    run_job(move || {
+    let bytes = estimate_input(&input, &spec, false);
+    run_sized(bytes, move || {
         let result = match input {
             Either::A(buffer) => stats_bytes(&buffer, &spec),
             Either::B(path) => stats_path(&path, &spec),
@@ -398,7 +428,8 @@ pub async fn probe(input: Either<Buffer, String>, spec: Value) -> Result<Value> 
 #[napi]
 pub async fn to_file(input: Either<Buffer, String>, path: String, spec: Value) -> Result<Value> {
     let spec = parse_spec(spec)?;
-    run_job(move || {
+    let bytes = estimate_input(&input, &spec, true);
+    run_sized(bytes, move || {
         let result = run_input(input, spec)?;
         write_file(&path, &result).map_err(map_error)?;
         serde_json::to_value(&result.info)
@@ -416,6 +447,28 @@ pub fn set_concurrency(value: Option<u32>) -> u32 {
     POOL_GENERATION.fetch_add(1, Ordering::AcqRel);
     drop(std::mem::take(&mut lock_pools().idle));
     configured_threads() as u32
+}
+
+/// The peak memory in bytes that a job over this input is estimated to need, which is what it
+/// claims from the memory budget (diagnostics and tests).
+#[napi]
+pub fn estimate_job(input: Either<Buffer, String>, spec: Value) -> Result<f64> {
+    let spec = parse_spec(spec)?;
+    let estimate = match &input {
+        Either::A(buffer) => estimate_bytes(buffer, &spec, true),
+        Either::B(path) => estimate_path(path, &spec, true),
+    };
+    estimate.map(|bytes| bytes as f64).map_err(map_error)
+}
+
+/// The memory budget and what has been claimed from it so far (diagnostics and tests).
+#[napi]
+pub fn admission_info() -> Value {
+    let mut info = admission::info();
+    if let Some(object) = info.as_object_mut() {
+        object.insert("maxJobs".into(), json!(max_jobs()));
+    }
+    info
 }
 
 /// Threads of the pool a job started now would run on (diagnostics and tests).

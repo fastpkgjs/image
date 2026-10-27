@@ -741,6 +741,91 @@ pub struct ShrinkHint {
     pub shrink: f64,
 }
 
+/// What decoding one image holds in memory, as far as the header and the shrink-on-load plan
+/// tell (the memory estimate of a job that decides how many jobs run at once).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeFootprint {
+    /// Size of the decoded image, after any shrink on load.
+    pub size: (u32, u32),
+    /// Bytes per pixel of `size` that are resident when the decode is at its biggest.
+    pub bytes_per_pixel: u64,
+    /// Bytes that grow with the file, not with the decoded size (the coefficients of a
+    /// progressive JPEG are kept for the whole source image whatever the DCT scale).
+    pub extra: u64,
+}
+
+/// The decoded size and memory of `decode_with_hint(.., hint, fast_shrink)` for a file with this
+/// header; the same decisions as the decoders make, without reading the pixels.
+pub fn decode_footprint(
+    header: &HeaderInfo,
+    hint: Option<ShrinkHint>,
+    fast_shrink: bool,
+) -> DecodeFootprint {
+    let source = (header.width, header.height);
+    let mut size = source;
+    let mut bytes_per_pixel = 4;
+    let mut extra = 0;
+    match header.format {
+        Format::Png => {
+            let wide = header.depth == "ushort";
+            let interlaced = header.is_progressive;
+            let shrink = if header.is_palette {
+                None
+            } else {
+                png_shrink_target(source, wide, interlaced, hint.map(|hint| hint.target))
+            };
+            match shrink {
+                Some(target) => {
+                    size = target;
+                    bytes_per_pixel = png_shrink_cell_bytes(wide, interlaced);
+                }
+                None if wide => {
+                    // The 8-bit twin only exists next to the wide samples when no resize follows;
+                    // an interlaced file is read whole into a buffer of its own first.
+                    bytes_per_pixel = if hint.is_some() { 8 } else { 12 } + 8 * u64::from(interlaced);
+                }
+                None => {}
+            }
+        }
+        Format::Jpeg => {
+            if let Some(hint) = hint {
+                size = if jpeg_rule_eighths() {
+                    let n = u64::from(jpeg_scale_numerator(source, hint.target, if fast_shrink { 1 } else { 2 }));
+                    let scaled = |side: u32| (u64::from(side) * n).div_ceil(8) as u32;
+                    (scaled(source.0), scaled(source.1))
+                } else {
+                    let denominator = u32::from(jpeg_scale_denominator(hint.shrink, fast_shrink));
+                    (source.0 / denominator, source.1 / denominator)
+                };
+                size = (size.0.max(1), size.1.max(1));
+            }
+            if header.is_progressive {
+                // Three 16-bit coefficients per pixel at 4:2:0, up to six at 4:4:4.
+                extra = source.0 as u64 * source.1 as u64 * 4;
+            }
+        }
+        Format::Webp => {
+            if let Some(hint) = hint {
+                let headroom = if fast_shrink { 1 } else { 2 };
+                size = (
+                    source.0.min(hint.target.0.saturating_mul(headroom)),
+                    source.1.min(hint.target.1.saturating_mul(headroom)),
+                );
+            }
+        }
+        // The decoders keep planes or float samples next to the RGBA result.
+        Format::Avif => bytes_per_pixel = 16,
+        Format::Jxl => bytes_per_pixel = 20,
+        Format::Svg => bytes_per_pixel = 8,
+        _ => {}
+    }
+    DecodeFootprint {
+        size,
+        bytes_per_pixel,
+        extra,
+    }
+}
+
 /// libjpeg DCT scale denominator (the decoder output is `1/d` of the source) that sharp picks
 /// for a JPEG that is going to be shrunk by `shrink`: only 1, 2, 4 or 8, the largest that
 /// still leaves the resampler a factor of one (`fast_shrink`) or two (otherwise), lowered once
@@ -928,6 +1013,35 @@ const PNG_SHRINK_BUDGET: u64 = 128 << 20;
 
 /// Bytes per pixel of the interlaced accumulator (four `f32`).
 const INTERLACED_ACC_BYTES: u64 = 16;
+
+/// Bytes per pixel of the intermediate the shrink builds (and hands on): the wide RGBA samples
+/// and the 8-bit copy next to them for 16-bit images, plus the interlaced accumulator.
+fn png_shrink_cell_bytes(wide: bool, interlaced: bool) -> u64 {
+    let samples = if wide { 12 } else { 4 };
+    samples + if interlaced { INTERLACED_ACC_BYTES } else { 0 }
+}
+
+/// The size a PNG is decoded to when the first resize of the pipeline wants `hint`: `None` is
+/// the full size. Shared by the decoder and by the memory estimate of the job.
+fn png_shrink_target(
+    size: (u32, u32),
+    wide: bool,
+    interlaced: bool,
+    hint: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    // Decoded size as RGBA, and what the shrunk image costs while it is built and handed on
+    // (the interlaced accumulator, then 16-bit images keep an 8-bit copy next to the wide one).
+    let decoded_bytes = size.0 as u64 * size.1 as u64 * if wide { 8 } else { 4 };
+    hint.filter(|_| decoded_bytes >= png_shrink_min_bytes())
+        .and_then(|hint| {
+            png_shrink::plan(
+                size,
+                hint,
+                png_shrink_cell_bytes(wide, interlaced),
+                PNG_SHRINK_BUDGET,
+            )
+        })
+}
 
 /// A sample type of the expanded PNG rows: `u8`, or big-endian `u16` on the wire.
 trait PngSample: png_shrink::Sample {
@@ -1140,11 +1254,7 @@ fn decode_png_stream(
     let wide = depth == png::BitDepth::Sixteen;
     // Decoded size as RGBA, and what the shrunk image costs while it is built and handed on
     // (the interlaced accumulator, then 16-bit images keep an 8-bit copy next to the wide one).
-    let decoded_bytes = width as u64 * height as u64 * if wide { 8 } else { 4 };
-    let cell_bytes = if wide { 12 } else { 4 } + if interlaced { INTERLACED_ACC_BYTES } else { 0 };
-    let shrink = hint
-        .filter(|_| decoded_bytes >= png_shrink_min_bytes())
-        .and_then(|hint| png_shrink::plan((width, height), hint, cell_bytes, PNG_SHRINK_BUDGET));
+    let shrink = png_shrink_target((width, height), wide, interlaced, hint);
     if color == png::ColorType::Indexed || (interlaced && shrink.is_none()) {
         return decode_png_buffered(bytes, fail_on, stream_ended);
     }

@@ -2428,6 +2428,11 @@ class Sharp extends Duplex {
     }
   }
 
+  // Internal: the peak memory in bytes that the job admission claims for this pipeline.
+  async _jobEstimate() {
+    return native.estimateJob(await this._resolvedInput(), this._snap());
+  }
+
   async probe() {
     const spec = this._snap();
     try {
@@ -2748,6 +2753,8 @@ image.versions = {
   vips: `fastpkg ${nativeVersions.fastpkg}`,
 };
 // Internal: the thread count of the pool the next job runs on (tests, diagnostics).
+// Internal: the memory budget of the job admission and what has been claimed from it.
+Object.defineProperty(image, '_admission', { value: () => native.admissionInfo(), enumerable: false });
 Object.defineProperty(image, '_jobPoolThreads', { value: () => native.jobPoolThreads(), enumerable: false });
 image.interpolators = {
   nearest: 'nearest',
