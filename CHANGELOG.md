@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- JPEG resizes match sharp again: PSNR against sharp for `resize()` and `rotate().resize()` on 1.3x to 32x downscales (1600x1200 photographs and hard-edge test images, 4:2:0 and 4:4:4) was 42-51 dB for photographs and 20-38 dB for hard edges in 0.5.0 (0.4.0 only matched for `rotate()` because it did not shrink on load there); it is now 52-76 dB for both. Three causes, all in how the shrink is done rather than in the filter: (1) JPEG shrink-on-load used libjpeg's finest n/8 scale (3/8, 5/8, ...) where libvips only uses 1/2, 1/4 and 1/8, so the resampler started from a different image; it now uses sharp's exact rule (including `fastShrinkOnLoad: false` and the guard that lowers the scale when it equals the integer part of the shrink). (2) The resampler worked from the ratio of the rounded input and output sizes; libvips works from the shrink factors themselves and spreads the rounding over both ends of each axis, which moved the sampling grid by up to half a pixel when the output size was rounded (`resize(1000)` of a 2400x1600 image: 32 dB on hard edges, 59 dB now), and box-shrinks by an integer factor first when the kernel would otherwise see more than twice the output. Both are now reproduced for every format whose resize starts from the pixels it was sized for. (3) libvips drops the partial last block of a shrunk JPEG (`floor(size / scale)`) and sizes the resize from that image, which made 72 of 1470 sampled JPEG output sizes differ from sharp by a pixel (`1000x500` `outside` 50x50: 101x50 in sharp, 100x50 here); sizes are now identical in all of them (`tests/jpeg-parity.test.mjs`). `pipelineColourspace` no longer shrinks on load, as in sharp.
+- Shrink-on-load, the memory saving, is unchanged for `rotate()`/`autoOrient()`, `flip()`, `flop()`, `flatten()` and `greyscale()` before `resize()`. Only `rotate(90/180/270)` before `resize()` is further from sharp (35-60 dB against sharp's full-size decode); see docs/COMPATIBILITY.md.
+
 ## 0.5.0
 
 ### Fixed

@@ -801,6 +801,9 @@ fn decode_jpeg_mozjpeg(
         if source_width == 0 || source_height == 0 {
             return None;
         }
+        // The size libvips gives the shrunk image: libjpeg rounds the scaled size up and fills
+        // the partial last block, libvips rounds down and drops it.
+        let mut cropped = None;
         if let Some(hint) = hint {
             let scale = if jpeg_rule_eighths() {
                 jpeg_scale_numerator(
@@ -809,7 +812,10 @@ fn decode_jpeg_mozjpeg(
                     if fast_shrink { 1 } else { 2 },
                 )
             } else {
-                8 / jpeg_scale_denominator(hint.shrink, fast_shrink)
+                let denominator = jpeg_scale_denominator(hint.shrink, fast_shrink) as u32;
+                let size = (source_width / denominator, source_height / denominator);
+                cropped = (denominator > 1 && size.0 > 0 && size.1 > 0).then_some(size);
+                (8 / denominator) as u8
             };
             decompress.scale(scale);
         }
@@ -842,6 +848,19 @@ fn decode_jpeg_mozjpeg(
             };
             data = icc::cmyk_to_rgba(&data, embedded.as_deref())?;
         }
+        let (width, height) = match cropped {
+            Some((crop_width, crop_height)) if (crop_width, crop_height) != (width, height) => {
+                let (w, cw) = (width as usize * 4, crop_width as usize * 4);
+                if cw != w {
+                    for y in 1..crop_height as usize {
+                        data.copy_within(y * w..y * w + cw, y * cw);
+                    }
+                }
+                data.truncate(cw * crop_height as usize);
+                (crop_width, crop_height)
+            }
+            _ => (width, height),
+        };
         let mut image = Image::from_rgba(width, height, data).ok()?;
         image.has_alpha = false;
         image.format = Format::Jpeg;

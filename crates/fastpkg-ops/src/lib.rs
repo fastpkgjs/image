@@ -475,7 +475,7 @@ fn resize(
     // input and output sizes, so an output size that was rounded moves the sampling grid of
     // the axis it was derived for by up to half a pixel across the image. Only a resize that
     // starts from the pixels it was sized for can reproduce that.
-    let scales = shrunk.is_none().then(|| {
+    let scales = (shrunk.is_none() && kernel != Kernel::Nearest).then(|| {
         fastpkg_core::pipeline::resolve_shrink(
             source_width,
             source_height,
@@ -592,30 +592,27 @@ fn resize_plain(
     Ok(out)
 }
 
-/// The part of the source a resize with explicit shrink factors samples. libvips resamples
-/// with the shrink factors themselves, so an output size that was rounded leaves
-/// `out * shrink - in` pixels over or short, which it spreads evenly over both sides of each
-/// axis: the sampled region is `out * shrink` wide and centred on the source, and runs past the
-/// edges (repeating the last row or column) when the output size was rounded up. The region is
-/// given in the coordinates of the padded source, whose size is `canvas`. `None` when the region
-/// is the whole source anyway.
-struct SampledRegion {
-    pad: (u32, u32),
-    canvas: (u32, u32),
-    /// Left, top, width and height of the region on the canvas.
-    crop: [f64; 4],
+/// libvips' `gap` for `resize` (and so for sharp): the image is box-shrunk by an integer factor
+/// until what is left for the kernel is less than this many times the output.
+const RESIZE_GAP: f64 = 2.0;
+
+/// How libvips (`vips_reducev` / `vips_reduceh`, as called by `vips_resize`) resamples one axis
+/// when given the shrink factor itself instead of an output size.
+struct AxisPlan {
+    /// Integer box-shrink factor, applied first.
+    box_factor: u32,
+    /// Size of the box-shrunk axis (a partial last block is completed by repeating the edge).
+    shrunk: u32,
+    /// Start and extent of the region the kernel samples, in box-shrunk pixels. The output size
+    /// is rounded, so `out * shrink` is a fraction of a pixel off the input size; libvips
+    /// spreads that evenly over both ends, which can put the region partly outside the image
+    /// (the edge pixels are repeated there).
+    start: f64,
+    span: f64,
 }
 
-fn sampled_region(
-    source: (u32, u32),
-    output: (u32, u32),
-    scales: Option<(f64, f64)>,
-) -> Option<SampledRegion> {
-    let (sx, sy) = scales?;
-    // A factor below one is an enlargement, which libvips does with another interpolator.
-    if sx < 1.0 || sy < 1.0 {
-        return None;
-    }
+fn axis_plan(input: u32, output: u32, shrink: f64) -> AxisPlan {
+    // Floating point noise must not turn an exact fit into a sliver of padding.
     let snap = |v: f64| {
         let r = v.round();
         if (v - r).abs() < 1e-6 {
@@ -624,47 +621,177 @@ fn sampled_region(
             v
         }
     };
-    let span = (snap(output.0 as f64 * sx), snap(output.1 as f64 * sy));
-    if span == (source.0 as f64, source.1 as f64) {
-        return None;
+    let box_factor = ((input as f64 / output as f64 / RESIZE_GAP).floor() as u32).max(1);
+    let k = box_factor as f64;
+    let extra = (output as f64 * shrink - input as f64) / k;
+    AxisPlan {
+        box_factor,
+        shrunk: input.div_ceil(box_factor),
+        start: snap(-extra / 2.0),
+        span: snap(output as f64 * shrink / k),
     }
-    // Pixels to add on each side so that the region (centred on the source) fits.
-    let pad = |span: f64, source: u32| (((span - source as f64) / 2.0).ceil().max(0.0)) as u32;
-    let pad = (pad(span.0, source.0), pad(span.1, source.1));
-    let canvas = (source.0 + 2 * pad.0, source.1 + 2 * pad.1);
-    let left = pad.0 as f64 + snap((source.0 as f64 - span.0) / 2.0);
-    let top = pad.1 as f64 + snap((source.1 as f64 - span.1) / 2.0);
-    Some(SampledRegion {
-        pad,
-        canvas,
-        crop: [left, top, span.0, span.1],
-    })
 }
 
-/// `data` (`width` x `height` pixels of four samples) on a larger canvas, `pad` pixels bigger on
-/// each side horizontally and vertically, whose extra columns and rows repeat the edge ones.
+/// The steps of a resize that follows libvips: an integer box shrink, then the kernel over a
+/// region of the shrunk image. See [`AxisPlan`].
+struct ResizePlan {
+    box_factor: (u32, u32),
+    /// Pixels to add on the left, top, right and bottom of the box-shrunk image.
+    pad: [u32; 4],
+    /// Left, top, width and height of the sampled region on the padded image.
+    crop: [f64; 4],
+    canvas: (u32, u32),
+}
+
+fn resize_plan(
+    source: (u32, u32),
+    output: (u32, u32),
+    scales: Option<(f64, f64)>,
+) -> Option<ResizePlan> {
+    let (sx, sy) = scales?;
+    // A factor below one is an enlargement, which libvips does with another interpolator.
+    if sx < 1.0 || sy < 1.0 {
+        return None;
+    }
+    let x = axis_plan(source.0, output.0, sx);
+    let y = axis_plan(source.1, output.1, sy);
+    let pad = |axis: &AxisPlan| {
+        let before = (-axis.start).ceil().max(0.0) as u32;
+        let after = (axis.start + axis.span - axis.shrunk as f64)
+            .ceil()
+            .max(0.0) as u32;
+        (before, after)
+    };
+    let ((left, right), (top, bottom)) = (pad(&x), pad(&y));
+    let plan = ResizePlan {
+        box_factor: (x.box_factor, y.box_factor),
+        pad: [left, top, right, bottom],
+        crop: [x.start + left as f64, y.start + top as f64, x.span, y.span],
+        canvas: (x.shrunk + left + right, y.shrunk + top + bottom),
+    };
+    let untouched = plan.box_factor == (1, 1)
+        && plan.pad == [0; 4]
+        && plan.crop == [0.0, 0.0, source.0 as f64, source.1 as f64];
+    (!untouched).then_some(plan)
+}
+
+/// Mean of every `kx` x `ky` block of `data` (`width` x `height` pixels of four samples), the
+/// way `vips_shrink` does it: the output is rounded up and a partial last block is completed by
+/// repeating the edge. Channels of an image with alpha are weighted by it (the average of the
+/// premultiplied pixels, un-premultiplied again).
+fn box_shrink<T>(
+    data: &[T],
+    (width, height): (usize, usize),
+    (kx, ky): (usize, usize),
+    weighted: bool,
+) -> (Vec<T>, usize, usize)
+where
+    T: Copy + Send + Sync + Into<u64> + TryFrom<u64>,
+{
+    let (out_w, out_h) = (width.div_ceil(kx), height.div_ceil(ky));
+    let area = (kx * ky) as u64;
+    let mut out = vec![data[0]; out_w * out_h * 4];
+    let narrow = |v: u64| T::try_from(v).unwrap_or_else(|_| data[0]);
+    out.par_chunks_mut(out_w * 4)
+        .enumerate()
+        .for_each(|(oy, row)| {
+            let mut acc = vec![0u64; out_w * 4];
+            let mut weight = vec![0u64; if weighted { out_w } else { 0 }];
+            for dy in 0..ky {
+                let line = &data[(oy * ky + dy).min(height - 1) * width * 4..][..width * 4];
+                for ox in 0..out_w {
+                    for dx in 0..kx {
+                        let px = &line[(ox * kx + dx).min(width - 1) * 4..][..4];
+                        let a: u64 = px[3].into();
+                        if weighted {
+                            weight[ox] += a;
+                            for c in 0..3 {
+                                let v: u64 = px[c].into();
+                                acc[ox * 4 + c] += v * a;
+                            }
+                        } else {
+                            for c in 0..3 {
+                                let v: u64 = px[c].into();
+                                acc[ox * 4 + c] += v;
+                            }
+                        }
+                        acc[ox * 4 + 3] += a;
+                    }
+                }
+            }
+            for ox in 0..out_w {
+                let px = &mut row[ox * 4..][..4];
+                for c in 0..3 {
+                    let v = if !weighted {
+                        (acc[ox * 4 + c] + area / 2) / area
+                    } else if weight[ox] > 0 {
+                        (acc[ox * 4 + c] + weight[ox] / 2) / weight[ox]
+                    } else {
+                        0
+                    };
+                    px[c] = narrow(v);
+                }
+                px[3] = narrow((acc[ox * 4 + 3] + area / 2) / area);
+            }
+        });
+    (out, out_w, out_h)
+}
+
+/// `data` (`width` x `height` pixels of four samples) on a larger canvas, with `pad` extra
+/// columns and rows (left, top, right, bottom) that repeat the edge ones.
 fn pad_replicate<T: Copy + Send + Sync>(
     data: &[T],
     (width, height): (usize, usize),
-    (pad_x, pad_y): (usize, usize),
+    pad: [usize; 4],
 ) -> Vec<T> {
-    let new_width = width + 2 * pad_x;
-    let new_height = height + 2 * pad_y;
+    let [left, top, right, bottom] = pad;
+    let new_width = left + width + right;
+    let new_height = top + height + bottom;
     let mut out = vec![data[0]; new_width * new_height * 4];
     out.par_chunks_mut(new_width * 4)
         .enumerate()
         .for_each(|(y, row)| {
-            let src = &data[y.saturating_sub(pad_y).min(height - 1) * width * 4..][..width * 4];
-            row[pad_x * 4..(pad_x + width) * 4].copy_from_slice(src);
-            let (left, right) = (&src[..4], &src[(width - 1) * 4..]);
-            for px in row[..pad_x * 4].chunks_exact_mut(4) {
-                px.copy_from_slice(left);
+            let src = &data[y.saturating_sub(top).min(height - 1) * width * 4..][..width * 4];
+            row[left * 4..(left + width) * 4].copy_from_slice(src);
+            let (first, last) = (&src[..4], &src[(width - 1) * 4..]);
+            for px in row[..left * 4].chunks_exact_mut(4) {
+                px.copy_from_slice(first);
             }
-            for px in row[(pad_x + width) * 4..].chunks_exact_mut(4) {
-                px.copy_from_slice(right);
+            for px in row[(left + width) * 4..].chunks_exact_mut(4) {
+                px.copy_from_slice(last);
             }
         });
     out
+}
+
+/// Applies the box shrink and padding of `plan` to `data`; returns the pixels and their size.
+fn prepare_source<T>(
+    mut data: Vec<T>,
+    mut size: (u32, u32),
+    plan: &ResizePlan,
+    weighted: bool,
+) -> (Vec<T>, (u32, u32))
+where
+    T: Copy + Send + Sync + Into<u64> + TryFrom<u64>,
+{
+    if plan.box_factor != (1, 1) {
+        let (shrunk, w, h) = box_shrink(
+            &data,
+            (size.0 as usize, size.1 as usize),
+            (plan.box_factor.0 as usize, plan.box_factor.1 as usize),
+            weighted,
+        );
+        data = shrunk;
+        size = (w as u32, h as u32);
+    }
+    if plan.pad != [0; 4] {
+        data = pad_replicate(
+            &data,
+            (size.0 as usize, size.1 as usize),
+            plan.pad.map(|p| p as usize),
+        );
+    }
+    (data, plan.canvas)
 }
 
 fn resize_raw_opts(
@@ -674,26 +801,19 @@ fn resize_raw_opts(
     kernel: Kernel,
     scales: Option<(f64, f64)>,
 ) -> Result<Image> {
-    let region = sampled_region((image.width, image.height), (width, height), scales);
+    let plan = resize_plan((image.width, image.height), (width, height), scales);
     if image.has_wide() {
-        return resize_raw_wide(image, width, height, kernel, region);
+        return resize_raw_wide(image, width, height, kernel, plan);
     }
     let mut data = std::mem::take(&mut image.data);
     let mut options = resize_options(kernel, image.has_alpha);
-    let (mut src_width, mut src_height) = (image.width, image.height);
-    if let Some(region) = &region {
-        if region.pad != (0, 0) {
-            data = pad_replicate(
-                &data,
-                (src_width as usize, src_height as usize),
-                (region.pad.0 as usize, region.pad.1 as usize),
-            );
-        }
-        (src_width, src_height) = region.canvas;
-        let [left, top, w, h] = region.crop;
+    let mut size = (image.width, image.height);
+    if let Some(plan) = &plan {
+        (data, size) = prepare_source(data, size, plan, image.has_alpha);
+        let [left, top, w, h] = plan.crop;
         options = options.crop(left, top, w, h);
     }
-    let src = FirImage::from_vec_u8(src_width, src_height, data, PixelType::U8x4)
+    let src = FirImage::from_vec_u8(size.0, size.1, data, PixelType::U8x4)
         .map_err(|e| FastpkgError::Operation(e.to_string()))?;
     let mut dst = FirImage::new(width, height, PixelType::U8x4);
     Resizer::new()
@@ -710,28 +830,21 @@ fn resize_raw_wide(
     width: u32,
     height: u32,
     kernel: Kernel,
-    region: Option<SampledRegion>,
+    plan: Option<ResizePlan>,
 ) -> Result<Image> {
     let mut wide = image.to_rgba16();
     let mut options = resize_options(kernel, image.has_alpha);
-    let (mut src_width, mut src_height) = (image.width, image.height);
-    if let Some(region) = &region {
-        if region.pad != (0, 0) {
-            wide = pad_replicate(
-                &wide,
-                (src_width as usize, src_height as usize),
-                (region.pad.0 as usize, region.pad.1 as usize),
-            );
-        }
-        (src_width, src_height) = region.canvas;
-        let [left, top, w, h] = region.crop;
+    let mut size = (image.width, image.height);
+    if let Some(plan) = &plan {
+        (wide, size) = prepare_source(wide, size, plan, image.has_alpha);
+        let [left, top, w, h] = plan.crop;
         options = options.crop(left, top, w, h);
     }
     let pixels = wide
         .chunks_exact(4)
         .map(|px| U16x4::new([px[0], px[1], px[2], px[3]]))
         .collect::<Vec<_>>();
-    let src = TypedImage::from_pixels(src_width, src_height, pixels)
+    let src = TypedImage::from_pixels(size.0, size.1, pixels)
         .map_err(|e| FastpkgError::Operation(e.to_string()))?;
     let mut dst = TypedImage::<U16x4>::new(width, height);
     Resizer::new()

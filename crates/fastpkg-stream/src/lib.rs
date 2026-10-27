@@ -147,7 +147,12 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
     } else {
         (header.width, header.height)
     };
-    let (hint, fast_shrink) = match spec.operations.get(leading) {
+    // sharp does not shrink on load when the resize happens in another colour space either.
+    let (hint, fast_shrink) = match spec
+        .operations
+        .get(leading)
+        .filter(|_| spec.pipeline_colourspace.is_none())
+    {
         Some(Operation::Resize {
             width,
             height,
