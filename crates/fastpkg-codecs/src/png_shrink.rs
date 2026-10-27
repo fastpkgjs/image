@@ -340,7 +340,8 @@ impl InterlacedShrink {
             let (head, tail) = self.acc[from..].split_at_mut(stride);
             self.core.add_to(y, head, Some(&mut tail[..stride]));
         } else {
-            self.core.add_to(y, &mut self.acc[from..from + stride], None);
+            self.core
+                .add_to(y, &mut self.acc[from..from + stride], None);
         }
     }
 
@@ -348,7 +349,11 @@ impl InterlacedShrink {
     pub fn finish<T: Sample>(self) -> Vec<T> {
         let mut out = vec![T::default(); self.acc.len()];
         let stride = self.core.xs.out * 4;
-        for (acc, out) in self.acc.chunks_exact(stride).zip(out.chunks_exact_mut(stride)) {
+        for (acc, out) in self
+            .acc
+            .chunks_exact(stride)
+            .zip(out.chunks_exact_mut(stride))
+        {
             self.core.finish(acc, out);
         }
         out
@@ -379,8 +384,18 @@ fn axis_size(src: u32, target: u32, headroom: f64) -> u32 {
 /// Size of the image the rows are shrunk to, or `None` to decode at full size. Takes the
 /// largest headroom whose intermediate (`cell_bytes` per pixel while it is built and handed
 /// on) fits `budget`, and the smallest one when none does.
-pub fn plan(src: (u32, u32), target: (u32, u32), cell_bytes: u64, budget: u64) -> Option<(u32, u32)> {
-    let size = |headroom| (axis_size(src.0, target.0, headroom), axis_size(src.1, target.1, headroom));
+pub fn plan(
+    src: (u32, u32),
+    target: (u32, u32),
+    cell_bytes: u64,
+    budget: u64,
+) -> Option<(u32, u32)> {
+    let size = |headroom| {
+        (
+            axis_size(src.0, target.0, headroom),
+            axis_size(src.1, target.1, headroom),
+        )
+    };
     let (w, h) = HEADROOMS
         .iter()
         .map(|&headroom| size(headroom))
@@ -408,7 +423,14 @@ mod tests {
 
     #[test]
     fn cells_have_unit_weight() {
-        for (src, out) in [(100, 10), (101, 10), (1000, 333), (7, 3), (16384, 1639), (50, 50)] {
+        for (src, out) in [
+            (100, 10),
+            (101, 10),
+            (1000, 333),
+            (7, 3),
+            (16384, 1639),
+            (50, 50),
+        ] {
             for (k, sum) in cell_sums(src, out).iter().enumerate() {
                 assert!((sum - 1.0).abs() < 1e-5, "{src}->{out} cell {k}: {sum}");
             }
@@ -480,7 +502,10 @@ mod tests {
                 let dense = core.hrow.clone();
                 core.reduce_sparse(&px[..w * 4], 0, 1);
                 for (a, b) in dense.iter().zip(&core.hrow) {
-                    assert!((a - b).abs() <= 1e-3 * b.abs().max(1.0), "{w}->{out} alpha {alpha}: {a} vs {b}");
+                    assert!(
+                        (a - b).abs() <= 1e-3 * b.abs().max(1.0),
+                        "{w}->{out} alpha {alpha}: {a} vs {b}"
+                    );
                 }
             }
         }

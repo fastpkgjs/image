@@ -970,7 +970,8 @@ fn read_png_rows<T: PngSample>(
         }
     }
     if let Some(shrinker) = shrinker.as_mut() {
-        shrinker.finish(|cy, cells: &[T]| out[cy * ow * 4..(cy + 1) * ow * 4].copy_from_slice(cells));
+        shrinker
+            .finish(|cy, cells: &[T]| out[cy * ow * 4..(cy + 1) * ow * 4].copy_from_slice(cells));
     }
     if blank.is_none() && !lenient {
         // Reading past the last row drains the image data, where a bad checksum or a damaged
@@ -1020,7 +1021,9 @@ fn read_png_interlaced<T: PngSample>(
             .map_err(|error| FastpkgError::Decode(error.to_string()))?;
         let Some(decoded) = decoded else { break };
         let png::InterlaceInfo::Adam7(info) = decoded.interlace() else {
-            return Err(FastpkgError::Decode("PNG: unexpected interlace method".into()));
+            return Err(FastpkgError::Decode(
+                "PNG: unexpected interlace method".into(),
+            ));
         };
         let (x0, y0, dx, dy) = ADAM7[info.pass() as usize - 1];
         let y = y0 + info.line() as usize * dy;
