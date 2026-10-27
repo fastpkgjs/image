@@ -764,13 +764,18 @@ pub fn jpeg_scale_denominator(shrink: f64, fast_shrink: bool) -> u8 {
     denominator
 }
 
-/// `FASTPKG_JPEG_SHRINK=eighths` selects libjpeg's finer n/8 scales (see
-/// [`jpeg_scale_numerator`]) over sharp's 1/2, 1/4 and 1/8: a little faster for shrink factors
-/// between the powers of two, but it leaves the resampler a different residual than libvips has.
+/// Whether JPEG shrink-on-load uses libjpeg's finer n/8 scales (see [`jpeg_scale_numerator`]),
+/// which is the default: decoding is faster for shrink factors between the powers of two. The
+/// output size is still sharp's (see `jpeg_virtual_source` in the stream crate), but the resampler
+/// is left a different residual than libvips has, so pixels differ from sharp's by 27-57 dB
+/// PSNR. `FASTPKG_JPEG_SHRINK=sharp` (read once) selects sharp's rule instead: DCT scales of 1/2,
+/// 1/4 and 1/8 only, for output within 53-77 dB of sharp's at sharp's speed.
 pub fn jpeg_rule_eighths() -> bool {
     static EIGHTHS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EIGHTHS
-        .get_or_init(|| std::env::var("FASTPKG_JPEG_SHRINK").is_ok_and(|rule| rule == "eighths"))
+    *EIGHTHS.get_or_init(|| {
+        !std::env::var("FASTPKG_JPEG_SHRINK")
+            .is_ok_and(|rule| matches!(rule.as_str(), "sharp" | "exact" | "libvips"))
+    })
 }
 
 /// Smallest DCT scale numerator `n` (output is `n/8` of the source) whose

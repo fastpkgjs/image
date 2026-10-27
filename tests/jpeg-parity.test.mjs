@@ -4,6 +4,9 @@
 // output size evenly over both ends of each axis). Anything finer, such as libjpeg's n/8 scales,
 // or a resampler that works from the rounded sizes, costs 10-25 dB of PSNR against sharp on
 // photographs and far more on hard edges (0.5.0 measured 42 dB on a rotate().resize()).
+// Runs with sharp's exact shrink-on-load rule (the default uses finer, faster DCT scales; see
+// jpeg-fast-default.test.mjs).
+import './_jpeg-sharp-env.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { sharp, engine, prng } from './_util.mjs';

@@ -199,11 +199,21 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
     input.ignore_icc |= keeps_input_icc;
     let mut image = decode_with_hint(bytes, header.format, &input, hint, fast_shrink)?;
     check_deadline(deadline)?;
-    if image.format == Format::Jpeg && !moved_before_resize && !fastpkg_codecs::jpeg_rule_eighths()
-    {
-        // sharp sizes the resize from the shrunk image it decoded (libjpeg rounds the
-        // dimensions up), not from the original; forget the original size to do the same.
-        image.pre_shrink = None;
+    if image.format == Format::Jpeg && !moved_before_resize {
+        if !fastpkg_codecs::jpeg_rule_eighths() {
+            // sharp sizes the resize from the shrunk image it decoded (libjpeg rounds the
+            // dimensions up), not from the original; forget the original size to do the same.
+            image.pre_shrink = None;
+        } else if let (Some(hint), Some(_)) = (&hint, image.pre_shrink) {
+            // Decoded with a finer n/8 scale than libvips has, but the output size is still
+            // sharp's: it comes from the image libvips would have decoded (a power-of-two scale,
+            // the partial last block dropped), so size the resize from those dimensions.
+            let denominator =
+                fastpkg_codecs::jpeg_scale_denominator(hint.shrink, fast_shrink) as u32;
+            if denominator > 1 {
+                image.pre_shrink = Some((header.width / denominator, header.height / denominator));
+            }
+        }
     }
 
     let keep_metadata = spec.output.keep_metadata
