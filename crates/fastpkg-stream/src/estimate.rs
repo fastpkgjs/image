@@ -10,6 +10,7 @@
 //! (`bench/admission-calibrate.mjs` prints estimate and measurement side by side).
 
 use std::fs::File;
+use std::io::Read;
 
 use fastpkg_codecs::{decode_footprint, probe_layout};
 use fastpkg_core::options::Operation;
@@ -255,9 +256,25 @@ pub fn estimate_bytes(bytes: &[u8], spec: &PipelineSpec, encodes: bool) -> Resul
     Ok(estimate_header(&header, spec, encodes))
 }
 
+/// How much of a file is read to learn its layout: the headers of nearly every JPEG and PNG fit.
+const HEAD_BYTES: usize = 64 << 10;
+
 pub fn estimate_path(path: &str, spec: &PipelineSpec, encodes: bool) -> Result<u64> {
-    let file = File::open(path)?;
-    // Mapping an empty file fails; a file this small is not an image either.
+    let mut file = File::open(path)?;
+    // A read of the head costs a few microseconds; mapping the file and unmapping it again
+    // interrupts every thread of the process, which a job this cheap should not do twice.
+    let mut head = Vec::with_capacity(HEAD_BYTES);
+    (&mut file).take(HEAD_BYTES as u64).read_to_end(&mut head)?;
+    if head.len() < HEAD_BYTES {
+        return estimate_bytes(&head, spec, encodes);
+    }
+    if matches!(Format::from_magic(&head), Format::Jpeg | Format::Png) {
+        if let Ok(bytes) = estimate_bytes(&head, spec, encodes) {
+            return Ok(bytes);
+        }
+    }
+    // Other formats count frames and chunks all through the file, and a header can be longer
+    // than the head: map the whole file.
     let mmap = unsafe { Mmap::map(&file)? };
     estimate_bytes(&mmap, spec, encodes)
 }
