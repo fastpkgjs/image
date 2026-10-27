@@ -280,6 +280,9 @@ pub fn decode(bytes: &[u8], format: Format, input: &InputOptions) -> Result<Imag
     decode_with_hint(bytes, format, input, None, false)
 }
 
+/// Decodes with a hint of the size the first resize will produce. A 16-bit PNG decoded for a
+/// resize skips the 8-bit twin of its samples (`Image::materialize_8bit` builds it); everything
+/// else is as `decode`.
 pub fn decode_with_hint(
     bytes: &[u8],
     format: Format,
@@ -1076,7 +1079,12 @@ fn decode_png_stream(
             Some(shrink) => read_png_interlaced::<u16>(&mut reader, color, shrink)?,
             None => read_png_rows::<u16>(&mut reader, color, shrink, lenient)?,
         };
-        let mut image = Image::from_rgba16(w, h, wide)?;
+        // The twin is only a second full-size copy when a resize is next.
+        let mut image = if hint.is_some() {
+            Image::from_rgba16_deferred(w, h, wide)?
+        } else {
+            Image::from_rgba16(w, h, wide)?
+        };
         // sharp/libvips promote 16-bit grey to RGB16, so wide grey decodes as 3 channels.
         image.gray = false;
         image

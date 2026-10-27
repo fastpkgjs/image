@@ -193,6 +193,11 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
         image.pre_shrink = shrunk.map(|(w, h)| if swaps_axes { (h, w) } else { (w, h) });
     }
 
+    // A 16-bit PNG decoded for a resize comes without its 8-bit twin (see
+    // `Image::from_rgba16_deferred`); the operations that do not need it restore it themselves.
+    if spec.pipeline_colourspace.is_some() {
+        image.materialize_8bit();
+    }
     let linear_pipeline = match spec.pipeline_colourspace.as_deref() {
         Some(space) => enter_pipeline_colourspace(&mut image, space).map_err(|error| {
             FastpkgError::InvalidOptions(format!("pipeline colourspace: {error}"))
@@ -203,6 +208,7 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
         image = apply(image, std::slice::from_ref(operation))?;
         check_deadline(deadline)?;
     }
+    image.materialize_8bit();
     if linear_pipeline {
         leave_linear_colourspace(&mut image);
     }

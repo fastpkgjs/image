@@ -52,6 +52,19 @@ pub fn geometry_swaps_axes(op: &Operation, orientation: Option<u32>) -> Option<b
 }
 
 pub fn apply_one(mut image: Image, op: &Operation) -> Result<Image> {
+    // A wide image from a decode with a resize hint may come without its 8-bit twin; only these
+    // operations work on the wide samples alone.
+    let wide_only = matches!(
+        op,
+        Operation::Resize { .. }
+            | Operation::AutoOrient
+            | Operation::Flip { .. }
+            | Operation::Flop { .. }
+            | Operation::Rotate { .. }
+    );
+    if !wide_only {
+        image.materialize_8bit();
+    }
     // Many operations rebuild the image buffer from scratch; carry per-image
     // metadata across so EXIF/ICC/XMP and the single-channel hint survive them.
     let gray = image.gray;
@@ -61,6 +74,10 @@ pub fn apply_one(mut image: Image, op: &Operation) -> Result<Image> {
     let swaps = geometry_swaps_axes(op, image.orientation);
     let shrunk = swaps.and_then(|_| image.pre_shrink.take());
     let mut out = apply_op(image, op)?;
+    if matches!(op, Operation::Resize { .. }) {
+        // The resize result is small; this only matters for its early returns (no-op sizes).
+        out.materialize_8bit();
+    }
     if let (Some((width, height)), Some(swaps)) = (shrunk, swaps) {
         out.pre_shrink = Some(if swaps {
             (height, width)
