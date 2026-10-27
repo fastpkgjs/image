@@ -11,7 +11,7 @@
 
 use std::fs::File;
 
-use fastpkg_codecs::{decode_footprint, probe};
+use fastpkg_codecs::{decode_footprint, probe_layout};
 use fastpkg_core::options::Operation;
 use fastpkg_core::pipeline::compute_target;
 use fastpkg_core::{Fit, Format, HeaderInfo, PipelineSpec, Result};
@@ -245,7 +245,13 @@ pub fn estimate_header(header: &HeaderInfo, spec: &PipelineSpec, encodes: bool) 
 /// Estimate for an input held in memory. An error means the header cannot be read (the job then
 /// fails on its own, almost for free).
 pub fn estimate_bytes(bytes: &[u8], spec: &PipelineSpec, encodes: bool) -> Result<u64> {
-    let header = probe(bytes, &spec.input)?;
+    // Only a pipeline that turns the pixels by the EXIF orientation needs to read it.
+    let orientation = spec.input.auto_orient
+        || spec
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::AutoOrient));
+    let header = probe_layout(bytes, &spec.input, orientation)?;
     Ok(estimate_header(&header, spec, encodes))
 }
 

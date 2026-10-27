@@ -29,9 +29,10 @@ pub fn libwebp_version() -> String {
     webp::version()
 }
 
-pub fn probe(bytes: &[u8], input: &InputOptions) -> Result<HeaderInfo> {
+/// The header of an input that is not a file: raw pixels, a generated image or text.
+fn probe_synthetic(bytes: &[u8], input: &InputOptions) -> Option<HeaderInfo> {
     if let Some(raw) = &input.raw {
-        return Ok(HeaderInfo {
+        return Some(HeaderInfo {
             format: Format::Raw,
             width: raw.width,
             height: raw.height,
@@ -50,7 +51,7 @@ pub fn probe(bytes: &[u8], input: &InputOptions) -> Result<HeaderInfo> {
         });
     }
     if let Some(create) = &input.create {
-        return Ok(HeaderInfo {
+        return Some(HeaderInfo {
             format: Format::Raw,
             width: create.width,
             height: create.height,
@@ -64,7 +65,7 @@ pub fn probe(bytes: &[u8], input: &InputOptions) -> Result<HeaderInfo> {
         });
     }
     if input.text.is_some() {
-        return Ok(HeaderInfo {
+        return Some(HeaderInfo {
             format: Format::Raw,
             width: 0,
             height: 0,
@@ -75,6 +76,13 @@ pub fn probe(bytes: &[u8], input: &InputOptions) -> Result<HeaderInfo> {
             pages: 1,
             ..Default::default()
         });
+    }
+    None
+}
+
+pub fn probe(bytes: &[u8], input: &InputOptions) -> Result<HeaderInfo> {
+    if let Some(header) = probe_synthetic(bytes, input) {
+        return Ok(header);
     }
 
     let format = Format::from_magic(bytes);
@@ -87,7 +95,7 @@ pub fn probe(bytes: &[u8], input: &InputOptions) -> Result<HeaderInfo> {
     let mut header = match format {
         Format::Svg => svg::probe(bytes, input.density)?,
         Format::Jxl => probe_jxl(bytes)?,
-        _ => probe_generic(bytes, format)?,
+        _ => probe_generic(bytes, format, false)?,
     };
     header.format = format;
     header.size = bytes.len();
@@ -122,7 +130,52 @@ pub fn probe(bytes: &[u8], input: &InputOptions) -> Result<HeaderInfo> {
     Ok(header)
 }
 
-fn probe_generic(bytes: &[u8], format: Format) -> Result<HeaderInfo> {
+/// What the memory estimate of a job needs from the header: format, size, channels, depth,
+/// interlacing, pages. The same answers as [`probe`] gives for those, without the parts that read
+/// more of the file (density, EXIF); the orientation is only read when `orientation` asks for it.
+pub fn probe_layout(
+    bytes: &[u8],
+    input: &InputOptions,
+    orientation: bool,
+) -> Result<HeaderInfo> {
+    if let Some(header) = probe_synthetic(bytes, input) {
+        return Ok(header);
+    }
+    let format = Format::from_magic(bytes);
+    if matches!(
+        format,
+        Format::Tiff | Format::Jp2 | Format::Heif | Format::Pdf
+    ) {
+        return Err(FastpkgError::UnsupportedInput);
+    }
+    let mut header = match format {
+        Format::Svg => svg::probe(bytes, input.density)?,
+        Format::Jxl => probe_jxl(bytes)?,
+        _ => probe_generic(bytes, format, true)?,
+    };
+    header.format = format;
+    header.size = bytes.len();
+    if orientation && matches!(format, Format::Jpeg | Format::Png | Format::Webp) {
+        header.orientation = read_orientation(bytes);
+    }
+    validate_dimensions(
+        header.width,
+        header.height,
+        &Limits {
+            max_pixels: if input.unlimited {
+                u64::MAX
+            } else {
+                input.limit_input_pixels
+            },
+            ..Default::default()
+        },
+    )?;
+    Ok(header)
+}
+
+/// `layout_only` leaves out what costs a scan of the file and is not about the pixel layout
+/// (a JPEG's density, which may mean parsing its EXIF block).
+fn probe_generic(bytes: &[u8], format: Format, layout_only: bool) -> Result<HeaderInfo> {
     // libjpeg skips junk between marker segments; the size reader gives up on it.
     let (width, height) = match imagesize::blob_size(bytes) {
         Ok(size) => (size.width as u32, size.height as u32),
@@ -188,6 +241,9 @@ fn probe_generic(bytes: &[u8], format: Format) -> Result<HeaderInfo> {
                 if channels == 4 {
                     header.space = "cmyk".into();
                 }
+            }
+            if layout_only {
+                return Ok(header);
             }
             let details = header::jpeg_details(bytes);
             header.chroma_subsampling = details.chroma_subsampling;
