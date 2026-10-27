@@ -722,12 +722,13 @@ where
             for ox in 0..out_w {
                 let px = &mut row[ox * 4..][..4];
                 for c in 0..3 {
-                    let v = if !weighted {
-                        (acc[ox * 4 + c] + area / 2) / area
-                    } else if weight[ox] > 0 {
-                        (acc[ox * 4 + c] + weight[ox] / 2) / weight[ox]
+                    let v = if weighted {
+                        // A block that is entirely transparent has no colour to average.
+                        (acc[ox * 4 + c] + weight[ox] / 2)
+                            .checked_div(weight[ox])
+                            .unwrap_or(0)
                     } else {
-                        0
+                        (acc[ox * 4 + c] + area / 2) / area
                     };
                     px[c] = narrow(v);
                 }

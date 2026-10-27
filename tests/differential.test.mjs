@@ -42,9 +42,11 @@ const FITS = ['cover', 'contain', 'fill', 'inside', 'outside'];
 
 // Resampling tolerance (mean absolute difference, 0-255). libvips shrinks by an integer box
 // factor and then applies the kernel; fast_image_resize runs one convolution with a scaled
-// support. They agree closely on moderate ratios; extreme ratios (>=8x either way), tiny
-// outputs (<=3 px) and tiny sources (<=13 px, where every output pixel sees the clamped edge)
-// amplify kernel-support differences, so those get a wider (but still bounded) tolerance.
+// support (the box shrink is reproduced for sources that were not already shrunk at decode,
+// see jpeg-parity.test.mjs for the JPEG PSNR bounds). They agree closely on moderate ratios;
+// extreme ratios (>=8x either way), tiny outputs (<=3 px) and tiny sources (<=13 px, where
+// every output pixel sees the clamped edge) amplify kernel-support differences, so those get
+// a wider (but still bounded) tolerance.
 function resizeTol(sw, sh, tw, th) {
   const w = tw ?? Math.round((sw * (th ?? sh)) / sh);
   const h = th ?? Math.round((sh * (tw ?? sw)) / sw);
@@ -117,7 +119,7 @@ function resizeTol(sw, sh, tw, th) {
   }
   group('resize: source sizes', cases, async (c) => {
     const src = await make(c.kind, c.sw, c.sh);
-    return compare((lib) => lib(src).resize(c.w, c.h, { fit: c.fit }), resizeTol(c.sw, c.sh, c.w, c.h), { sizeSlack: c.kind === 'jpeg' ? 1 : 0 });
+    return compare((lib) => lib(src).resize(c.w, c.h, { fit: c.fit }), resizeTol(c.sw, c.sh, c.w, c.h), { sizeSlack: 0 });
   });
 }
 
