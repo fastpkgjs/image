@@ -8,8 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
-use fast_image_resize::images::{Image as FirImage, TypedImage};
-use fast_image_resize::pixels::U16x4;
+use fast_image_resize::images::{Image as FirImage, ImageRef};
 use fast_image_resize::{FilterType as FirFilter, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use fastpkg_core::options::{
     Blend, ChannelSelector, ExtendWith, Fit, GradientKind, GradientSpec, GradientSpread, Kernel,
@@ -53,6 +52,19 @@ pub fn geometry_swaps_axes(op: &Operation, orientation: Option<u32>) -> Option<b
 }
 
 pub fn apply_one(mut image: Image, op: &Operation) -> Result<Image> {
+    // A wide image from a decode with a resize hint may come without its 8-bit twin; only these
+    // operations work on the wide samples alone.
+    let wide_only = matches!(
+        op,
+        Operation::Resize { .. }
+            | Operation::AutoOrient
+            | Operation::Flip { .. }
+            | Operation::Flop { .. }
+            | Operation::Rotate { .. }
+    );
+    if !wide_only {
+        image.materialize_8bit();
+    }
     // Many operations rebuild the image buffer from scratch; carry per-image
     // metadata across so EXIF/ICC/XMP and the single-channel hint survive them.
     let gray = image.gray;
@@ -62,6 +74,10 @@ pub fn apply_one(mut image: Image, op: &Operation) -> Result<Image> {
     let swaps = geometry_swaps_axes(op, image.orientation);
     let shrunk = swaps.and_then(|_| image.pre_shrink.take());
     let mut out = apply_op(image, op)?;
+    if matches!(op, Operation::Resize { .. }) {
+        // The resize result is small; this only matters for its early returns (no-op sizes).
+        out.materialize_8bit();
+    }
     if let (Some((width, height)), Some(swaps)) = (shrunk, swaps) {
         out.pre_shrink = Some(if swaps {
             (height, width)
@@ -578,7 +594,7 @@ fn resize_raw(image: Image, width: u32, height: u32, kernel: Kernel) -> Result<I
 }
 
 fn resize_raw_opts(
-    mut image: Image,
+    image: Image,
     width: u32,
     height: u32,
     kernel: Kernel,
@@ -587,24 +603,28 @@ fn resize_raw_opts(
     if image.has_wide() {
         return resize_raw_wide(image, width, height, kernel, centering);
     }
-    let src = FirImage::from_vec_u8(
-        image.width,
-        image.height,
-        std::mem::take(&mut image.data),
-        PixelType::U8x4,
-    )
-    .map_err(|e| FastpkgError::Operation(e.to_string()))?;
     let mut dst = FirImage::new(width, height, PixelType::U8x4);
-    let mut options = resize_options(kernel, image.has_alpha);
-    if let Some(centering) = centering {
-        options = options.fit_into_destination(Some(centering));
+    {
+        let src = ImageRef::new(image.width, image.height, &image.data, PixelType::U8x4)
+            .map_err(|e| FastpkgError::Operation(e.to_string()))?;
+        let mut options = resize_options(kernel, image.has_alpha);
+        if let Some(centering) = centering {
+            options = options.fit_into_destination(Some(centering));
+        }
+        resize_banded(
+            &src,
+            &mut dst,
+            &options,
+            centering.is_none(),
+            BAND_TEMP_BYTES,
+        )?;
     }
-    Resizer::new()
-        .resize(&src, &mut dst, Some(&options))
-        .map_err(|e| FastpkgError::Operation(e.to_string()))?;
+    let format = image.format;
+    let has_alpha = image.has_alpha;
+    drop(image);
     let mut out = Image::from_rgba(width, height, dst.into_vec())?;
-    out.format = image.format;
-    out.has_alpha = image.has_alpha;
+    out.format = format;
+    out.has_alpha = has_alpha;
     Ok(out)
 }
 
@@ -615,24 +635,97 @@ fn resize_raw_wide(
     kernel: Kernel,
     centering: Option<(f64, f64)>,
 ) -> Result<Image> {
-    let wide = image.to_rgba16();
-    let pixels = wide
-        .chunks_exact(4)
-        .map(|px| U16x4::new([px[0], px[1], px[2], px[3]]))
-        .collect::<Vec<_>>();
-    let src = TypedImage::from_pixels(image.width, image.height, pixels)
+    // The wide samples are resized in place of the source (borrowed, not cloned or repacked),
+    // and the 8-bit copy is dropped first: `set_wide_rgba` rebuilds it at the new size.
+    let wide = image.wide.take().unwrap_or_default();
+    image.data = Vec::new();
+    let mut dst = FirImage::new(width, height, PixelType::U16x4);
+    {
+        let src = ImageRef::new(
+            image.width,
+            image.height,
+            bytemuck::cast_slice(&wide),
+            PixelType::U16x4,
+        )
         .map_err(|e| FastpkgError::Operation(e.to_string()))?;
-    let mut dst = TypedImage::<U16x4>::new(width, height);
-    let mut options = resize_options(kernel, image.has_alpha);
-    if let Some(centering) = centering {
-        options = options.fit_into_destination(Some(centering));
+        let mut options = resize_options(kernel, image.has_alpha);
+        if let Some(centering) = centering {
+            options = options.fit_into_destination(Some(centering));
+        }
+        resize_banded(
+            &src,
+            &mut dst,
+            &options,
+            centering.is_none(),
+            BAND_TEMP_BYTES,
+        )?;
     }
-    Resizer::new()
-        .resize_typed(&src, &mut dst, Some(&options))
-        .map_err(|e| FastpkgError::Operation(e.to_string()))?;
-    let out = dst.pixels().iter().flat_map(|px| px.0).collect::<Vec<_>>();
+    drop(wide);
+    let out = bytemuck::pod_collect_to_vec::<u8, u16>(dst.buffer());
     image.set_wide_rgba(width, height, out)?;
     Ok(image)
+}
+
+/// The convolution resizer keeps an intermediate image of the destination width (or, for 8-bit
+/// samples, the destination height) by the full source height. Past this many bytes the
+/// resize is done in bands of destination rows instead.
+const BAND_TEMP_BYTES: usize = 24 << 20;
+
+/// Resizes `src` into `dst`. A large vertical downscale (`allow_bands`: no fit-into-destination
+/// cropping) is done band by band: the source rows a band of destination rows depends on, margin
+/// included, are resized with a crop box that places them exactly where the whole-image resize
+/// would, so the filter weights are those of the one-shot resize (to float rounding) while the
+/// intermediate shrinks to the band.
+fn resize_banded(
+    src: &ImageRef<'_>,
+    dst: &mut FirImage<'_>,
+    options: &ResizeOptions,
+    allow_bands: bool,
+    max_temp: usize,
+) -> Result<()> {
+    let fail = |e: fast_image_resize::ResizeError| FastpkgError::Operation(e.to_string());
+    let mut resizer = Resizer::new();
+    let (sw, sh, dw, dh) = (src.width(), src.height(), dst.width(), dst.height());
+    let pixel_type = src.pixel_type();
+    let pixel = pixel_type.size();
+    let scale = sh as f64 / dh.max(1) as f64;
+    // Rows of intermediate per destination row, and the rows the filter reaches past a band.
+    let per_row = (sw as usize).max((dw as f64 * scale).ceil() as usize) * pixel;
+    let margin = (5.0 * scale.max(1.0)).ceil() as usize + 2;
+    let overhead = 2 * margin * dw as usize * pixel;
+    let rows = max_temp.saturating_sub(overhead) / per_row.max(1);
+    if !allow_bands || dh >= sh || dh == 0 || rows >= dh as usize {
+        return resizer.resize(src, dst, Some(options)).map_err(fail);
+    }
+    let rows = rows.max(1) as u32;
+    let src_row = sw as usize * pixel;
+    let dst_row = dw as usize * pixel;
+    let source = src.buffer();
+    let mut y0 = 0;
+    while y0 < dh {
+        let y1 = (y0 + rows).min(dh);
+        let lo = ((y0 as f64 * scale) - margin as f64).floor().max(0.0) as u32;
+        let hi = (((y1 as f64 * scale) + margin as f64).ceil() as u32).min(sh);
+        let band_src = ImageRef::new(
+            sw,
+            hi - lo,
+            &source[lo as usize * src_row..hi as usize * src_row],
+            pixel_type,
+        )
+        .map_err(|e| FastpkgError::Operation(e.to_string()))?;
+        let mut band = FirImage::new(dw, y1 - y0, pixel_type);
+        // Rounding must not push the box past the slice (it would be rejected).
+        let top = y0 as f64 * scale - lo as f64;
+        let height = ((y1 - y0) as f64 * scale).min((hi - lo) as f64 - top);
+        let cropped = options.crop(0.0, top, sw as f64, height);
+        resizer
+            .resize(&band_src, &mut band, Some(&cropped))
+            .map_err(fail)?;
+        dst.buffer_mut()[y0 as usize * dst_row..y1 as usize * dst_row]
+            .copy_from_slice(band.buffer());
+        y0 = y1;
+    }
+    Ok(())
 }
 
 fn custom_filter(name: &'static str, func: fn(f64) -> f64, support: f64) -> FirFilter {
@@ -749,7 +842,7 @@ fn extract(mut image: Image, left: u32, top: u32, width: u32, height: u32) -> Re
         ));
     }
     if image.has_wide() {
-        let wide = image.to_rgba16();
+        let wide = image.take_rgba16();
         let mut out = Vec::with_capacity(width as usize * height as usize * 4);
         for y in 0..height {
             let start = ((top + y) as usize * image.width as usize + left as usize) * 4;
@@ -827,7 +920,7 @@ fn extend(
         (color.r, color.g, color.b) = (lum, lum, lum);
     }
     if image.has_wide() {
-        let wide = image.to_rgba16();
+        let wide = image.take_rgba16();
         let fill = [
             color.r as u16 * 257,
             color.g as u16 * 257,
@@ -1178,7 +1271,7 @@ fn flip(mut image: Image, flip: bool) -> Result<Image> {
         return Ok(image);
     }
     if image.has_wide() {
-        let wide = image.to_rgba16();
+        let wide = image.take_rgba16();
         let stride = image.width as usize * 4;
         let mut out = vec![0u16; wide.len()];
         for y in 0..image.height as usize {
@@ -1197,7 +1290,7 @@ fn flop(mut image: Image, flop: bool) -> Result<Image> {
         return Ok(image);
     }
     if image.has_wide() {
-        let wide = image.to_rgba16();
+        let wide = image.take_rgba16();
         let stride = image.width as usize * 4;
         let mut out = vec![0u16; wide.len()];
         for (y, row) in out.chunks_exact_mut(stride).enumerate() {
@@ -1285,7 +1378,7 @@ fn rotation_source(cos: f64, sin: f64, left: f64, top: f64, x: u32, y: u32) -> (
 }
 
 fn rotate_wide(mut image: Image, angle: f64, background: &str) -> Result<Image> {
-    let wide = image.to_rgba16();
+    let wide = image.take_rgba16();
     let width = image.width as usize;
     let height = image.height as usize;
     if (angle - 90.0).abs() < f64::EPSILON {
@@ -1626,7 +1719,7 @@ fn affine(
     let (origin_x, origin_y) = (min_x.round(), min_y.round());
     let bg = Color::parse(background).unwrap_or(Color::BLACK);
     if image.has_wide() {
-        let wide = image.to_rgba16();
+        let wide = image.take_rgba16();
         let fallback = [
             bg.r as u16 * 257,
             bg.g as u16 * 257,
@@ -4268,6 +4361,53 @@ mod tests {
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
         (*state >> 33) as u8
+    }
+
+    /// A banded resize has the filter weights of the one-shot resize, so the two agree to float
+    /// rounding (at most one level) for 8- and 16-bit samples, up- and downscales, and kernels
+    /// with wide support.
+    #[test]
+    fn banded_resize_matches_one_shot() {
+        let mut state = 7;
+        for (pixel_type, bytes) in [(PixelType::U8x4, 1usize), (PixelType::U16x4, 2)] {
+            for (sw, sh, dw, dh, kernel) in [
+                (300u32, 500u32, 90u32, 41u32, Kernel::Lanczos3),
+                (257, 331, 257, 100, Kernel::Lanczos3),
+                (200, 900, 150, 301, Kernel::Cubic),
+                (128, 400, 31, 17, Kernel::Mks2021),
+                (64, 64, 70, 20, Kernel::Lanczos3),
+            ] {
+                let data: Vec<u8> = (0..sw * sh * 4 * bytes as u32)
+                    .map(|_| lcg(&mut state))
+                    .collect();
+                let src = ImageRef::new(sw, sh, &data, pixel_type).unwrap();
+                let options = resize_options(kernel, false);
+                let mut whole = FirImage::new(dw, dh, pixel_type);
+                resize_banded(&src, &mut whole, &options, true, usize::MAX).unwrap();
+                for max_temp in [1usize << 10, 1 << 14] {
+                    let mut banded = FirImage::new(dw, dh, pixel_type);
+                    resize_banded(&src, &mut banded, &options, true, max_temp).unwrap();
+                    let worst = if bytes == 1 {
+                        whole
+                            .buffer()
+                            .iter()
+                            .zip(banded.buffer())
+                            .map(|(a, b)| a.abs_diff(*b) as u32)
+                            .max()
+                    } else {
+                        bytemuck::pod_collect_to_vec::<u8, u16>(whole.buffer())
+                            .iter()
+                            .zip(bytemuck::pod_collect_to_vec::<u8, u16>(banded.buffer()))
+                            .map(|(a, b)| a.abs_diff(b) as u32)
+                            .max()
+                    };
+                    assert!(
+                        worst <= Some(if bytes == 1 { 1 } else { 2 }),
+                        "{pixel_type:?} {sw}x{sh}->{dw}x{dh} {kernel:?} temp {max_temp}: {worst:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

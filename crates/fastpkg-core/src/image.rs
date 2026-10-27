@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::color::Color;
 use crate::{FastpkgError, Format, Result};
 use rayon::prelude::*;
@@ -109,6 +111,17 @@ impl Image {
     }
 
     pub fn from_rgba16(width: u32, height: u32, data: Vec<u16>) -> Result<Self> {
+        let mut image = Self::from_rgba16_deferred(width, height, data)?;
+        image.materialize_8bit();
+        Ok(image)
+    }
+
+    /// Like [`Image::from_rgba16`] but without the 8-bit twin of the samples (`data` is empty
+    /// until [`Image::materialize_8bit`]). For frames big enough that a second copy matters, when
+    /// the next thing that happens to them is an operation that works on the wide samples alone
+    /// (a resize, flips and quarter turns); `fastpkg_ops::apply` restores the twin before any
+    /// other operation.
+    pub fn from_rgba16_deferred(width: u32, height: u32, data: Vec<u16>) -> Result<Self> {
         let expected = width as usize * height as usize * 4;
         if data.len() != expected {
             return Err(FastpkgError::InvalidOptions(format!(
@@ -118,12 +131,22 @@ impl Image {
                 height
             )));
         }
-        let rgba = wide_to_rgba8(&data);
-        let mut image = Self::new(width, height, rgba)?;
+        let mut image = Self::new(0, 0, Vec::new())?;
+        image.width = width;
+        image.height = height;
         image.has_alpha = true;
         image.depth = "ushort".into();
         image.wide = Some(data);
         Ok(image)
+    }
+
+    /// Builds the 8-bit twin of a wide image whose twin was deferred (nothing otherwise).
+    pub fn materialize_8bit(&mut self) {
+        if let Some(wide) = self.wide.as_ref() {
+            if self.data.is_empty() && !wide.is_empty() {
+                self.data = wide_to_rgba8(wide);
+            }
+        }
     }
 
     pub fn from_raw16(width: u32, height: u32, channels: u8, data: &[u16]) -> Result<Self> {
@@ -399,9 +422,9 @@ impl Image {
 
     /// Packed 16-bit samples with the same layout as [`Image::to_packed`].
     pub fn to_packed16(&self) -> Vec<u16> {
-        let rgba = self.to_rgba16();
+        let rgba = self.rgba16();
         match (self.gray, self.has_alpha) {
-            (false, true) => rgba,
+            (false, true) => rgba.into_owned(),
             (false, false) => pack(&rgba, 3, |src, dst| {
                 for (d, px) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
                     d.copy_from_slice(&px[..3]);
@@ -433,18 +456,36 @@ impl Image {
         &self.data
     }
 
-    pub fn to_rgba16(&self) -> Vec<u16> {
-        self.wide.clone().unwrap_or_else(|| {
-            pack(&self.data, 4, |src, dst| {
+    /// 16-bit RGBA samples: borrowed when the image is wide, widened from the 8-bit samples
+    /// otherwise.
+    pub fn rgba16(&self) -> Cow<'_, [u16]> {
+        match self.wide.as_deref() {
+            Some(wide) => Cow::Borrowed(wide),
+            None => Cow::Owned(pack(&self.data, 4, |src, dst| {
                 for (d, s) in dst.iter_mut().zip(src) {
                     *d = *s as u16 * 257;
                 }
-            })
-        })
+            })),
+        }
+    }
+
+    /// An owned copy of [`Image::rgba16`].
+    pub fn to_rgba16(&self) -> Vec<u16> {
+        self.rgba16().into_owned()
+    }
+
+    /// Moves the wide samples out (widening 8-bit ones) so an operation can rebuild the image
+    /// from them without a second full-size copy. The caller must store a result with
+    /// [`Image::set_wide_rgba`] afterwards.
+    pub fn take_rgba16(&mut self) -> Vec<u16> {
+        match self.wide.take() {
+            Some(wide) => wide,
+            None => self.to_rgba16(),
+        }
     }
 
     pub fn to_rgb16(&self) -> Vec<u16> {
-        let rgba = self.to_rgba16();
+        let rgba = self.rgba16();
         pack(&rgba, 3, |src, dst| {
             for (d, px) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
                 d.copy_from_slice(&px[..3]);
@@ -453,7 +494,7 @@ impl Image {
     }
 
     pub fn to_luma16(&self) -> Vec<u16> {
-        let rgba = self.to_rgba16();
+        let rgba = self.rgba16();
         pack(&rgba, 1, |src, dst| {
             for (d, px) in dst.iter_mut().zip(src.chunks_exact(4)) {
                 *d = px[0];

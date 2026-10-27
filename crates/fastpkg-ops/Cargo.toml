@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 base64 = "0.22"
+bytemuck.workspace = true
 fast_image_resize.workspace = true
 fastpkg-core = { path = "../fastpkg-core" }
 fastpkg-codecs = { path = "../fastpkg-codecs" }

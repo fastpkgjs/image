@@ -6,6 +6,48 @@
 
 - The decode-time shrink also looks through `flatten()` and `greyscale()` between `rotate()` and `resize()` (they are linear on the premultiplied samples the shrink averages), so listing and background-removal pipelines (`rotate().flatten().resize()`) keep the low-memory path: a 256 MP PNG peaks at 82 MB (sharp 308 MB) instead of about 1.15 GB. `bench/mem.mjs` case `huge-png-rotate-flatten-800-jpeg`.
 
+Peak RSS of one fresh process (`bench/peak-rss.mjs`; fixtures from `bench/gen-huge-png.mjs`, so they are reproducible), the 0.5.0 build against this one, with sharp 0.35.5 for scale. `rotate().resize(1200).jpeg()` unless noted:
+
+| input | 0.5.0 | now | sharp |
+|---|---|---|---|
+| 16-bit RGB 40 MP (6325x6325), gradient | 366 MB | 165 MB | 151 MB |
+| 16-bit RGB 40 MP, noise (229 MB file) | 592 MB | 397 MB | 380 MB |
+| 16-bit RGB 31 MP (5568x5568), gradient | 949 MB | 165 MB | 142 MB |
+| 16-bit RGBA 31 MP, gradient | 1186 MB | 234 MB | 167 MB |
+| 16-bit RGB 31 MP, noise (177 MB file) | 1126 MB | 342 MB | 318 MB |
+| 16-bit RGB 40 MP to 3000 px (mild downscale), gradient | 1341 MB | 468 MB | 175 MB |
+| 16-bit RGB 40 MP to 3000 px, noise | 1569 MB | 694 MB | 405 MB |
+| 8-bit RGB 31 MP, gradient / noise | 208 / 294 MB | 207 / 298 MB (unchanged: 124 MB decoded, under the cutoff) | 111 / 200 MB |
+| Adam7 8-bit RGB 256 MP to 800 px | 1134 MB, 2.8 s | 133 MB, 1.4 s | 904 MB, 6.6 s |
+| Adam7 8-bit RGBA 256 MP to 800 px | 2160 MB, 3.6 s | 136 MB, 1.9 s | 1196 MB, 8.2 s |
+| Adam7 16-bit RGB 256 MP to 800 px | over 6 GB (killed) | 152 MB, 2.7 s | |
+| non-interlaced 8-bit RGB 256 MP to 1200 px | 104 MB, 1.2 s | 173 MB, 1.8 s | |
+
+The spread in the 16-bit reports was the shrink factor, not the content: with a large downscale the decode-time shrink applies and the cost is the intermediate; with a mild one (the target is more than half the source) nothing can shrink, the whole 16-bit frame is resident and every copy of it counts. Gradient versus noise only changes the input file size; RGB versus RGBA and grey change the bytes per pixel; the filter type, an embedded ICC profile or an EXIF orientation made no difference.
+
+- The PNG pre-shrink cutoff is now in decoded bytes, not pixels: 128 MB as RGBA, which is 32 MP of 8-bit and 16 MP of 16-bit pixels (4 and 8 bytes each). A 31 MP 16-bit PNG used to decode whole (240 MB of samples plus an 8-bit copy plus two clones for the resize) and now shrinks while decoding. `FASTPKG_PNG_SHRINK_MIN_BYTES` overrides it; `FASTPKG_PNG_SHRINK_MIN_PIXELS` still works and counts 8-bit pixels.
+- Interlaced (Adam7) PNGs are shrunk while decoding too: pass rows are accumulated straight into the shrunk image (`next_interlaced_row`; the vendored `png` gained `Adam7Info::pass`/`line`), so neither the frame nor a de-interlaced copy is ever resident. The result equals the shrink of the same picture stored non-interlaced up to float rounding. Colour types, bit depths, tRNS/palette, `failOn` (interlaced stays all-or-nothing under `none`) and `limitInputPixels` behave as for the row-by-row path. Interlaced files under the cutoff keep the buffered decoder.
+- 16-bit images lost their redundant full-size copies: a 16-bit PNG decoded for a resize no longer builds the 8-bit twin of its samples (`Image::from_rgba16_deferred`; any operation that needs it rebuilds it), the wide resize borrows the samples instead of cloning them and repacking them as pixel structs (28 bytes per pixel in flight, now 8), rotate/flip/extract/extend/affine on wide images move the buffer instead of copying it, and the PNG and raw16 writers borrow it too.
+- Large vertical downscales are resized in bands of destination rows (about 24 MB of convolution intermediate instead of the whole source height, 152 MB for the 40 MP case above); the filter weights are those of the one-shot resize, so output differs by at most one level from float rounding.
+
+### Accuracy
+
+The decode-time PNG shrink is now an area average with exact fractional edge weights (no integer factor, no partial last block), taken to 4x the target size when the intermediate fits a 128 MiB budget, then 3.5x, 2.5x and 2x. It used to floor to an integer box factor that left 2x to 4x. PSNR in dB against an f64 Lanczos3 resample of the full-resolution pixels (3600x2400 pictures, `node bench/png-shrink-psnr.mjs`; exact = whole image resampled, old = 0.5.0 shrink):
+
+| picture | downscale | exact | new shrink | old shrink | sharp |
+|---|---|---|---|---|---|
+| photo-like | 9x | 58.5 | 57.8 | 56.5 | 55.7 |
+| photo-like | 18x | 58.7 | 57.8 | 53.7 | 54.9 |
+| photo-like | 36x | 58.8 | 57.8 | 43.7 | 55.9 |
+| textured, hard edges | 9x | 58.5 | 55.9 | 50.4 | 50.1 |
+| textured, hard edges | 18x | 58.7 | 56.9 | 48.8 | 52.4 |
+| textured, hard edges | 36x | 58.8 | 57.4 | 38.7 | 53.7 |
+| flat graphics, thin lines, text | 9x | 39.0 | 39.4 | 32.6 | 32.6 |
+| flat graphics, thin lines, text | 18x | 42.8 | 41.9 | 34.1 | 36.3 |
+| flat graphics, thin lines, text | 36x | 45.8 | 45.1 | 32.6 | 40.2 |
+
+The shrink is within about a dB of resampling the whole image and now beats sharp everywhere (before, a 36x downscale lost 13 to 20 dB). When the memory budget forces 2.5x or 2x (a 40 MP 16-bit file to 1200 px), it is still above sharp for ratios of 6x and up (graphics 35 to 39 dB at 2.5x against sharp's 32; headroom 3 is skipped, it resonates with the box and is erratically worse than 2.5) and ties with it at 2x. An axis that would shrink by less than 1.25x is not shrunk. Cost: the wider intermediate and the weighted average take a single-threaded 256 MP non-interlaced PNG to 1200 px from 1.2 s to 1.8 s and 104 MB to 173 MB; a 40 MP 16-bit file is faster (0.8 s to 0.5 s).
+
 ### Fixed
 
 - Bursts of parallel jobs no longer multiply threads and memory. 0.5.0 gave every thread of the async runtime's blocking pool (up to 512) its own rayon pool of `concurrency()` threads, so 200 simultaneous resizes peaked at 1300-2300 threads and 650-700 MB where sharp uses 24 threads and 210 MB. Now at most `max(4, cores)` jobs run at once (sharp's libuv pool has four threads); the rest wait in the async entry points without holding a thread or decoded pixels. A job runs on a rayon pool taken from a small shared list and handed back when it ends, so the pools that exist are the ones running jobs plus a few idle ones, which are released after ten seconds unused. Rayon threads are budgeted at twice the cores (or `concurrency()` if larger): up to two running jobs get the full `concurrency()` threads each, and with more jobs running each gets the budget divided over the job slots (2 threads on 12 cores). A single job still gets all `concurrency()` threads and `concurrency(n)` still means threads per image, taking effect for the next job. `metadata`, `stats`, `toFile` and the other async entry points count as jobs; failing jobs give their slot back. Output does not depend on the pool size.

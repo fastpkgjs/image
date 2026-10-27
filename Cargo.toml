@@ -65,7 +65,8 @@ tokio = { version = "1", features = ["rt", "sync"] }
 #
 # png 0.18.1 with one addition: after the last row, `Reader::zlib_stream_ended` reports whether the
 # zlib stream was seen to finish with a verified checksum, so a PNG decode need not inflate the
-# stream a second time to learn that. See vendor/png/src/decoder/zlib.rs ("fastpkg patch").
+# stream a second time to learn that. See vendor/png/src/decoder/zlib.rs ("fastpkg patch"). And
+# `Adam7Info::pass` / `line` accessors, so interlaced rows can be consumed one by one.
 [patch.crates-io]
 rav1d = { path = "vendor/rav1d" }
 png = { path = "vendor/png" }

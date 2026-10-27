@@ -50,6 +50,15 @@ The returned header is used to reject oversized input before allocation and to c
 
 If the first resize in the pipeline needs a smaller image, `fastpkg-stream` computes the target and passes it to `fastpkg-codecs`. JPEG input is decoded with MozJPEG at a DCT scale close to the target (3/8, 1/2, 1/4, ...), using `fastShrinkOnLoad` to permit the nearest lower scale. A pure-Rust `jpeg-decoder` path is the fallback. This is why the first resize does not always pay for a full-resolution JPEG decode.
 
+## PNG shrink-on-load
+
+PNG rows are decoded one at a time (`fastpkg-codecs`, `decode_png_stream`), so a large file never exists as a raw frame next to its RGBA copy. When the first resample is a downscale and the decoded image is big, the rows are also averaged into the shrunk image as they arrive and only that image is resident (`png_shrink.rs`):
+
+- **When.** The decoded size as RGBA is at least 128 MB: 32 MP of 8-bit pixels, 16 MP of 16-bit pixels (the cutoff is in bytes because memory is). Below it the image decodes whole and the parallel resampler sees every pixel. `FASTPKG_PNG_SHRINK_MIN_BYTES` overrides it (tests set it to 0); `FASTPKG_PNG_SHRINK_MIN_PIXELS` is the older spelling, counted in 8-bit pixels.
+- **What.** An area average with exact fractional edge weights from the source size to an intermediate size, so the resampler that follows sees an exactly aligned, exactly scaled image. Colour is averaged premultiplied when there is alpha. The intermediate is 4x the target size on each axis when its memory fits a 128 MiB budget, then 3.5x, 2.5x, 2x (against a full-resolution float Lanczos reference this is within about a dB of resampling the whole image, and several dB better than libvips' integer pre-shrink on thin lines; `bench/png-shrink-psnr.mjs` prints the numbers). An axis that would shrink by less than 1.25x is left alone. Leading `rotate`/`flip`/`autoOrient`/`flatten`/`greyscale` are looked through (`fastpkg-stream`), the resize still computes its target from the full-resolution size (`Image::pre_shrink`).
+- **Interlaced files.** Adam7 rows arrive pass by pass, so the average is accumulated in place at the shrunk size (four `f32` per output pixel) from the pass rows (`Reader::next_interlaced_row`, with the `pass`/`line` accessors added to the vendored `png`), and the result equals the non-interlaced shrink up to float rounding. Interlaced files below the cutoff, or that cannot shrink, still use the buffered decoder. Interlaced files are all-or-nothing under `failOn: 'none'`.
+- **16-bit.** 16-bit PNGs keep wide `u16` samples next to an 8-bit twin (`Image::wide` / `data`). A 16-bit PNG decoded for a resize skips the twin (`Image::from_rgba16_deferred`); `fastpkg_ops::apply` rebuilds it before any operation that reads it. Resizing borrows the wide samples instead of cloning and repacking them, and large vertical downscales run in bands so the convolution intermediate stays near 24 MB.
+
 ## Resize and filters
 
 `fast_image_resize` provides separable convolution kernels with runtime-dispatched SIMD. The plan maps sharp kernel names to FIR kernels:
