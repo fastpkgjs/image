@@ -20,6 +20,7 @@ pub mod icc;
 pub mod png_enc;
 pub mod png_huff;
 pub mod png_quant;
+mod png_shrink;
 pub mod svg;
 mod webp;
 
@@ -830,69 +831,51 @@ fn decode_jpeg_mozjpeg(
     Ok(Some(image))
 }
 
-/// The resampler keeps this many times the target size after the box shrink. 2 reproduces
-/// libvips' integer pre-shrink: against sharp, a 2400 px photo to 100 px is off by 0.28 levels
-/// (1.97 with a single full-resolution Lanczos pass, 1.1 and 1.5 with headroom 3 and 4).
-const PNG_SHRINK_HEADROOM: u32 = 2;
-
-/// Images below this many pixels decode at full size even when a large downscale follows: the
-/// resampler is exact there and runs in parallel, whereas the row-by-row box shrink is a single
-/// thread and costs accuracy. The shrink only pays for itself when the decoded image would be
-/// big (32 MP is 128 MiB as RGBA). `FASTPKG_PNG_SHRINK_MIN_PIXELS` overrides it (tests).
-fn png_shrink_min_pixels() -> u64 {
+/// Decoded images below this many bytes (RGBA8 is 4 per pixel, 16-bit RGBA 8) decode at full
+/// size even when a large downscale follows: the resampler is exact there and runs in parallel,
+/// whereas the row-by-row shrink is a single thread and costs accuracy. The shrink only pays for
+/// itself when the decoded image would be big: 128 MB is 32 MP of 8-bit and 16 MP of 16-bit
+/// pixels. `FASTPKG_PNG_SHRINK_MIN_BYTES` overrides it (tests); `FASTPKG_PNG_SHRINK_MIN_PIXELS`
+/// is the older spelling and counts 8-bit pixels (four bytes each).
+fn png_shrink_min_bytes() -> u64 {
     static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MIN.get_or_init(|| {
-        std::env::var("FASTPKG_PNG_SHRINK_MIN_PIXELS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(32_000_000)
+        let var = |name: &str| std::env::var(name).ok()?.parse::<u64>().ok();
+        var("FASTPKG_PNG_SHRINK_MIN_BYTES")
+            .or_else(|| var("FASTPKG_PNG_SHRINK_MIN_PIXELS").map(|pixels| pixels.saturating_mul(4)))
+            .unwrap_or(128_000_000)
     })
 }
 
-/// Integer box factor for decode-time PNG shrinking: the largest `f` that still leaves the
-/// resampler `headroom` times the target on both axes (the PNG analogue of
-/// [`jpeg_scale_numerator`]). 1 means "decode at full size".
-pub fn png_shrink_factor(source: (u32, u32), target: (u32, u32), headroom: u32) -> u32 {
-    let axis = |s: u32, t: u32| s as u64 / (t as u64 * headroom as u64).max(1);
-    axis(source.0, target.0)
-        .min(axis(source.1, target.1))
-        .clamp(1, u32::MAX as u64) as u32
-}
+/// What the shrink may keep resident while it runs (the shrunk image, which the resampler then
+/// copies, plus the accumulator for interlaced files).
+const PNG_SHRINK_BUDGET: u64 = 128 << 20;
+
+/// Bytes per pixel of the interlaced accumulator (four `f32`).
+const INTERLACED_ACC_BYTES: u64 = 16;
 
 /// A sample type of the expanded PNG rows: `u8`, or big-endian `u16` on the wire.
-trait PngSample: Copy + Default + Into<u64> {
-    const MAX: u64;
+trait PngSample: png_shrink::Sample {
     fn load(src: &[u8], i: usize) -> Self;
-    fn from_u64(v: u64) -> Self;
 }
 
 impl PngSample for u8 {
-    const MAX: u64 = 255;
     #[inline(always)]
     fn load(src: &[u8], i: usize) -> Self {
         src[i]
     }
-    #[inline(always)]
-    fn from_u64(v: u64) -> Self {
-        v as u8
-    }
 }
 
 impl PngSample for u16 {
-    const MAX: u64 = 65_535;
     #[inline(always)]
     fn load(src: &[u8], i: usize) -> Self {
         read_be_u16(src, i * 2)
-    }
-    #[inline(always)]
-    fn from_u64(v: u64) -> Self {
-        v as u16
     }
 }
 
 /// Expands one decoded PNG row (grey, grey+alpha, RGB or RGBA) to RGBA samples.
 fn expand_png_row<T: PngSample>(color: png::ColorType, src: &[u8], dst: &mut [T]) {
-    let opaque = T::from_u64(T::MAX);
+    let opaque = T::from_f32(T::MAX);
     match color {
         png::ColorType::Grayscale => {
             for (i, px) in dst.chunks_exact_mut(4).enumerate() {
@@ -929,96 +912,17 @@ fn expand_png_row<T: PngSample>(color: png::ColorType, src: &[u8], dst: &mut [T]
     }
 }
 
-/// Running `factor` x `factor` box average over RGBA rows. With alpha the colour channels are
-/// averaged premultiplied (as the resizer does) and un-premultiplied again on output; the sums
-/// are `u64`, so no factor or bit depth can overflow.
-struct BoxShrink {
-    factor: usize,
-    width: usize,
-    has_alpha: bool,
-    sums: Vec<u64>,
-    rows: u64,
-}
-
-impl BoxShrink {
-    fn new(width: usize, factor: usize, has_alpha: bool) -> Self {
-        Self {
-            factor,
-            width,
-            has_alpha,
-            sums: vec![0; width.div_ceil(factor) * 4],
-            rows: 0,
-        }
-    }
-
-    fn add_row<T: PngSample>(&mut self, row: &[T]) {
-        for (sum, block) in self
-            .sums
-            .chunks_exact_mut(4)
-            .zip(row.chunks(self.factor * 4))
-        {
-            let mut acc = [0u64; 4];
-            if self.has_alpha {
-                for px in block.chunks_exact(4) {
-                    let a: u64 = px[3].into();
-                    acc[0] += px[0].into() * a;
-                    acc[1] += px[1].into() * a;
-                    acc[2] += px[2].into() * a;
-                    acc[3] += a;
-                }
-            } else {
-                for px in block.chunks_exact(4) {
-                    acc[0] += px[0].into();
-                    acc[1] += px[1].into();
-                    acc[2] += px[2].into();
-                }
-            }
-            for (s, a) in sum.iter_mut().zip(acc) {
-                *s += a;
-            }
-        }
-        self.rows += 1;
-    }
-
-    /// Writes the averaged output row and resets the accumulator for the next block of rows.
-    fn finish_row<T: PngSample>(&mut self, out: &mut [T]) {
-        for (ox, (sum, px)) in self
-            .sums
-            .chunks_exact_mut(4)
-            .zip(out.chunks_exact_mut(4))
-            .enumerate()
-        {
-            let columns = self.factor.min(self.width - ox * self.factor) as u64;
-            let n = columns * self.rows;
-            if self.has_alpha {
-                let alpha = sum[3];
-                for k in 0..3 {
-                    px[k] = T::from_u64((sum[k] + alpha / 2).checked_div(alpha).unwrap_or(0));
-                }
-                px[3] = T::from_u64((alpha + n / 2) / n);
-            } else {
-                for k in 0..3 {
-                    px[k] = T::from_u64((sum[k] + n / 2) / n);
-                }
-                px[3] = T::from_u64(T::MAX);
-            }
-            sum.fill(0);
-        }
-        self.rows = 0;
-    }
-}
-
 /// Decodes the rows of a non-interlaced PNG straight into RGBA samples of the final (possibly
-/// box-shrunk) size. `lenient` turns a broken stream into blank rows instead of an error.
+/// shrunk to `shrink`) size. `lenient` turns a broken stream into blank rows instead of an error.
 fn read_png_rows<T: PngSample>(
     reader: &mut png::Reader<Cursor<&[u8]>>,
     color: png::ColorType,
-    factor: usize,
+    shrink: Option<(u32, u32)>,
     lenient: bool,
 ) -> Result<(u32, u32, Vec<T>)> {
     let (width, height) = reader.info().size();
     let (w, h) = (width as usize, height as usize);
-    let (ow, oh) = (w.div_ceil(factor), h.div_ceil(factor));
+    let (ow, oh) = shrink.map_or((w, h), |(x, y)| (x as usize, y as usize));
     let samples = ow
         .checked_mul(oh)
         .and_then(|n| n.checked_mul(4))
@@ -1027,11 +931,11 @@ fn read_png_rows<T: PngSample>(
     // cost nothing extra.
     let mut out = vec![T::default(); samples];
     let has_alpha = matches!(color, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
-    let mut shrink = (factor > 1).then(|| BoxShrink::new(w, factor, has_alpha));
-    let mut row = vec![T::default(); if factor > 1 { w * 4 } else { 0 }];
+    let mut shrinker = shrink.map(|_| png_shrink::RowShrink::new((w, h), (ow, oh), has_alpha));
+    let mut row = vec![T::default(); if shrinker.is_some() { w * 4 } else { 0 }];
     let mut blank: Option<Vec<u8>> = None;
     for y in 0..h {
-        let dst = match shrink {
+        let dst = match shrinker {
             Some(_) => &mut row[..],
             None => &mut out[y * w * 4..(y + 1) * w * 4],
         };
@@ -1056,13 +960,14 @@ fn read_png_rows<T: PngSample>(
             let src = blank.get_or_insert_with(|| vec![0u8; line]);
             expand_png_row(color, src, dst);
         }
-        if let Some(shrink) = shrink.as_mut() {
-            shrink.add_row(&row);
-            if (y + 1) % factor == 0 || y + 1 == h {
-                let oy = y / factor;
-                shrink.finish_row(&mut out[oy * ow * 4..(oy + 1) * ow * 4]);
-            }
+        if let Some(shrinker) = shrinker.as_mut() {
+            shrinker.add_row(y, &row, |cy, cells: &[T]| {
+                out[cy * ow * 4..(cy + 1) * ow * 4].copy_from_slice(cells)
+            });
         }
+    }
+    if let Some(shrinker) = shrinker.as_mut() {
+        shrinker.finish(|cy, cells: &[T]| out[cy * ow * 4..(cy + 1) * ow * 4].copy_from_slice(cells));
     }
     if blank.is_none() && !lenient {
         // Reading past the last row drains the image data, where a bad checksum or a damaged
@@ -1074,12 +979,66 @@ fn read_png_rows<T: PngSample>(
     Ok((ow as u32, oh as u32, out))
 }
 
+/// Adam7 passes as (first column, first row, column step, row step).
+const ADAM7: [(usize, usize, usize, usize); 7] = [
+    (0, 0, 8, 8),
+    (4, 0, 8, 8),
+    (0, 4, 4, 8),
+    (2, 0, 4, 4),
+    (0, 2, 2, 4),
+    (1, 0, 2, 2),
+    (0, 1, 1, 2),
+];
+
+/// Decodes an interlaced PNG pass row by pass row straight into the shrunk image, so neither the
+/// whole frame nor a de-interlaced copy is ever resident, only the accumulator at the shrunk
+/// size. Interlaced files are all-or-nothing: a broken stream is an error whatever `failOn` says.
+fn read_png_interlaced<T: PngSample>(
+    reader: &mut png::Reader<Cursor<&[u8]>>,
+    color: png::ColorType,
+    shrink: (u32, u32),
+) -> Result<(u32, u32, Vec<T>)> {
+    let (width, height) = reader.info().size();
+    let (w, h) = (width as usize, height as usize);
+    let (ow, oh) = (shrink.0 as usize, shrink.1 as usize);
+    let has_alpha = matches!(color, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
+    let mut shrinker = png_shrink::InterlacedShrink::new((w, h), (ow, oh), has_alpha);
+    let mut row = vec![T::default(); w * 4];
+    let channels = match color {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        _ => 4,
+    };
+    let sample_bytes = std::mem::size_of::<T>();
+    loop {
+        let decoded = reader
+            .next_interlaced_row()
+            .map_err(|error| FastpkgError::Decode(error.to_string()))?;
+        let Some(decoded) = decoded else { break };
+        let png::InterlaceInfo::Adam7(info) = decoded.interlace() else {
+            return Err(FastpkgError::Decode("PNG: unexpected interlace method".into()));
+        };
+        let (x0, y0, dx, dy) = ADAM7[info.pass() as usize - 1];
+        let y = y0 + info.line() as usize * dy;
+        let data = decoded.data();
+        let n = (data.len() / (channels * sample_bytes)).min(w);
+        if y >= h || n == 0 {
+            continue;
+        }
+        expand_png_row(color, data, &mut row[..n * 4]);
+        shrinker.add_row(y, &row[..n * 4], x0, dx);
+    }
+    Ok((ow as u32, oh as u32, shrinker.finish()))
+}
+
 /// PNG decode. Non-interlaced files are read row by row straight into the RGBA result, so no
 /// full-frame intermediate buffer exists; when `hint` is a large downscale the rows are
-/// box-averaged as they arrive and only the shrunk image is ever resident (the shrink-on-load
-/// analogue of JPEG DCT scaling). `fastShrinkOnLoad` does not apply: libvips never shrinks PNG
-/// on load, so the resampler always keeps `PNG_SHRINK_HEADROOM` times the target. Interlaced
-/// files need the whole frame to de-interlace and use the buffered decoder.
+/// area-averaged as they arrive and only the shrunk image is ever resident (the shrink-on-load
+/// analogue of JPEG DCT scaling). Interlaced files are accumulated pass row by pass row into
+/// the same shrunk image; without a shrink they need the whole frame to de-interlace and use the
+/// buffered decoder. `fastShrinkOnLoad` does not apply: libvips never shrinks PNG on load, so
+/// the resampler always keeps several times the target (see `png_shrink::plan`).
 fn decode_png_stream(
     bytes: &[u8],
     fail_on: &str,
@@ -1098,24 +1057,34 @@ fn decode_png_stream(
         return Err(FastpkgError::Decode("PNG: missing PLTE chunk".into()));
     }
     let (color, depth) = reader.output_color_type();
-    if reader.info().interlaced || color == png::ColorType::Indexed {
+    let interlaced = reader.info().interlaced;
+    let (width, height) = reader.info().size();
+    let wide = depth == png::BitDepth::Sixteen;
+    // Decoded size as RGBA, and what the shrunk image costs while it is built and handed on
+    // (the interlaced accumulator, then 16-bit images keep an 8-bit copy next to the wide one).
+    let decoded_bytes = width as u64 * height as u64 * if wide { 8 } else { 4 };
+    let cell_bytes = if wide { 12 } else { 4 } + if interlaced { INTERLACED_ACC_BYTES } else { 0 };
+    let shrink = hint
+        .filter(|_| decoded_bytes >= png_shrink_min_bytes())
+        .and_then(|hint| png_shrink::plan((width, height), hint, cell_bytes, PNG_SHRINK_BUDGET));
+    if color == png::ColorType::Indexed || (interlaced && shrink.is_none()) {
         return decode_png_buffered(bytes, fail_on, stream_ended);
     }
-    let (width, height) = reader.info().size();
-    let factor = hint
-        .filter(|_| width as u64 * height as u64 >= png_shrink_min_pixels())
-        .map_or(1, |hint| {
-            png_shrink_factor((width, height), hint, PNG_SHRINK_HEADROOM)
-        }) as usize;
     let has_alpha = matches!(color, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
-    let mut image = if depth == png::BitDepth::Sixteen {
-        let (w, h, wide) = read_png_rows::<u16>(&mut reader, color, factor, lenient)?;
+    let mut image = if wide {
+        let (w, h, wide) = match shrink.filter(|_| interlaced) {
+            Some(shrink) => read_png_interlaced::<u16>(&mut reader, color, shrink)?,
+            None => read_png_rows::<u16>(&mut reader, color, shrink, lenient)?,
+        };
         let mut image = Image::from_rgba16(w, h, wide)?;
         // sharp/libvips promote 16-bit grey to RGB16, so wide grey decodes as 3 channels.
         image.gray = false;
         image
     } else {
-        let (w, h, rgba) = read_png_rows::<u8>(&mut reader, color, factor, lenient)?;
+        let (w, h, rgba) = match shrink.filter(|_| interlaced) {
+            Some(shrink) => read_png_interlaced::<u8>(&mut reader, color, shrink)?,
+            None => read_png_rows::<u8>(&mut reader, color, shrink, lenient)?,
+        };
         let mut image = Image::from_rgba(w, h, rgba)?;
         image.gray = matches!(
             color,
@@ -1126,7 +1095,7 @@ fn decode_png_stream(
     *stream_ended = reader.zlib_stream_ended();
     image.has_alpha = has_alpha;
     image.format = Format::Png;
-    if factor > 1 {
+    if shrink.is_some() {
         image.pre_shrink = Some((width, height));
     }
     Ok(image)

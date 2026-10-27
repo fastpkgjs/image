@@ -63,6 +63,21 @@ impl Adam7Info {
         }
     }
 
+    /// The Adam7 pass number, 1..=7.
+    ///
+    /// fastpkg patch: read access to the position of a row from [`Reader::next_interlaced_row`],
+    /// so rows can be consumed one by one without de-interlacing the whole frame.
+    pub fn pass(&self) -> u8 {
+        self.pass
+    }
+
+    /// The index of the line within its pass.
+    ///
+    /// fastpkg patch, see [`Adam7Info::pass`].
+    pub fn line(&self) -> u32 {
+        self.line
+    }
+
     fn pass_constants(&self) -> PassConstants {
         PassConstants::PASSES[self.pass as usize - 1]
     }
