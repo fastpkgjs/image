@@ -10,7 +10,8 @@ import { writePng } from '../bench/png-fixtures.mjs';
 
 const mode = process.argv[2];
 const sha = (buf) => crypto.createHash('sha1').update(buf).digest('hex');
-const status = (key) => Number(new RegExp(`${key}:\\s+(\\d+)`).exec(fs.readFileSync('/proc/self/status', 'utf8'))[1]) / 1024;
+const linux = process.platform === 'linux';
+const status = (key) => (linux ? Number(new RegExp(`${key}:\\s+(\\d+)`).exec(fs.readFileSync('/proc/self/status', 'utf8'))[1]) / 1024 : 0);
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fastpkg-admission-'));
 process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
 
@@ -23,7 +24,7 @@ async function bigPng(width, height, extra = {}) {
 
 const smallJpeg = () => engine(pattern(800, 600, 3), { raw: { width: 800, height: 600, channels: 3 } }).jpeg().toBuffer();
 const thumb = (input) => engine(input).resize(300).jpeg({ quality: 80 }).toBuffer();
-const resetPeak = () => fs.writeFileSync('/proc/self/clear_refs', '5');
+const resetPeak = () => linux && fs.writeFileSync('/proc/self/clear_refs', '5');
 
 async function info() {
   console.log(JSON.stringify(engine._admission()));
