@@ -584,7 +584,11 @@ impl<T: Raw> RowShrink<T> {
     fn finish_cells(&mut self) {
         let c = self.channels;
         let max = T::from_f32(T::MAX);
-        for (a, px) in self.reduced.chunks_exact(c).zip(self.cells.chunks_exact_mut(4)) {
+        for (a, px) in self
+            .reduced
+            .chunks_exact(c)
+            .zip(self.cells.chunks_exact_mut(4))
+        {
             if self.has_alpha {
                 let alpha = a[c - 1];
                 let colour = |v: f32| {
@@ -598,7 +602,12 @@ impl<T: Raw> RowShrink<T> {
                     let v = colour(a[0]);
                     px.copy_from_slice(&[v, v, v, T::from_f32(alpha)]);
                 } else {
-                    px.copy_from_slice(&[colour(a[0]), colour(a[1]), colour(a[2]), T::from_f32(alpha)]);
+                    px.copy_from_slice(&[
+                        colour(a[0]),
+                        colour(a[1]),
+                        colour(a[2]),
+                        T::from_f32(alpha),
+                    ]);
                 }
             } else if c == 1 {
                 let v = T::from_f32(a[0]);
@@ -817,7 +826,11 @@ mod tests {
             let (cy, wy0, wy1) = ys.at(y);
             for x in 0..w {
                 let (cx, wx0, wx1) = xs.at(x);
-                let a = if alpha { sample(x, y, channels - 1) } else { 1.0 };
+                let a = if alpha {
+                    sample(x, y, channels - 1)
+                } else {
+                    1.0
+                };
                 for c in 0..channels {
                     let v = if alpha && c < channels - 1 {
                         sample(x, y, c) * a
@@ -856,37 +869,57 @@ mod tests {
                             .collect();
                         let run = |wide: bool| -> (Vec<f64>, Vec<f64>) {
                             if wide {
-                                let mut rows = RowShrink::<u16>::new((w, h), (ow, oh), channels, alpha);
+                                let mut rows =
+                                    RowShrink::<u16>::new((w, h), (ow, oh), channels, alpha);
                                 let mut out = vec![0f64; ow * oh * 4];
                                 for y in 0..h {
-                                    rows.add_row(y, &raw[y * w * channels * 2..][..w * channels * 2], |cy, c: &[u16]| {
-                                        for (d, s) in out[cy * ow * 4..][..ow * 4].iter_mut().zip(c) {
-                                            *d = *s as f64;
-                                        }
-                                    });
+                                    rows.add_row(
+                                        y,
+                                        &raw[y * w * channels * 2..][..w * channels * 2],
+                                        |cy, c: &[u16]| {
+                                            for (d, s) in
+                                                out[cy * ow * 4..][..ow * 4].iter_mut().zip(c)
+                                            {
+                                                *d = *s as f64;
+                                            }
+                                        },
+                                    );
                                 }
                                 rows.finish(|cy, c: &[u16]| {
                                     for (d, s) in out[cy * ow * 4..][..ow * 4].iter_mut().zip(c) {
                                         *d = *s as f64;
                                     }
                                 });
-                                (out, reference::<u16>(&raw, (w, h), (ow, oh), channels, alpha))
+                                (
+                                    out,
+                                    reference::<u16>(&raw, (w, h), (ow, oh), channels, alpha),
+                                )
                             } else {
-                                let mut rows = RowShrink::<u8>::new((w, h), (ow, oh), channels, alpha);
+                                let mut rows =
+                                    RowShrink::<u8>::new((w, h), (ow, oh), channels, alpha);
                                 let mut out = vec![0f64; ow * oh * 4];
                                 for y in 0..h {
-                                    rows.add_row(y, &raw[y * w * channels..][..w * channels], |cy, c: &[u8]| {
-                                        for (d, s) in out[cy * ow * 4..][..ow * 4].iter_mut().zip(c) {
-                                            *d = *s as f64;
-                                        }
-                                    });
+                                    rows.add_row(
+                                        y,
+                                        &raw[y * w * channels..][..w * channels],
+                                        |cy, c: &[u8]| {
+                                            for (d, s) in
+                                                out[cy * ow * 4..][..ow * 4].iter_mut().zip(c)
+                                            {
+                                                *d = *s as f64;
+                                            }
+                                        },
+                                    );
                                 }
                                 rows.finish(|cy, c: &[u8]| {
                                     for (d, s) in out[cy * ow * 4..][..ow * 4].iter_mut().zip(c) {
                                         *d = *s as f64;
                                     }
                                 });
-                                (out, reference::<u8>(&raw, (w, h), (ow, oh), channels, alpha))
+                                (
+                                    out,
+                                    reference::<u8>(&raw, (w, h), (ow, oh), channels, alpha),
+                                )
                             }
                         };
                         let (got, sums) = run(wide);

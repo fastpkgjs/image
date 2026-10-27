@@ -134,9 +134,15 @@ pub fn encode(p: &Params, samples: &[u8], out: &mut Vec<u8>) {
     }
     let mut idat = IdatWriter::new(out);
     if lazy {
-        zlib_filtered(samples, row_bytes, h, bpp, plan.strategy, plan.method, &mut |bytes| {
-            idat.write(bytes)
-        });
+        zlib_filtered(
+            samples,
+            row_bytes,
+            h,
+            bpp,
+            plan.strategy,
+            plan.method,
+            &mut |bytes| idat.write(bytes),
+        );
     } else {
         let filtered;
         let src = if direct {
@@ -863,7 +869,7 @@ fn zlib_header(method: Method) -> [u8; 2] {
 }
 
 /// Blocks of `SPLIT_BLOCK` bytes filtered (and then deflated) at a time by [`zlib_filtered`].
-const FILTER_BLOCKS: usize = 16;
+const FILTER_BLOCKS: usize = 8;
 
 /// The zlib stream of the filtered rows of `data`, handed to `emit` in order as it is made:
 /// the bytes of [`zlib`] over `Source::Flat` of the filtered rows, without that copy. The rows
@@ -905,7 +911,10 @@ fn zlib_filtered(
     let mut first_block = 0;
     while first_block < count {
         let last_block = (first_block + FILTER_BLOCKS).min(count);
-        let (from, to) = (first_block * SPLIT_BLOCK, (last_block * SPLIT_BLOCK).min(total));
+        let (from, to) = (
+            first_block * SPLIT_BLOCK,
+            (last_block * SPLIT_BLOCK).min(total),
+        );
         let (first_row, end_row) = (from / stride, to.div_ceil(stride));
         let filtered = filter(first_row, end_row);
         let mut window = Vec::with_capacity(tail.len() + (to - from));
@@ -1050,10 +1059,21 @@ mod tests {
                 filter_into(&data, row_bytes, rows, bpp, Strategy::Adaptive, &mut flat);
                 let want = zlib(&Source::Flat(&flat), method);
                 let mut got = Vec::new();
-                zlib_filtered(&data, row_bytes, rows, bpp, Strategy::Adaptive, method, &mut |b| {
-                    got.extend_from_slice(b)
-                });
-                assert!(got == want, "{row_bytes}x{rows} {method:?}: {} vs {} bytes", got.len(), want.len());
+                zlib_filtered(
+                    &data,
+                    row_bytes,
+                    rows,
+                    bpp,
+                    Strategy::Adaptive,
+                    method,
+                    &mut |b| got.extend_from_slice(b),
+                );
+                assert!(
+                    got == want,
+                    "{row_bytes}x{rows} {method:?}: {} vs {} bytes",
+                    got.len(),
+                    want.len()
+                );
             }
         }
     }

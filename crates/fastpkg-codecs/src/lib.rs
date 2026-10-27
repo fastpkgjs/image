@@ -351,8 +351,8 @@ fn decode_with_hint_inner(
         Format::Svg => svg::decode(bytes, input.density)?,
         Format::Png => {
             // An embedded profile is converted on the decoded pixels, before any resize.
-            let sinks = sinks
-                .filter(|_| input.ignore_icc || fastpkg_meta::icc_profile(bytes).is_none());
+            let sinks =
+                sinks.filter(|_| input.ignore_icc || fastpkg_meta::icc_profile(bytes).is_none());
             decode_png(bytes, &input.fail_on, hint.map(|hint| hint.target), sinks)?
         }
         Format::Jpeg => decode_jpeg_scaled(bytes, hint, fast_shrink, input)?,
@@ -950,7 +950,7 @@ fn png_shrink_min_bytes() -> u64 {
 /// then reads (the shrunk image, 4 bytes a pixel, 12 for 16-bit ones that keep an 8-bit copy
 /// next to the wide one): the headroom ladder of `png_shrink::plan` stops at the first rung that
 /// fits. Rows handed to a sink are never collected, so streamed decodes always take the best rung.
-const PNG_SHRINK_BUDGET: u64 = 32 << 20;
+const PNG_SHRINK_BUDGET: u64 = 48 << 20;
 
 /// The same for interlaced files, whose accumulator (four `f32` a pixel) is the larger part.
 const PNG_SHRINK_BUDGET_INTERLACED: u64 = 128 << 20;
@@ -1147,7 +1147,14 @@ fn read_png_rows<T: PngSample>(
             vec![T::default(); samples]
         },
         shrinker: shrink.map(|_| png_shrink::RowShrink::new((w, h), (ow, oh), channels, has_alpha)),
-        row: vec![T::default(); if to_sink && shrink.is_none() { w * 4 } else { 0 }],
+        row: vec![
+            T::default();
+            if to_sink && shrink.is_none() {
+                w * 4
+            } else {
+                0
+            }
+        ],
         sink,
         error: None,
     };
@@ -1306,8 +1313,8 @@ fn decode_png_stream(
             return Ok(image);
         }
     }
-    let shrink = wants_shrink
-        .and_then(|hint| png_shrink::plan((width, height), hint, cell_bytes, budget));
+    let shrink =
+        wants_shrink.and_then(|hint| png_shrink::plan((width, height), hint, cell_bytes, budget));
     if color == png::ColorType::Indexed || (interlaced && shrink.is_none()) {
         return decode_png_buffered(bytes, fail_on, stream_ended);
     }

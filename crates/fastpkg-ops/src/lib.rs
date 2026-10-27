@@ -772,7 +772,12 @@ fn resize_raw_opts(
     let mut options = resize_options(kernel, image.has_alpha);
     let format = image.format;
     let has_alpha = image.has_alpha;
-    let geometry = Geometry::new((image.width, image.height), (width, height), plan.as_ref(), has_alpha);
+    let geometry = Geometry::new(
+        (image.width, image.height),
+        (width, height),
+        plan.as_ref(),
+        has_alpha,
+    );
     if data.len() >= stream_min_bytes() && kernel != Kernel::Nearest && geometry.streamable::<u8>()
     {
         // Rows go through the box shrink, padding and kernel a band at a time: the shrunk and
@@ -825,7 +830,9 @@ fn resize_raw_wide(
         plan.as_ref(),
         image.has_alpha,
     );
-    if wide.len() * 2 >= stream_min_bytes() && kernel != Kernel::Nearest && geometry.streamable::<u16>()
+    if wide.len() * 2 >= stream_min_bytes()
+        && kernel != Kernel::Nearest
+        && geometry.streamable::<u16>()
     {
         let out = resize_frame(&wide, geometry, options)?;
         drop(wide);

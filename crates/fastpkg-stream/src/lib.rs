@@ -6,8 +6,8 @@ use base64::Engine;
 use fastpkg_codecs::{decode, decode_with_sink, encode, output_is_16, probe, ShrinkHint};
 use fastpkg_core::options::Operation;
 use fastpkg_core::{
-    FastpkgError, Format, HeaderInfo, Image, OutputInfo, PipelineSpec, Result, RowSinkSpec, SinkFactory,
-    Stats,
+    FastpkgError, Format, HeaderInfo, Image, OutputInfo, PipelineSpec, Result, RowSinkSpec,
+    SinkFactory, Stats,
 };
 use fastpkg_meta::{enrich, MetadataExtras};
 use fastpkg_ops::{
@@ -213,9 +213,8 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
     let narrow = spec.operations.len() == leading + 1
         && spec.pipeline_colourspace.is_none()
         && !output_is_16(&spec.output);
-    let sink_factory = |sink: &RowSinkSpec| {
-        streamed_op.and_then(|op| fastpkg_ops::resize_sink(op, sink, narrow))
-    };
+    let sink_factory =
+        |sink: &RowSinkSpec| streamed_op.and_then(|op| fastpkg_ops::resize_sink(op, sink, narrow));
     let sinks: Option<SinkFactory> = streamed_op.is_some().then_some(&sink_factory);
     let mut image = decode_with_sink(bytes, header.format, &input, hint, fast_shrink, sinks)?;
     check_deadline(deadline)?;

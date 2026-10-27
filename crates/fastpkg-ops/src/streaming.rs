@@ -22,7 +22,13 @@ use rayon::prelude::*;
 pub(crate) trait Sample:
     Copy + Default + Send + Sync + Pod + Into<u64> + TryFrom<u64> + 'static
 {
-    type Acc: Copy + Default + Send + Sync + Into<u64> + std::ops::AddAssign + std::ops::Mul<Output = Self::Acc>;
+    type Acc: Copy
+        + Default
+        + Send
+        + Sync
+        + Into<u64>
+        + std::ops::AddAssign
+        + std::ops::Mul<Output = Self::Acc>;
     const PIXEL: PixelType;
     /// Block areas below this are divided by reciprocal multiplication (see `divide`).
     const FAST_AREA: u64;
@@ -179,7 +185,7 @@ pub(crate) struct Geometry {
 }
 
 /// Bytes of source rows kept for one band, margin included.
-const WINDOW_BYTES: usize = 16 << 20;
+const WINDOW_BYTES: usize = 8 << 20;
 
 /// Most bytes of un-shrunk rows buffered for the vertical box factor.
 const BOX_BYTES: usize = 64 << 20;
@@ -278,7 +284,9 @@ impl<T: Sample> Engine<T> {
         let margin = (5.0 * scale.max(1.0)).ceil() as usize + 2;
         let row_bytes = g.canvas.0 * 4 * std::mem::size_of::<T>();
         let rows = (window / row_bytes.max(1)).saturating_sub(2 * margin);
-        let band_rows = ((rows as f64 / scale) as usize).clamp(4, g.out.1.max(4)).min(g.out.1);
+        let band_rows = ((rows as f64 / scale) as usize)
+            .clamp(4, g.out.1.max(4))
+            .min(g.out.1);
         let samples = g.out.0 * g.out.1 * 4;
         let out = if narrow && std::mem::size_of::<T>() == 2 {
             Output::Narrowed(vec![0; samples])
@@ -613,11 +621,7 @@ impl RowSink for ResizeSink {
 /// downscale, nearest-neighbour kernel, ...) and the image should be decoded and resized as
 /// usual. `narrow` lets 16-bit samples be narrowed to 8 bits in the result: pass it when
 /// nothing after the resize needs the wide samples.
-pub fn resize_sink(
-    op: &Operation,
-    spec: &RowSinkSpec,
-    narrow: bool,
-) -> Option<Box<dyn RowSink>> {
+pub fn resize_sink(op: &Operation, spec: &RowSinkSpec, narrow: bool) -> Option<Box<dyn RowSink>> {
     let Operation::Resize {
         width,
         height,
@@ -737,7 +741,14 @@ mod tests {
 
     #[test]
     fn box_shrink_is_the_plain_block_mean() {
-        for (w, h, kx, ky) in [(37, 29, 3, 2), (64, 8, 2, 2), (5, 5, 1, 4), (9, 3, 7, 1), (1, 1, 2, 2), (40, 41, 16, 16)] {
+        for (w, h, kx, ky) in [
+            (37, 29, 3, 2),
+            (64, 8, 2, 2),
+            (5, 5, 1, 4),
+            (9, 3, 7, 1),
+            (1, 1, 2, 2),
+            (40, 41, 16, 16),
+        ] {
             for weighted in [false, true] {
                 let a: Vec<u8> = noise(w * h * 4, 3);
                 assert_eq!(
@@ -781,7 +792,9 @@ mod tests {
         };
         let src = ImageRef::new(size.0, size.1, bytemuck::cast_slice(&data), T::PIXEL).unwrap();
         let mut dst = vec![T::default(); out.0 as usize * out.1 as usize * 4];
-        let mut view = FirImage::from_slice_u8(out.0, out.1, bytemuck::cast_slice_mut(&mut dst), T::PIXEL).unwrap();
+        let mut view =
+            FirImage::from_slice_u8(out.0, out.1, bytemuck::cast_slice_mut(&mut dst), T::PIXEL)
+                .unwrap();
         crate::resize_banded(&src, &mut view, &options, crop, true, usize::MAX).unwrap();
         dst
     }
@@ -800,8 +813,12 @@ mod tests {
         ] {
             for kernel in [Kernel::Lanczos3, Kernel::Cubic] {
                 for alpha in [false, true] {
-                    let (rw, rh) = fastpkg_core::pipeline::compute_target(sw, sh, width, height, fit, false, false);
-                    let scales = fastpkg_core::pipeline::resolve_shrink(sw, sh, width, height, fit, false, false);
+                    let (rw, rh) = fastpkg_core::pipeline::compute_target(
+                        sw, sh, width, height, fit, false, false,
+                    );
+                    let scales = fastpkg_core::pipeline::resolve_shrink(
+                        sw, sh, width, height, fit, false, false,
+                    );
                     let plan = crate::resize_plan((sw, sh), (rw, rh), Some(scales));
                     let g = Geometry::new((sw, sh), (rw, rh), plan.as_ref(), alpha);
                     if !g.streamable::<u8>() {
@@ -812,11 +829,14 @@ mod tests {
                     let data: Vec<u8> = noise(sw as usize * sh as usize * 4, 5);
                     let want = one_shot(&data, (sw, sh), (rw, rh), plan.as_ref(), kernel, alpha);
                     for window in [1usize << 12, 1 << 16] {
-                        let mut engine = Engine::<u8>::with_window(g.clone(), options.clone(), false, window);
+                        let mut engine =
+                            Engine::<u8>::with_window(g.clone(), options.clone(), false, window);
                         for row in data.chunks_exact(sw as usize * 4) {
                             engine.push_row(row).unwrap();
                         }
-                        let Output::Same(got) = engine.finish().unwrap() else { panic!() };
+                        let Output::Same(got) = engine.finish().unwrap() else {
+                            panic!()
+                        };
                         let worst = got.iter().zip(&want).map(|(a, b)| a.abs_diff(*b)).max();
                         assert!(worst <= Some(1), "u8 {sw}x{sh}->{rw}x{rh} {kernel:?} alpha {alpha} window {window}: {worst:?}");
                     }
@@ -827,19 +847,28 @@ mod tests {
                         .collect();
                     let want = one_shot(&wide, (sw, sh), (rw, rh), plan.as_ref(), kernel, alpha);
                     for narrow in [false, true] {
-                        let mut engine = Engine::<u16>::with_window(g.clone(), options.clone(), narrow, 1 << 13);
+                        let mut engine =
+                            Engine::<u16>::with_window(g.clone(), options.clone(), narrow, 1 << 13);
                         for row in wide.chunks_exact(sw as usize * 4) {
                             engine.push_row(row).unwrap();
                         }
                         match engine.finish().unwrap() {
                             Output::Same(got) => {
                                 assert!(!narrow);
-                                let worst = got.iter().zip(&want).map(|(a, b)| a.abs_diff(*b)).max();
-                                assert!(worst <= Some(2), "u16 {sw}x{sh}->{rw}x{rh} {kernel:?} alpha {alpha}: {worst:?}");
+                                let worst =
+                                    got.iter().zip(&want).map(|(a, b)| a.abs_diff(*b)).max();
+                                assert!(
+                                    worst <= Some(2),
+                                    "u16 {sw}x{sh}->{rw}x{rh} {kernel:?} alpha {alpha}: {worst:?}"
+                                );
                             }
                             Output::Narrowed(got) => {
                                 assert!(narrow);
-                                let worst = got.iter().zip(&want).map(|(a, b)| a.abs_diff(narrow_sample(*b))).max();
+                                let worst = got
+                                    .iter()
+                                    .zip(&want)
+                                    .map(|(a, b)| a.abs_diff(narrow_sample(*b)))
+                                    .max();
                                 assert!(worst <= Some(1), "narrowed {sw}x{sh}->{rw}x{rh} {kernel:?} alpha {alpha}: {worst:?}");
                             }
                         }
@@ -848,7 +877,10 @@ mod tests {
                     let got = resize_frame(&data, g.clone(), options.clone()).unwrap();
                     let want = one_shot(&data, (sw, sh), (rw, rh), plan.as_ref(), kernel, alpha);
                     let worst = got.iter().zip(&want).map(|(a, b)| a.abs_diff(*b)).max();
-                    assert!(worst <= Some(1), "frame {sw}x{sh}->{rw}x{rh} {kernel:?} alpha {alpha}: {worst:?}");
+                    assert!(
+                        worst <= Some(1),
+                        "frame {sw}x{sh}->{rw}x{rh} {kernel:?} alpha {alpha}: {worst:?}"
+                    );
                 }
             }
         }
