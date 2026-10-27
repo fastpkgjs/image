@@ -514,8 +514,7 @@ mod tests {
     #[test]
     fn flat_colour_stays_flat() {
         let (w, h) = (97, 61);
-        let px: Vec<u16> = std::iter::repeat([40_000u16, 1, 65_535, 65_535])
-            .take(w * h)
+        let px: Vec<u16> = std::iter::repeat_n([40_000u16, 1, 65_535, 65_535], w * h)
             .flatten()
             .collect();
         let mut rows = RowShrink::new((w, h), (10, 6), false);
