@@ -122,6 +122,36 @@ test('fits, kernels, orientation and later operations see the streamed result', 
   });
 });
 
+test('thin, tiny and tall images and extreme targets agree with the whole-frame resize', () => {
+  const jobs = [];
+  const labels = [];
+  const sample = (x, y, c) => (c === 3 ? 60 + ((x * 5 + y * 3) % 190) : (x * 37 + y * 11 + c * 90) & 255);
+  for (const [width, height] of [[7, 500], [500, 5], [1, 1000], [333, 2], [64, 3000], [3000, 64], [97, 89]]) {
+    for (const [type, depth] of [[2, 8], [6, 8], [6, 16]]) {
+      const file = write(`odd-${width}x${height}-${type}-${depth}`, { width, height, type, depth, sample: (x, y, c) => (depth === 16 ? sample(x, y, c) * 257 : sample(x, y, c)) });
+      for (const op of [
+        '{ width: 3 }',
+        '{ height: 2 }',
+        `{ width: ${Math.max(1, width >> 1)} }`,
+        '{ width: 1, height: 1, fit: "fill" }',
+        '{ width: 5, height: 9, fit: "cover" }',
+      ]) {
+        jobs.push({ file, pipeline: `(s) => s.resize(${op}).raw()` });
+        labels.push(`${width}x${height} type ${type} depth ${depth} ${op}`);
+      }
+    }
+  }
+  const on = run(jobs, ON);
+  const off = run(jobs, OFF);
+  on.forEach((result, i) => {
+    assert.equal(Boolean(result.error), Boolean(off[i].error), `${labels[i]}: ${result.error} / ${off[i].error}`);
+    if (!result.error) {
+      assert.deepEqual([result.width, result.height, result.channels], [off[i].width, off[i].height, off[i].channels], labels[i]);
+      assert.ok(worst(result, off[i]) <= 2, `${labels[i]}: differs by ${worst(result, off[i])}`);
+    }
+  });
+});
+
 test('truncated and damaged files behave the same streamed or not', () => {
   const jobs = [];
   const labels = [];
