@@ -760,14 +760,19 @@ pub fn jpeg_scale_denominator(shrink: f64, fast_shrink: bool) -> u8 {
     denominator
 }
 
+/// `FASTPKG_JPEG_SHRINK=eighths` selects libjpeg's finer n/8 scales (see
+/// [`jpeg_scale_numerator`]) over sharp's 1/2, 1/4 and 1/8: a little faster for shrink factors
+/// between the powers of two, but it leaves the resampler a different residual than libvips has.
 pub fn jpeg_rule_eighths() -> bool {
     static EIGHTHS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EIGHTHS.get_or_init(|| std::env::var("FASTPKG_JPEG_RULE").is_ok_and(|rule| rule == "eighths"))
+    *EIGHTHS
+        .get_or_init(|| std::env::var("FASTPKG_JPEG_SHRINK").is_ok_and(|rule| rule == "eighths"))
 }
 
 /// Smallest DCT scale numerator `n` (output is `n/8` of the source) whose
-/// result still covers `target` on both axes. `headroom` keeps extra source
-/// pixels for the resampler when moire-free output matters more than speed.
+/// result still covers `target` on both axes. Only used with `FASTPKG_JPEG_SHRINK=eighths`.
+/// `headroom` keeps extra source pixels for the resampler when moire-free output matters more
+/// than speed.
 pub fn jpeg_scale_numerator(source: (u32, u32), target: (u32, u32), headroom: u32) -> u8 {
     let need = |s: u32, t: u32| -> u32 {
         let t = (t as u64 * headroom as u64).clamp(1, s as u64);
@@ -2849,7 +2854,36 @@ fn webp_flags(bytes: &[u8]) -> (bool, bool, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::jpeg_scale_numerator;
+    use super::{jpeg_scale_denominator, jpeg_scale_numerator};
+
+    #[test]
+    fn jpeg_scale_denominator_is_sharps_rule() {
+        // (shrink, denominator with fastShrinkOnLoad, without)
+        for (shrink, fast, slow) in [
+            (0.5, 1, 1),
+            (1.0, 1, 1),
+            (1.99, 1, 1),
+            // 2 and 4 equal their own integer part, so the scale drops a step.
+            (2.0, 1, 1),
+            (2.9, 1, 1),
+            (3.0, 2, 1),
+            (3.99, 2, 1),
+            (4.0, 2, 2),
+            (4.9, 2, 2),
+            (5.0, 4, 2),
+            (7.99, 4, 2),
+            (8.0, 4, 4),
+            (8.9, 4, 4),
+            (9.0, 8, 4),
+            (15.9, 8, 4),
+            (16.0, 8, 8),
+            (17.0, 8, 8),
+            (100.0, 8, 8),
+        ] {
+            assert_eq!(jpeg_scale_denominator(shrink, true), fast, "{shrink} fast");
+            assert_eq!(jpeg_scale_denominator(shrink, false), slow, "{shrink} slow");
+        }
+    }
 
     fn scaled(size: u32, numerator: u8) -> u32 {
         (size as u64 * numerator as u64).div_ceil(8) as u32

@@ -4864,3 +4864,77 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod resize_plan_tests {
+    use super::*;
+
+    #[test]
+    fn exact_fit_needs_no_plan() {
+        assert!(resize_plan((1600, 1200), (800, 600), Some((2.0, 2.0))).is_none());
+        assert!(resize_plan((1600, 1200), (800, 600), None).is_none());
+        // Enlargements are left to the plain resampler.
+        assert!(resize_plan((100, 100), (200, 150), Some((0.5, 0.75))).is_none());
+    }
+
+    #[test]
+    fn rounded_up_output_runs_past_the_edges_evenly() {
+        // 2400x1600 to 1000 wide: the height 1600 / 2.4 = 666.67 is rounded up to 667, which
+        // asks for 1600.8 rows; libvips takes 0.4 from each end.
+        let plan = resize_plan((2400, 1600), (1000, 667), Some((2.4, 2.4))).unwrap();
+        assert_eq!(plan.box_factor, (1, 1));
+        assert_eq!(plan.pad, [0, 1, 0, 1]);
+        assert_eq!(plan.canvas, (2400, 1602));
+        let [left, top, width, height] = plan.crop;
+        assert_eq!((left, width), (0.0, 2400.0));
+        assert!((top - 0.6).abs() < 1e-9 && (height - 1600.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rounded_down_output_skips_the_edges_evenly() {
+        // 1000x667 to 333 wide: 222.2 rows rounded down to 222, so 0.2 * 3.003 rows are unused.
+        let shrink = 1000.0 / 333.0;
+        let plan = resize_plan((1000, 667), (333, 222), Some((shrink, shrink))).unwrap();
+        assert_eq!(plan.pad, [0; 4]);
+        let [_, top, _, height] = plan.crop;
+        assert!(top > 0.0 && (top * 2.0 + height - 667.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn libvips_box_shrinks_until_the_kernel_sees_twice_the_output() {
+        for (input, output, factor) in [
+            (1600, 800, 1),
+            (1600, 533, 1),
+            (1600, 400, 2),
+            (4000, 100, 20),
+            (4000, 2000, 1),
+            (1000, 125, 4),
+        ] {
+            let plan = axis_plan(input, output, input as f64 / output as f64);
+            assert_eq!(plan.box_factor, factor, "{input} -> {output}");
+            assert_eq!(plan.shrunk, input.div_ceil(factor));
+        }
+    }
+
+    #[test]
+    fn box_shrink_averages_blocks_and_repeats_the_edge() {
+        // 3x1 pixels shrunk by 2: the second block is the last pixel twice.
+        let data: Vec<u8> = vec![10, 20, 30, 255, 30, 40, 50, 255, 100, 100, 100, 255];
+        let (out, w, h) = box_shrink(&data, (3, 1), (2, 1), false);
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(out, vec![20, 30, 40, 255, 100, 100, 100, 255]);
+        // With alpha the colours are weighted by it: a transparent pixel does not dilute.
+        let data: Vec<u8> = vec![200, 0, 0, 255, 0, 255, 0, 0];
+        let (out, ..) = box_shrink(&data, (2, 1), (2, 1), true);
+        assert_eq!(out, vec![200, 0, 0, 128]);
+    }
+
+    #[test]
+    fn padding_repeats_the_edges() {
+        let data: Vec<u8> = vec![1, 1, 1, 1, 2, 2, 2, 2];
+        let out = pad_replicate(&data, (2, 1), [1, 1, 0, 0]);
+        // 3x2 canvas: the new left column and top row copy the first column and the first row.
+        let px: Vec<u8> = out.chunks_exact(4).map(|p| p[0]).collect();
+        assert_eq!(px, vec![1, 1, 2, 1, 1, 2]);
+    }
+}
