@@ -25,7 +25,7 @@ Fresh process each (`node bench/png-ab.mjs <file> --pipeline <name> --base <0.6.
 | 8192x8192 RGBA to 4096 px, PNG | | 458 MB | 144 MB | 134 MB |
 | 8192x8192 RGBA to 4096 px, JPEG | | 458 MB | 286 MB (64 of it the flattened copy JPEG needs) | 226 MB |
 
-(0.5.0 for the 16-bit rows is from the 0.6.0 table below, gradient fixtures.) The 4096 px CPU regression was the box shrink and resize copies of 0.6.0, not the decoder (the zlib end-of-stream check from 0.6.0 still avoids the second inflate); a raw 4096x4096 RGB resize to 1024 px costs 205-230 ms CPU after the box shrink work, against 275 ms in 0.6.0 and 125 ms in 0.5.0 (which resampled from 4096 px with a wider kernel but no libvips box-shrink emulation) - the rest of the gap is the box shrink that makes the output match libvips, and it is paid back by the cheaper convolution.
+(0.5.0 for the 16-bit rows is from the 0.6.0 table below, gradient fixtures.) The 4096 px CPU regression was in the resize, not the decoder (the zlib end-of-stream check from 0.6.0 still avoids the second inflate): resizing an already decoded 4096x4096 RGB image to 1024 px costs 216-240 ms CPU now, 295 ms in 0.6.0 and 104 ms in 0.5.0. The remaining difference is the box shrink that makes the output match libvips (0.6.0's geometry work, not PNG specific); the PNG pipeline as a whole is cheaper than 0.5.0's because the rows are resampled while they decode and the frame is never copied.
 
 ### Accuracy
 
@@ -37,7 +37,7 @@ Unchanged: the decode-time shrink has the same weights and headroom ladder, and 
 | textured | 4.5x / 9x / 18x / 36x | 46.0 / 50.4 / 53.2 / 53.6 | 46.0 / 55.9 / 56.9 / 57.4 | 46.0 / 55.9 / 56.9 / 57.4 | 45.6 / 50.1 / 52.4 / 53.7 |
 | hard edges | 4.5x / 9x / 18x / 36x | 32.8 / 32.6 / 36.7 / 41.0 | 32.8 / 39.4 / 41.9 / 45.1 | 32.8 / 39.4 / 41.9 / 45.1 | 32.8 / 32.6 / 36.3 / 40.2 |
 
-The 48 MiB fallback budget only matters when the intermediate is collected and large (7200x4800 to 1200x800: photo 57.7 -> 56.7, textured 55.2 -> 50.8, hard edges 36.8 -> 35.0 dB with a 2.5x intermediate instead of 4x at 32 MiB; still at or above sharp and the exact path).
+The 48 MiB fallback budget only matters when the intermediate is collected and large (7200x4800 to 1200x800 with streaming off: photo 57.7 -> 57.5, textured 55.2 -> 54.2, hard edges 36.8 -> 36.6 dB with a 3.5x intermediate instead of 4x; 2.5x at a 32 MiB budget cost 1.0, 4.4 and 1.8 dB, which is why the budget is not smaller).
 
 Tests: interlaced-versus-row shrink comparison tolerates one more level (the row path now sums whole rows exactly in integers, the Adam7 one in f32 in pass order; the mean difference stays below 0.02).
 
