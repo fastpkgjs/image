@@ -44,7 +44,7 @@ The decode-time PNG shrink is now an area average with exact fractional edge wei
 | flat graphics, thin lines, text | 18x | 42.8 | 41.9 | 34.1 | 36.3 |
 | flat graphics, thin lines, text | 36x | 45.8 | 45.1 | 32.6 | 40.2 |
 
-The shrink is within about a dB of resampling the whole image and now beats sharp everywhere (before, a 36x downscale lost 14 to 20 dB). When the memory budget forces 2.5x or 2x (a 40 MP 16-bit file to 1200 px), it is still above sharp for ratios of 6x and up (graphics 35 to 39 dB at 2.5x against sharp's 32; headroom 3 is skipped, it resonates with the box and is erratically worse than 2.5) and ties with it at 2x. An axis that would shrink by less than 1.25x is not shrunk. Cost: the wider intermediate and the weighted average take a single-threaded 256 MP non-interlaced PNG to 1200 px from 1.2 s to 1.8 s and 104 MB to 173 MB; a 40 MP 16-bit file is faster (0.8 s to 0.5 s).
+The shrink is within about a dB of resampling the whole image and now beats sharp everywhere (before, a 36x downscale lost 13 to 20 dB). When the memory budget forces 2.5x or 2x (a 40 MP 16-bit file to 1200 px), it is still above sharp for ratios of 6x and up (graphics 35 to 39 dB at 2.5x against sharp's 32; headroom 3 is skipped, it resonates with the box and is erratically worse than 2.5) and ties with it at 2x. An axis that would shrink by less than 1.25x is not shrunk. Cost: the wider intermediate and the weighted average take a single-threaded 256 MP non-interlaced PNG to 1200 px from 1.2 s to 1.8 s and 104 MB to 173 MB; a 40 MP 16-bit file is faster (0.8 s to 0.5 s).
 
 ## 0.5.0
 
