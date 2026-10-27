@@ -8,8 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
-use fast_image_resize::images::{Image as FirImage, TypedImage};
-use fast_image_resize::pixels::U16x4;
+use fast_image_resize::images::{Image as FirImage, ImageRef};
 use fast_image_resize::{FilterType as FirFilter, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use fastpkg_core::options::{
     Blend, ChannelSelector, ExtendWith, Fit, GradientKind, GradientSpec, GradientSpread, Kernel,
@@ -615,22 +614,29 @@ fn resize_raw_wide(
     kernel: Kernel,
     centering: Option<(f64, f64)>,
 ) -> Result<Image> {
-    let wide = image.to_rgba16();
-    let pixels = wide
-        .chunks_exact(4)
-        .map(|px| U16x4::new([px[0], px[1], px[2], px[3]]))
-        .collect::<Vec<_>>();
-    let src = TypedImage::from_pixels(image.width, image.height, pixels)
+    // The wide samples are resized in place of the source (borrowed, not cloned or repacked),
+    // and the 8-bit copy is dropped first: `set_wide_rgba` rebuilds it at the new size.
+    let wide = image.wide.take().unwrap_or_default();
+    image.data = Vec::new();
+    let mut dst = FirImage::new(width, height, PixelType::U16x4);
+    {
+        let src = ImageRef::new(
+            image.width,
+            image.height,
+            bytemuck::cast_slice(&wide),
+            PixelType::U16x4,
+        )
         .map_err(|e| FastpkgError::Operation(e.to_string()))?;
-    let mut dst = TypedImage::<U16x4>::new(width, height);
-    let mut options = resize_options(kernel, image.has_alpha);
-    if let Some(centering) = centering {
-        options = options.fit_into_destination(Some(centering));
+        let mut options = resize_options(kernel, image.has_alpha);
+        if let Some(centering) = centering {
+            options = options.fit_into_destination(Some(centering));
+        }
+        Resizer::new()
+            .resize(&src, &mut dst, Some(&options))
+            .map_err(|e| FastpkgError::Operation(e.to_string()))?;
     }
-    Resizer::new()
-        .resize_typed(&src, &mut dst, Some(&options))
-        .map_err(|e| FastpkgError::Operation(e.to_string()))?;
-    let out = dst.pixels().iter().flat_map(|px| px.0).collect::<Vec<_>>();
+    drop(wide);
+    let out = bytemuck::pod_collect_to_vec::<u8, u16>(dst.buffer());
     image.set_wide_rgba(width, height, out)?;
     Ok(image)
 }
@@ -749,7 +755,7 @@ fn extract(mut image: Image, left: u32, top: u32, width: u32, height: u32) -> Re
         ));
     }
     if image.has_wide() {
-        let wide = image.to_rgba16();
+        let wide = image.take_rgba16();
         let mut out = Vec::with_capacity(width as usize * height as usize * 4);
         for y in 0..height {
             let start = ((top + y) as usize * image.width as usize + left as usize) * 4;
@@ -827,7 +833,7 @@ fn extend(
         (color.r, color.g, color.b) = (lum, lum, lum);
     }
     if image.has_wide() {
-        let wide = image.to_rgba16();
+        let wide = image.take_rgba16();
         let fill = [
             color.r as u16 * 257,
             color.g as u16 * 257,
@@ -1178,7 +1184,7 @@ fn flip(mut image: Image, flip: bool) -> Result<Image> {
         return Ok(image);
     }
     if image.has_wide() {
-        let wide = image.to_rgba16();
+        let wide = image.take_rgba16();
         let stride = image.width as usize * 4;
         let mut out = vec![0u16; wide.len()];
         for y in 0..image.height as usize {
@@ -1197,7 +1203,7 @@ fn flop(mut image: Image, flop: bool) -> Result<Image> {
         return Ok(image);
     }
     if image.has_wide() {
-        let wide = image.to_rgba16();
+        let wide = image.take_rgba16();
         let stride = image.width as usize * 4;
         let mut out = vec![0u16; wide.len()];
         for (y, row) in out.chunks_exact_mut(stride).enumerate() {
@@ -1285,7 +1291,7 @@ fn rotation_source(cos: f64, sin: f64, left: f64, top: f64, x: u32, y: u32) -> (
 }
 
 fn rotate_wide(mut image: Image, angle: f64, background: &str) -> Result<Image> {
-    let wide = image.to_rgba16();
+    let wide = image.take_rgba16();
     let width = image.width as usize;
     let height = image.height as usize;
     if (angle - 90.0).abs() < f64::EPSILON {
@@ -1626,7 +1632,7 @@ fn affine(
     let (origin_x, origin_y) = (min_x.round(), min_y.round());
     let bg = Color::parse(background).unwrap_or(Color::BLACK);
     if image.has_wide() {
-        let wide = image.to_rgba16();
+        let wide = image.take_rgba16();
         let fallback = [
             bg.r as u16 * 257,
             bg.g as u16 * 257,

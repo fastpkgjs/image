@@ -1864,7 +1864,7 @@ fn encode_png(image: &Image, options: &OutputOptions, out: &mut Vec<u8>) -> Resu
     } else if output_is_16(options) && !eight_bit_source(image, options) {
         // `bitdepth: 16` only matters for images that carry 16-bit samples (sharp keeps 8-bit
         // sources at 8 bits); toColourspace('rgb16') etc. still force it.
-        let wide = image.to_rgba16();
+        let wide = image.rgba16();
         let mut samples = Vec::with_capacity(wide.len() * 2);
         let color_type = if image.gray {
             for px in wide.chunks_exact(4) {
