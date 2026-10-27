@@ -21,8 +21,17 @@ fn main() {
     );
 
     let start = Instant::now();
-    let image =
-        decode_with_hint(&bytes, header.format, &spec.input, Some((1200, 900)), true).unwrap();
+    let image = decode_with_hint(
+        &bytes,
+        header.format,
+        &spec.input,
+        Some(fastpkg_codecs::ShrinkHint {
+            target: (1200, 900),
+            shrink: 4.0 / 3.0,
+        }),
+        true,
+    )
+    .unwrap();
     println!(
         "decode: {:?} {}x{}",
         start.elapsed(),
