@@ -1080,7 +1080,12 @@ fn read_png_rows<T: PngSample>(
 /// analogue of JPEG DCT scaling). `fastShrinkOnLoad` does not apply: libvips never shrinks PNG
 /// on load, so the resampler always keeps `PNG_SHRINK_HEADROOM` times the target. Interlaced
 /// files need the whole frame to de-interlace and use the buffered decoder.
-fn decode_png_stream(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> Result<Image> {
+fn decode_png_stream(
+    bytes: &[u8],
+    fail_on: &str,
+    hint: Option<(u32, u32)>,
+    stream_ended: &mut bool,
+) -> Result<Image> {
     let lenient = fail_on == "none";
     if !png_chunk_headers_valid(bytes) {
         return Err(FastpkgError::Decode("PNG: invalid chunk header".into()));
@@ -1094,7 +1099,7 @@ fn decode_png_stream(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> R
     }
     let (color, depth) = reader.output_color_type();
     if reader.info().interlaced || color == png::ColorType::Indexed {
-        return decode_png_buffered(bytes, fail_on);
+        return decode_png_buffered(bytes, fail_on, stream_ended);
     }
     let (width, height) = reader.info().size();
     let factor = hint
@@ -1118,6 +1123,7 @@ fn decode_png_stream(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> R
         );
         image
     };
+    *stream_ended = reader.zlib_stream_ended();
     image.has_alpha = has_alpha;
     image.format = Format::Png;
     if factor > 1 {
@@ -1218,7 +1224,9 @@ fn png_raster_size(info: &png::Info) -> u64 {
 }
 
 /// Whether the zlib stream spread over the IDAT run ends properly (final block, checksum): the
-/// decoder stops after the last row and never notices a stream that was cut short. A stream
+/// decoder stops after the last row and never notices a stream that was cut short. This is a
+/// second full inflate, so `decode_png_once` only runs it when the decoder did not see the
+/// stream end by itself (`png::Reader::zlib_stream_ended`). A stream
 /// that breaks once the raster is complete is let through: libpng has stopped inflating by then
 /// and treats the error as benign (a bad checksum right at the end is not).
 fn png_zlib_complete(bytes: &[u8], raster: u64) -> bool {
@@ -1283,8 +1291,9 @@ fn decode_png(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> Result<I
     }
 }
 
-/// Decodes the PNG while a second thread checks that its zlib stream is whole (the decoder
-/// stops after the last row), so the check does not add to the wall time of large files.
+/// Decodes the PNG and makes sure its zlib stream is whole (the decoder stops after the last
+/// row). The decoder itself usually sees the stream end, checksum included, in what follows the
+/// last row; only when it did not (or ignores checksums) is the stream inflated a second time.
 fn decode_png_once(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> Result<Image> {
     // Interlaced files are read whole by libvips, so there a short stream is fatal at any level.
     let raster = png_decoder(bytes, fail_on)
@@ -1292,28 +1301,19 @@ fn decode_png_once(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> Res
         .ok()
         .filter(|reader| fail_on != "none" || reader.info().interlaced)
         .map(|reader| png_raster_size(reader.info()));
-    let Some(raster) = raster else {
-        return decode_png_stream(bytes, fail_on, hint);
-    };
-    if bytes.len() < 1 << 18 {
-        return match png_zlib_complete(bytes, raster) {
-            true => decode_png_stream(bytes, fail_on, hint),
-            false => Err(FastpkgError::Decode("PNG: truncated zlib stream".into())),
-        };
-    }
-    std::thread::scope(|scope| {
-        let check = scope.spawn(|| png_zlib_complete(bytes, raster));
-        let decoded = decode_png_stream(bytes, fail_on, hint);
-        match check.join() {
-            Ok(false) => Err(FastpkgError::Decode("PNG: truncated zlib stream".into())),
-            _ => decoded,
+    let mut stream_ended = false;
+    let decoded = decode_png_stream(bytes, fail_on, hint, &mut stream_ended);
+    match raster {
+        Some(raster) if !stream_ended && !png_zlib_complete(bytes, raster) => {
+            Err(FastpkgError::Decode("PNG: truncated zlib stream".into()))
         }
-    })
+        _ => decoded,
+    }
 }
 
 /// With `failOn: 'none'` a PNG whose data stream breaks yields the rows decoded so far; the
 /// rest stays zero, as in libvips. Interlaced files are all-or-nothing.
-fn decode_png_buffered(bytes: &[u8], fail_on: &str) -> Result<Image> {
+fn decode_png_buffered(bytes: &[u8], fail_on: &str, stream_ended: &mut bool) -> Result<Image> {
     let lenient = fail_on == "none";
     if !png_chunk_headers_valid(bytes) {
         return Err(FastpkgError::Decode("PNG: invalid chunk header".into()));
@@ -1371,6 +1371,7 @@ fn decode_png_buffered(bytes: &[u8], fail_on: &str) -> Result<Image> {
         }
         Err(error) => return Err(FastpkgError::Decode(error.to_string())),
     };
+    *stream_ended = reader.zlib_stream_ended();
     let raw = &buffer[..info.buffer_size()];
     let width = info.width;
     let height = info.height;

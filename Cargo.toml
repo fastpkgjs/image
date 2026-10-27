@@ -62,8 +62,13 @@ tokio = { version = "1", features = ["rt", "sync"] }
 # the padding check after each tile (libaom always does it) no longer needs strict compliance,
 # so a damaged AV1 payload is an error as with libheif. See vendor/rav1d/src/decode.rs
 # ("fastpkg patch").
+#
+# png 0.18.1 with one addition: after the last row, `Reader::zlib_stream_ended` reports whether the
+# zlib stream was seen to finish with a verified checksum, so a PNG decode need not inflate the
+# stream a second time to learn that. See vendor/png/src/decoder/zlib.rs ("fastpkg patch").
 [patch.crates-io]
 rav1d = { path = "vendor/rav1d" }
+png = { path = "vendor/png" }
 
 [profile.release]
 lto = "fat"
