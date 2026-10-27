@@ -20,7 +20,11 @@ use rayon::prelude::*;
 
 mod gauss;
 mod sharpen;
+mod streaming;
 mod vips;
+
+pub use streaming::resize_sink;
+use streaming::{box_shrink, resize_frame, stream_min_bytes, Geometry};
 
 pub fn apply(mut image: Image, operations: &[Operation]) -> Result<Image> {
     for op in operations {
@@ -473,6 +477,14 @@ fn resize(
     without_reduction: bool,
     defer_canvas: bool,
 ) -> Result<Image> {
+    if image.presized {
+        // A decoder fed by `resize_sink` resampled the rows as it read them.
+        image.presized = false;
+        if defer_canvas {
+            return Ok(image);
+        }
+        return finish_canvas(image, fit, width, height, position, background);
+    }
     let shrunk = image.pre_shrink.take();
     let (source_width, source_height) = shrunk.unwrap_or((image.width, image.height));
     if width.is_none() && height.is_none() {
@@ -691,69 +703,6 @@ fn resize_plan(
     (!untouched).then_some(plan)
 }
 
-/// Mean of every `kx` x `ky` block of `data` (`width` x `height` pixels of four samples), the
-/// way `vips_shrink` does it: the output is rounded up and a partial last block is completed by
-/// repeating the edge. Channels of an image with alpha are weighted by it (the average of the
-/// premultiplied pixels, un-premultiplied again).
-fn box_shrink<T>(
-    data: &[T],
-    (width, height): (usize, usize),
-    (kx, ky): (usize, usize),
-    weighted: bool,
-) -> (Vec<T>, usize, usize)
-where
-    T: Copy + Send + Sync + Into<u64> + TryFrom<u64>,
-{
-    let (out_w, out_h) = (width.div_ceil(kx), height.div_ceil(ky));
-    let area = (kx * ky) as u64;
-    let mut out = vec![data[0]; out_w * out_h * 4];
-    let narrow = |v: u64| T::try_from(v).unwrap_or_else(|_| data[0]);
-    out.par_chunks_mut(out_w * 4)
-        .enumerate()
-        .for_each(|(oy, row)| {
-            let mut acc = vec![0u64; out_w * 4];
-            let mut weight = vec![0u64; if weighted { out_w } else { 0 }];
-            for dy in 0..ky {
-                let line = &data[(oy * ky + dy).min(height - 1) * width * 4..][..width * 4];
-                for ox in 0..out_w {
-                    for dx in 0..kx {
-                        let px = &line[(ox * kx + dx).min(width - 1) * 4..][..4];
-                        let a: u64 = px[3].into();
-                        if weighted {
-                            weight[ox] += a;
-                            for c in 0..3 {
-                                let v: u64 = px[c].into();
-                                acc[ox * 4 + c] += v * a;
-                            }
-                        } else {
-                            for c in 0..3 {
-                                let v: u64 = px[c].into();
-                                acc[ox * 4 + c] += v;
-                            }
-                        }
-                        acc[ox * 4 + 3] += a;
-                    }
-                }
-            }
-            for ox in 0..out_w {
-                let px = &mut row[ox * 4..][..4];
-                for c in 0..3 {
-                    let v = if weighted {
-                        // A block that is entirely transparent has no colour to average.
-                        (acc[ox * 4 + c] + weight[ox] / 2)
-                            .checked_div(weight[ox])
-                            .unwrap_or(0)
-                    } else {
-                        (acc[ox * 4 + c] + area / 2) / area
-                    };
-                    px[c] = narrow(v);
-                }
-                px[3] = narrow((acc[ox * 4 + 3] + area / 2) / area);
-            }
-        });
-    (out, out_w, out_h)
-}
-
 /// `data` (`width` x `height` pixels of four samples) on a larger canvas, with `pad` extra
 /// columns and rows (left, top, right, bottom) that repeat the edge ones.
 fn pad_replicate<T: Copy + Send + Sync>(
@@ -782,15 +731,12 @@ fn pad_replicate<T: Copy + Send + Sync>(
 }
 
 /// Applies the box shrink and padding of `plan` to `data`; returns the pixels and their size.
-fn prepare_source<T>(
+fn prepare_source<T: streaming::Sample>(
     mut data: Vec<T>,
     mut size: (u32, u32),
     plan: &ResizePlan,
     weighted: bool,
-) -> (Vec<T>, (u32, u32))
-where
-    T: Copy + Send + Sync + Into<u64> + TryFrom<u64>,
-{
+) -> (Vec<T>, (u32, u32)) {
     if plan.box_factor != (1, 1) {
         let (shrunk, w, h) = box_shrink(
             &data,
@@ -824,6 +770,21 @@ fn resize_raw_opts(
     }
     let mut data = std::mem::take(&mut image.data);
     let mut options = resize_options(kernel, image.has_alpha);
+    let format = image.format;
+    let has_alpha = image.has_alpha;
+    let geometry = Geometry::new((image.width, image.height), (width, height), plan.as_ref(), has_alpha);
+    if data.len() >= stream_min_bytes() && kernel != Kernel::Nearest && geometry.streamable::<u8>()
+    {
+        // Rows go through the box shrink, padding and kernel a band at a time: the shrunk and
+        // padded copies of the frame never exist.
+        drop(image);
+        let out = resize_frame(&data, geometry, options)?;
+        drop(data);
+        let mut out = Image::from_rgba(width, height, out)?;
+        out.format = format;
+        out.has_alpha = has_alpha;
+        return Ok(out);
+    }
     let mut size = (image.width, image.height);
     let mut crop = [0.0, 0.0, size.0 as f64, size.1 as f64];
     if let Some(plan) = &plan {
@@ -832,8 +793,6 @@ fn resize_raw_opts(
         let [left, top, w, h] = plan.crop;
         options = options.crop(left, top, w, h);
     }
-    let format = image.format;
-    let has_alpha = image.has_alpha;
     drop(image);
     let mut dst = FirImage::new(width, height, PixelType::U8x4);
     {
@@ -860,6 +819,19 @@ fn resize_raw_wide(
     let mut wide = image.wide.take().unwrap_or_default();
     image.data = Vec::new();
     let mut options = resize_options(kernel, image.has_alpha);
+    let geometry = Geometry::new(
+        (image.width, image.height),
+        (width, height),
+        plan.as_ref(),
+        image.has_alpha,
+    );
+    if wide.len() * 2 >= stream_min_bytes() && kernel != Kernel::Nearest && geometry.streamable::<u16>()
+    {
+        let out = resize_frame(&wide, geometry, options)?;
+        drop(wide);
+        image.set_wide_rgba(width, height, out)?;
+        return Ok(image);
+    }
     let mut size = (image.width, image.height);
     let mut crop = [0.0, 0.0, size.0 as f64, size.1 as f64];
     if let Some(plan) = &plan {
@@ -868,7 +840,7 @@ fn resize_raw_wide(
         let [left, top, w, h] = plan.crop;
         options = options.crop(left, top, w, h);
     }
-    let mut dst = FirImage::new(width, height, PixelType::U16x4);
+    let mut dst = vec![0u16; width as usize * height as usize * 4];
     {
         let src = ImageRef::new(
             size.0,
@@ -877,11 +849,17 @@ fn resize_raw_wide(
             PixelType::U16x4,
         )
         .map_err(|e| FastpkgError::Operation(e.to_string()))?;
-        resize_banded(&src, &mut dst, &options, crop, true, BAND_TEMP_BYTES)?;
+        let mut band = FirImage::from_slice_u8(
+            width,
+            height,
+            bytemuck::cast_slice_mut(&mut dst),
+            PixelType::U16x4,
+        )
+        .map_err(|e| FastpkgError::Operation(e.to_string()))?;
+        resize_banded(&src, &mut band, &options, crop, true, BAND_TEMP_BYTES)?;
     }
     drop(wide);
-    let out = bytemuck::pod_collect_to_vec::<u8, u16>(dst.buffer());
-    image.set_wide_rgba(width, height, out)?;
+    image.set_wide_rgba(width, height, dst)?;
     Ok(image)
 }
 

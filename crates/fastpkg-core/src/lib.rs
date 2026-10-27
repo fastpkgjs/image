@@ -7,11 +7,13 @@ pub mod exif;
 pub mod image;
 pub mod options;
 pub mod pipeline;
+pub mod sink;
 
 pub use color::Color;
 pub use image::Image;
 pub use options::*;
 pub use pipeline::*;
+pub use sink::{RowSink, RowSinkSpec, SinkFactory};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

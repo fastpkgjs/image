@@ -4,7 +4,10 @@ use std::io::Cursor;
 
 use base64::Engine;
 use fastpkg_core::options::{InputOptions, OutputOptions, RawInput};
-use fastpkg_core::{validate_dimensions, FastpkgError, Format, HeaderInfo, Image, Limits, Result};
+use fastpkg_core::{
+    validate_dimensions, FastpkgError, Format, HeaderInfo, Image, Limits, Result, RowSink,
+    RowSinkSpec, SinkFactory,
+};
 #[cfg(feature = "jxl-encode")]
 use gamut_core::{Dimensions, EncodeImage, Gray8, ImageRef, Rgb8, Rgba8};
 #[cfg(feature = "jxl-encode")]
@@ -290,7 +293,22 @@ pub fn decode_with_hint(
     hint: Option<ShrinkHint>,
     fast_shrink: bool,
 ) -> Result<Image> {
-    let mut image = decode_with_hint_inner(bytes, format, input, hint, fast_shrink)?;
+    decode_with_sink(bytes, format, input, hint, fast_shrink, None)
+}
+
+/// [`decode_with_hint`] that may hand the rows of a big PNG to a sink built by `sinks` instead
+/// of returning them: the sink resamples them as they arrive and the returned image is already
+/// resized (`Image::presized`), so the full-size frame is never resident. The factory may
+/// decline, and is not asked for anything but a PNG without an embedded profile to convert.
+pub fn decode_with_sink(
+    bytes: &[u8],
+    format: Format,
+    input: &InputOptions,
+    hint: Option<ShrinkHint>,
+    fast_shrink: bool,
+    sinks: Option<SinkFactory>,
+) -> Result<Image> {
+    let mut image = decode_with_hint_inner(bytes, format, input, hint, fast_shrink, sinks)?;
     // sharp expands every grey input to RGB(A); only extractChannel and
     // toColourspace('b-w') produce single-channel output.
     image.gray = false;
@@ -303,6 +321,7 @@ fn decode_with_hint_inner(
     input: &InputOptions,
     hint: Option<ShrinkHint>,
     fast_shrink: bool,
+    sinks: Option<SinkFactory>,
 ) -> Result<Image> {
     if let Some(raw) = &input.raw {
         return decode_raw(bytes, raw);
@@ -330,7 +349,12 @@ fn decode_with_hint_inner(
         Format::Avif => decode_avif(bytes)?,
         Format::Jxl => decode_jxl(bytes)?,
         Format::Svg => svg::decode(bytes, input.density)?,
-        Format::Png => decode_png(bytes, &input.fail_on, hint.map(|hint| hint.target))?,
+        Format::Png => {
+            // An embedded profile is converted on the decoded pixels, before any resize.
+            let sinks = sinks
+                .filter(|_| input.ignore_icc || fastpkg_meta::icc_profile(bytes).is_none());
+            decode_png(bytes, &input.fail_on, hint.map(|hint| hint.target), sinks)?
+        }
         Format::Jpeg => decode_jpeg_scaled(bytes, hint, fast_shrink, input)?,
         Format::Webp => {
             // libvips opens WebP through the demuxer, which rejects a damaged container
@@ -922,16 +946,35 @@ fn png_shrink_min_bytes() -> u64 {
     })
 }
 
-/// What the shrink may keep resident while it runs (the shrunk image, which the resampler then
-/// copies, plus the accumulator for interlaced files).
-const PNG_SHRINK_BUDGET: u64 = 128 << 20;
+/// What the shrink may keep resident while it runs when its result is an image the resampler
+/// then reads (the shrunk image, 4 bytes a pixel, 12 for 16-bit ones that keep an 8-bit copy
+/// next to the wide one): the headroom ladder of `png_shrink::plan` stops at the first rung that
+/// fits. Rows handed to a sink are never collected, so streamed decodes always take the best rung.
+const PNG_SHRINK_BUDGET: u64 = 32 << 20;
+
+/// The same for interlaced files, whose accumulator (four `f32` a pixel) is the larger part.
+const PNG_SHRINK_BUDGET_INTERLACED: u64 = 128 << 20;
+
+/// Decoded images below this many bytes (RGBA8 is 4 per pixel, 16-bit RGBA 8) are not resampled
+/// from a stream of rows: their frame is small, and resampling it whole is quicker.
+/// `FASTPKG_PNG_STREAM_MIN_BYTES` overrides it (tests).
+fn png_stream_min_bytes() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("FASTPKG_PNG_STREAM_MIN_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16 << 20)
+    })
+}
 
 /// Bytes per pixel of the interlaced accumulator (four `f32`).
 const INTERLACED_ACC_BYTES: u64 = 16;
 
 /// A sample type of the expanded PNG rows: `u8`, or big-endian `u16` on the wire.
-trait PngSample: png_shrink::Sample {
+trait PngSample: png_shrink::Raw {
     fn load(src: &[u8], i: usize) -> Self;
+    fn push(sink: &mut dyn RowSink, row: &[Self]) -> Result<()>;
 }
 
 impl PngSample for u8 {
@@ -939,12 +982,20 @@ impl PngSample for u8 {
     fn load(src: &[u8], i: usize) -> Self {
         src[i]
     }
+
+    fn push(sink: &mut dyn RowSink, row: &[Self]) -> Result<()> {
+        sink.push_u8(row)
+    }
 }
 
 impl PngSample for u16 {
     #[inline(always)]
     fn load(src: &[u8], i: usize) -> Self {
         read_be_u16(src, i * 2)
+    }
+
+    fn push(sink: &mut dyn RowSink, row: &[Self]) -> Result<()> {
+        sink.push_u16(row)
     }
 }
 
@@ -987,13 +1038,87 @@ fn expand_png_row<T: PngSample>(color: png::ColorType, src: &[u8], dst: &mut [T]
     }
 }
 
+/// Where the rows of a non-interlaced decode go: into one RGBA buffer of the final size, or one
+/// at a time into a sink.
+struct RowOutput<'a, T: PngSample> {
+    color: png::ColorType,
+    width: usize,
+    out_width: usize,
+    out: Vec<T>,
+    shrinker: Option<png_shrink::RowShrink<T>>,
+    /// Expanded row of an unshrunk decode into a sink.
+    row: Vec<T>,
+    sink: Option<&'a mut dyn RowSink>,
+    error: Option<FastpkgError>,
+}
+
+impl<T: PngSample> RowOutput<'_, T> {
+    /// Takes source row `y` as the decoder produced it.
+    fn put(&mut self, y: usize, raw: &[u8]) -> Result<()> {
+        let Some(shrinker) = self.shrinker.as_mut() else {
+            let w4 = self.width * 4;
+            if let Some(sink) = self.sink.as_deref_mut() {
+                expand_png_row(self.color, raw, &mut self.row);
+                return T::push(sink, &self.row);
+            }
+            expand_png_row(self.color, raw, &mut self.out[y * w4..(y + 1) * w4]);
+            return Ok(());
+        };
+        let (out, ow, sink, error) = (
+            &mut self.out,
+            self.out_width,
+            &mut self.sink,
+            &mut self.error,
+        );
+        shrinker.add_row(y, raw, |cy, cells: &[T]| {
+            Self::cells(out, ow, sink, error, cy, cells)
+        });
+        self.error.take().map_or(Ok(()), Err)
+    }
+
+    fn cells(
+        out: &mut [T],
+        ow: usize,
+        sink: &mut Option<&mut dyn RowSink>,
+        error: &mut Option<FastpkgError>,
+        cy: usize,
+        cells: &[T],
+    ) {
+        match sink.as_deref_mut() {
+            Some(sink) => {
+                if error.is_none() {
+                    if let Err(e) = T::push(sink, cells) {
+                        *error = Some(e);
+                    }
+                }
+            }
+            None => out[cy * ow * 4..(cy + 1) * ow * 4].copy_from_slice(cells),
+        }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(shrinker) = self.shrinker.as_mut() {
+            let (out, ow, sink, error) = (
+                &mut self.out,
+                self.out_width,
+                &mut self.sink,
+                &mut self.error,
+            );
+            shrinker.finish(|cy, cells: &[T]| Self::cells(out, ow, sink, error, cy, cells));
+        }
+        self.error.take().map_or(Ok(()), Err)
+    }
+}
+
 /// Decodes the rows of a non-interlaced PNG straight into RGBA samples of the final (possibly
-/// shrunk to `shrink`) size. `lenient` turns a broken stream into blank rows instead of an error.
+/// shrunk to `shrink`) size, or, with a `sink`, hands them on one by one (the returned buffer is
+/// then empty). `lenient` turns a broken stream into blank rows instead of an error.
 fn read_png_rows<T: PngSample>(
     reader: &mut png::Reader<Cursor<&[u8]>>,
     color: png::ColorType,
     shrink: Option<(u32, u32)>,
     lenient: bool,
+    sink: Option<&mut dyn RowSink>,
 ) -> Result<(u32, u32, Vec<T>)> {
     let (width, height) = reader.info().size();
     let (w, h) = (width as usize, height as usize);
@@ -1002,49 +1127,52 @@ fn read_png_rows<T: PngSample>(
         .checked_mul(oh)
         .and_then(|n| n.checked_mul(4))
         .ok_or_else(|| FastpkgError::Decode("PNG output buffer is too large".into()))?;
-    // Zeroed pages are only touched when written, so unread rows of a broken lenient decode
-    // cost nothing extra.
-    let mut out = vec![T::default(); samples];
     let has_alpha = matches!(color, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
-    let mut shrinker = shrink.map(|_| png_shrink::RowShrink::new((w, h), (ow, oh), has_alpha));
-    let mut row = vec![T::default(); if shrinker.is_some() { w * 4 } else { 0 }];
+    let channels = match color {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        _ => 4,
+    };
+    let to_sink = sink.is_some();
+    let mut rows = RowOutput::<T> {
+        color,
+        width: w,
+        out_width: ow,
+        // Zeroed pages are only touched when written, so unread rows of a broken lenient decode
+        // cost nothing extra.
+        out: if to_sink {
+            Vec::new()
+        } else {
+            vec![T::default(); samples]
+        },
+        shrinker: shrink.map(|_| png_shrink::RowShrink::new((w, h), (ow, oh), channels, has_alpha)),
+        row: vec![T::default(); if to_sink && shrink.is_none() { w * 4 } else { 0 }],
+        sink,
+        error: None,
+    };
     let mut blank: Option<Vec<u8>> = None;
     for y in 0..h {
-        let dst = match shrinker {
-            Some(_) => &mut row[..],
-            None => &mut out[y * w * 4..(y + 1) * w * 4],
-        };
-        let decoded = if blank.is_some() {
-            false
-        } else {
+        if blank.is_none() {
             match reader.next_row() {
                 Ok(Some(data)) => {
-                    expand_png_row(color, data.data(), dst);
-                    true
+                    rows.put(y, data.data())?;
+                    continue;
                 }
                 Ok(None) if !lenient => {
                     return Err(FastpkgError::Decode("PNG ended before the last row".into()))
                 }
                 Err(error) if !lenient => return Err(FastpkgError::Decode(error.to_string())),
-                _ => false,
+                // Lenient: from here on the rows are blank.
+                _ => {}
             }
-        };
-        if !decoded {
-            // A raw zero row converts like libvips' zero fill (opaque black unless alpha).
-            let line = reader.output_line_size(width).unwrap_or(0);
-            let src = blank.get_or_insert_with(|| vec![0u8; line]);
-            expand_png_row(color, src, dst);
         }
-        if let Some(shrinker) = shrinker.as_mut() {
-            shrinker.add_row(y, &row, |cy, cells: &[T]| {
-                out[cy * ow * 4..(cy + 1) * ow * 4].copy_from_slice(cells)
-            });
-        }
+        // A raw zero row converts like libvips' zero fill (opaque black unless alpha).
+        let line = reader.output_line_size(width).unwrap_or(0);
+        let src = blank.get_or_insert_with(|| vec![0u8; line]);
+        rows.put(y, src)?;
     }
-    if let Some(shrinker) = shrinker.as_mut() {
-        shrinker
-            .finish(|cy, cells: &[T]| out[cy * ow * 4..(cy + 1) * ow * 4].copy_from_slice(cells));
-    }
+    rows.finish()?;
     if blank.is_none() && !lenient {
         // Reading past the last row drains the image data, where a bad checksum or a damaged
         // tail shows up (as `next_frame` did).
@@ -1052,7 +1180,7 @@ fn read_png_rows<T: PngSample>(
             return Err(FastpkgError::Decode(error.to_string()));
         }
     }
-    Ok((ow as u32, oh as u32, out))
+    Ok((ow as u32, oh as u32, rows.out))
 }
 
 /// Adam7 passes as (first column, first row, column step, row step).
@@ -1121,6 +1249,7 @@ fn decode_png_stream(
     bytes: &[u8],
     fail_on: &str,
     hint: Option<(u32, u32)>,
+    sinks: Option<SinkFactory>,
     stream_ended: &mut bool,
 ) -> Result<Image> {
     let lenient = fail_on == "none";
@@ -1138,21 +1267,54 @@ fn decode_png_stream(
     let interlaced = reader.info().interlaced;
     let (width, height) = reader.info().size();
     let wide = depth == png::BitDepth::Sixteen;
+    let has_alpha = matches!(color, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
     // Decoded size as RGBA, and what the shrunk image costs while it is built and handed on
     // (the interlaced accumulator, then 16-bit images keep an 8-bit copy next to the wide one).
     let decoded_bytes = width as u64 * height as u64 * if wide { 8 } else { 4 };
     let cell_bytes = if wide { 12 } else { 4 } + if interlaced { INTERLACED_ACC_BYTES } else { 0 };
-    let shrink = hint
-        .filter(|_| decoded_bytes >= png_shrink_min_bytes())
-        .and_then(|hint| png_shrink::plan((width, height), hint, cell_bytes, PNG_SHRINK_BUDGET));
+    let budget = if interlaced {
+        PNG_SHRINK_BUDGET_INTERLACED
+    } else {
+        PNG_SHRINK_BUDGET
+    };
+    let wants_shrink = hint.filter(|_| decoded_bytes >= png_shrink_min_bytes());
+    // A big non-interlaced image whose resize can be done from a stream of rows never exists
+    // as a frame: the rows are shrunk (best headroom, nothing is collected) and resampled as
+    // they are decoded.
+    if let Some(sinks) = sinks.filter(|_| {
+        !interlaced && color != png::ColorType::Indexed && decoded_bytes >= png_stream_min_bytes()
+    }) {
+        let fed = wants_shrink
+            .and_then(|hint| png_shrink::plan((width, height), hint, 0, budget))
+            .unwrap_or((width, height));
+        let spec = RowSinkSpec {
+            source: (width, height),
+            fed,
+            has_alpha,
+            wide,
+        };
+        if let Some(mut sink) = sinks(&spec) {
+            let shrink = (fed != (width, height)).then_some(fed);
+            if wide {
+                read_png_rows::<u16>(&mut reader, color, shrink, lenient, Some(&mut *sink))?;
+            } else {
+                read_png_rows::<u8>(&mut reader, color, shrink, lenient, Some(&mut *sink))?;
+            }
+            *stream_ended = reader.zlib_stream_ended();
+            let mut image = sink.finish()?;
+            image.format = Format::Png;
+            return Ok(image);
+        }
+    }
+    let shrink = wants_shrink
+        .and_then(|hint| png_shrink::plan((width, height), hint, cell_bytes, budget));
     if color == png::ColorType::Indexed || (interlaced && shrink.is_none()) {
         return decode_png_buffered(bytes, fail_on, stream_ended);
     }
-    let has_alpha = matches!(color, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
     let mut image = if wide {
         let (w, h, wide) = match shrink.filter(|_| interlaced) {
             Some(shrink) => read_png_interlaced::<u16>(&mut reader, color, shrink)?,
-            None => read_png_rows::<u16>(&mut reader, color, shrink, lenient)?,
+            None => read_png_rows::<u16>(&mut reader, color, shrink, lenient, None)?,
         };
         // The twin is only a second full-size copy when a resize is next.
         let mut image = if hint.is_some() {
@@ -1166,7 +1328,7 @@ fn decode_png_stream(
     } else {
         let (w, h, rgba) = match shrink.filter(|_| interlaced) {
             Some(shrink) => read_png_interlaced::<u8>(&mut reader, color, shrink)?,
-            None => read_png_rows::<u8>(&mut reader, color, shrink, lenient)?,
+            None => read_png_rows::<u8>(&mut reader, color, shrink, lenient, None)?,
         };
         let mut image = Image::from_rgba(w, h, rgba)?;
         image.gray = matches!(
@@ -1325,15 +1487,20 @@ fn png_zlib_complete(bytes: &[u8], raster: u64) -> bool {
 /// libpng stops once the last row is read, so a missing or damaged tail (IEND, trailing chunks)
 /// is not an error: a failed decode is retried with the data cut after the IDAT run and a
 /// synthetic IEND appended.
-fn decode_png(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> Result<Image> {
-    match decode_png_once(bytes, fail_on, hint) {
+fn decode_png(
+    bytes: &[u8],
+    fail_on: &str,
+    hint: Option<(u32, u32)>,
+    sinks: Option<SinkFactory>,
+) -> Result<Image> {
+    match decode_png_once(bytes, fail_on, hint, sinks) {
         Err(error) => {
             if let Some(end) = png_idat_end(bytes) {
                 let mut cut = bytes[..end].to_vec();
                 cut.extend_from_slice(&[
                     0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
                 ]);
-                if let Ok(image) = decode_png_once(&cut, fail_on, hint) {
+                if let Ok(image) = decode_png_once(&cut, fail_on, hint, sinks) {
                     return Ok(image);
                 }
             }
@@ -1346,7 +1513,12 @@ fn decode_png(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> Result<I
 /// Decodes the PNG and makes sure its zlib stream is whole (the decoder stops after the last
 /// row). The decoder itself usually sees the stream end, checksum included, in what follows the
 /// last row; only when it did not (or ignores checksums) is the stream inflated a second time.
-fn decode_png_once(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> Result<Image> {
+fn decode_png_once(
+    bytes: &[u8],
+    fail_on: &str,
+    hint: Option<(u32, u32)>,
+    sinks: Option<SinkFactory>,
+) -> Result<Image> {
     // Interlaced files are read whole by libvips, so there a short stream is fatal at any level.
     let raster = png_decoder(bytes, fail_on)
         .read_info()
@@ -1354,7 +1526,7 @@ fn decode_png_once(bytes: &[u8], fail_on: &str, hint: Option<(u32, u32)>) -> Res
         .filter(|reader| fail_on != "none" || reader.info().interlaced)
         .map(|reader| png_raster_size(reader.info()));
     let mut stream_ended = false;
-    let decoded = decode_png_stream(bytes, fail_on, hint, &mut stream_ended);
+    let decoded = decode_png_stream(bytes, fail_on, hint, sinks, &mut stream_ended);
     match raster {
         Some(raster) if !stream_ended && !png_zlib_complete(bytes, raster) => {
             Err(FastpkgError::Decode("PNG: truncated zlib stream".into()))

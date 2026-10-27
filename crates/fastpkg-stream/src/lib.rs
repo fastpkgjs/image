@@ -3,10 +3,11 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use fastpkg_codecs::{decode, decode_with_hint, encode, output_is_16, probe, ShrinkHint};
+use fastpkg_codecs::{decode, decode_with_sink, encode, output_is_16, probe, ShrinkHint};
 use fastpkg_core::options::Operation;
 use fastpkg_core::{
-    FastpkgError, Format, HeaderInfo, Image, OutputInfo, PipelineSpec, Result, Stats,
+    FastpkgError, Format, HeaderInfo, Image, OutputInfo, PipelineSpec, Result, RowSinkSpec, SinkFactory,
+    Stats,
 };
 use fastpkg_meta::{enrich, MetadataExtras};
 use fastpkg_ops::{
@@ -197,7 +198,26 @@ pub fn execute_bytes(bytes: &[u8], spec: &PipelineSpec) -> Result<RunResult> {
             && spec.output.with_icc_raw.is_none();
     let mut input = spec.input.clone();
     input.ignore_icc |= keeps_input_icc;
-    let mut image = decode_with_hint(bytes, header.format, &input, hint, fast_shrink)?;
+    // A big PNG whose first resampling step is this resize is resampled from its rows while it
+    // is decoded, when nothing before the resize touches the pixels: no frame is ever held.
+    // Samples are narrowed to 8 bits on the way when nothing afterwards needs the wide ones.
+    let streamed_op = spec.operations.get(leading).filter(|_| {
+        header.format == Format::Png
+            && hint.is_some()
+            && !swaps_axes
+            && matches!(header.orientation, None | Some(1))
+            && spec.operations[..leading]
+                .iter()
+                .all(|op| matches!(op, Operation::AutoOrient))
+    });
+    let narrow = spec.operations.len() == leading + 1
+        && spec.pipeline_colourspace.is_none()
+        && !output_is_16(&spec.output);
+    let sink_factory = |sink: &RowSinkSpec| {
+        streamed_op.and_then(|op| fastpkg_ops::resize_sink(op, sink, narrow))
+    };
+    let sinks: Option<SinkFactory> = streamed_op.is_some().then_some(&sink_factory);
+    let mut image = decode_with_sink(bytes, header.format, &input, hint, fast_shrink, sinks)?;
     check_deadline(deadline)?;
     if image.format == Format::Jpeg && !moved_before_resize {
         if !fastpkg_codecs::jpeg_rule_eighths() {
