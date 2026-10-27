@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Bursts of parallel jobs no longer multiply threads and memory. 0.5.0 gave every thread of the async runtime's blocking pool (up to 512) its own rayon pool of `concurrency()` threads, so 200 simultaneous resizes peaked at 1300-2300 threads and 650-700 MB where sharp uses 24 threads and 210 MB. Now at most `max(4, cores)` jobs run at once (sharp's libuv pool has four threads); the rest wait in the async entry points without holding a thread or decoded pixels. A job runs on a rayon pool taken from a small shared list and handed back when it ends, so the pools that exist are the ones running jobs plus a few idle ones, which are released after ten seconds unused. Rayon threads are budgeted at twice the cores (or `concurrency()` if larger): up to two running jobs get the full `concurrency()` threads each, and with more jobs running each gets the budget divided over the job slots (2 threads on 12 cores). A single job still gets all `concurrency()` threads and `concurrency(n)` still means threads per image, taking effect for the next job. `metadata`, `stats`, `toFile` and the other async entry points count as jobs; failing jobs give their slot back. Output does not depend on the pool size.
+  - 200 parallel 2000x1500 JPEG resizes to 800 px (12 cores): peak 74 threads and 270-280 MB instead of 2200 threads and 670 MB (sharp: 24 threads, 210 MB); 180 jobs/s against 170 (sharp: 73). 200 parallel resizes of a small JPEG to 200 px: 76-85 threads and 93 MB instead of 1300 threads and 140 MB; 4000+ jobs/s against 1200-1600 (sharp: 400).
+  - Eight concurrent 200 px resizes cost about 3-5% more than in 0.5.0 (2.2-2.5 ms against 2.1-2.4 ms in alternating runs); one job at a time and two concurrent jobs are unchanged.
+
 ## 0.5.0
 
 ### Fixed

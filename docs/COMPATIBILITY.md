@@ -71,7 +71,7 @@ Operations run in sharp's fixed pipeline order, not call order (`packages/image/
 
 ## Utilities
 
-`cache`, `concurrency`, `counters`, `simd`, `format`, `versions`, `interpolators`, `queue`, `block`, `unblock` are present. `cache` is a compatibility shim; `simd(false)` toggles the reported flag but does not disable compiled kernels; `concurrency(n)` is the number of threads each image job uses (changing it applies to the next job); `queue` emits depth changes; `block`/`unblock` are no-ops.
+`cache`, `concurrency`, `counters`, `simd`, `format`, `versions`, `interpolators`, `queue`, `block`, `unblock` are present. `cache` is a compatibility shim; `simd(false)` toggles the reported flag but does not disable compiled kernels; `concurrency(n)` is the number of threads an image job uses when it runs alone or next to one other job (changing it applies to the next job; with more jobs in flight the threads are shared out so the process stays near twice the cores, and at most `max(4, cores)` jobs run at once, the others wait); `queue` emits depth changes; `block`/`unblock` are no-ops.
 
 ## Extensions
 
