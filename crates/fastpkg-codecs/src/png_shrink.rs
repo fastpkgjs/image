@@ -10,6 +10,9 @@
 //! With alpha the colour channels are averaged premultiplied (as the resizer does) and
 //! un-premultiplied again on output.
 
+// The per-pixel loops index several arrays of a pixel by a const channel count.
+#![allow(clippy::needless_range_loop)]
+
 /// How the pixels of one axis fall into output cells. Cell `k` covers the source interval
 /// `[k * span, (k + 1) * span)` with `span = src / out`; every cell's weights sum to one.
 ///
@@ -268,48 +271,359 @@ impl Core {
     }
 }
 
-/// Top-to-bottom shrink: only the cell rows the current source row touches are resident.
-pub struct RowShrink {
-    core: Core,
-    /// Accumulator rows of cell rows `cell` and `cell + 1`.
-    rows: [Vec<f32>; 2],
-    cell: usize,
+/// A sample type of the raw rows a PNG decoder hands over (big-endian on the wire for 16 bits),
+/// with the accumulator that sums whole rows of them without overflow. The row loops live here,
+/// per sample type, so that they are plain element-wise loops the compiler vectorises.
+pub trait Raw: Sample {
+    type Acc: Copy + Default;
+    /// `acc[i] += sample i` of the raw row.
+    fn add_plain(acc: &mut [Self::Acc], raw: &[u8]);
+    /// The same for pixels of `C` samples whose last one is alpha, with the others premultiplied.
+    fn add_alpha<const C: usize>(acc: &mut [Self::Acc], raw: &[u8]);
+    /// The raw row as `f32` (premultiplied for alpha pixels of `C` samples when `C > 0`).
+    fn load_plain(dst: &mut [f32], raw: &[u8]);
+    fn load_alpha<const C: usize>(dst: &mut [f32], raw: &[u8]);
+    /// `dst[i] = acc[i] * scale`.
+    fn scale_into(dst: &mut [f32], acc: &[Self::Acc], scale: f32);
 }
 
-impl RowShrink {
-    pub fn new(src: (usize, usize), out: (usize, usize), has_alpha: bool) -> Self {
-        Self {
-            core: Core::new(src, out, has_alpha),
-            rows: [vec![0.0; out.0 * 4], vec![0.0; out.0 * 4]],
-            cell: 0,
+impl Raw for u8 {
+    type Acc = u32;
+
+    #[inline(always)]
+    fn add_plain(acc: &mut [u32], raw: &[u8]) {
+        for (a, &b) in acc.iter_mut().zip(raw) {
+            *a += b as u32;
         }
     }
 
-    /// Feeds source row `y` (rows must come in order). Cell rows that are complete are written
-    /// through `emit(cell_row, samples)`.
-    pub fn add_row<T: Sample>(&mut self, y: usize, row: &[T], mut emit: impl FnMut(usize, &[T])) {
-        let (cell, _, _) = self.core.ys.at(y);
+    #[inline(always)]
+    fn add_alpha<const C: usize>(acc: &mut [u32], raw: &[u8]) {
+        for (a, b) in acc.chunks_exact_mut(C).zip(raw.chunks_exact(C)) {
+            let alpha = b[C - 1] as u32;
+            for i in 0..C - 1 {
+                a[i] += b[i] as u32 * alpha;
+            }
+            a[C - 1] += alpha;
+        }
+    }
+
+    #[inline(always)]
+    fn load_plain(dst: &mut [f32], raw: &[u8]) {
+        for (d, &b) in dst.iter_mut().zip(raw) {
+            *d = b as f32;
+        }
+    }
+
+    #[inline(always)]
+    fn load_alpha<const C: usize>(dst: &mut [f32], raw: &[u8]) {
+        for (d, b) in dst.chunks_exact_mut(C).zip(raw.chunks_exact(C)) {
+            let alpha = b[C - 1] as f32;
+            for i in 0..C - 1 {
+                d[i] = b[i] as f32 * alpha;
+            }
+            d[C - 1] = alpha;
+        }
+    }
+
+    #[inline(always)]
+    fn scale_into(dst: &mut [f32], acc: &[u32], scale: f32) {
+        for (d, &a) in dst.iter_mut().zip(acc) {
+            *d = (a as i32) as f32 * scale;
+        }
+    }
+}
+
+impl Raw for u16 {
+    type Acc = u64;
+
+    #[inline(always)]
+    fn add_plain(acc: &mut [u64], raw: &[u8]) {
+        for (a, b) in acc.iter_mut().zip(raw.chunks_exact(2)) {
+            *a += u16::from_be_bytes([b[0], b[1]]) as u64;
+        }
+    }
+
+    #[inline(always)]
+    fn add_alpha<const C: usize>(acc: &mut [u64], raw: &[u8]) {
+        for (a, b) in acc.chunks_exact_mut(C).zip(raw.chunks_exact(2 * C)) {
+            let sample = |i: usize| u16::from_be_bytes([b[2 * i], b[2 * i + 1]]) as u64;
+            let alpha = sample(C - 1);
+            for i in 0..C - 1 {
+                a[i] += sample(i) * alpha;
+            }
+            a[C - 1] += alpha;
+        }
+    }
+
+    #[inline(always)]
+    fn load_plain(dst: &mut [f32], raw: &[u8]) {
+        for (d, b) in dst.iter_mut().zip(raw.chunks_exact(2)) {
+            *d = u16::from_be_bytes([b[0], b[1]]) as f32;
+        }
+    }
+
+    #[inline(always)]
+    fn load_alpha<const C: usize>(dst: &mut [f32], raw: &[u8]) {
+        for (d, b) in dst.chunks_exact_mut(C).zip(raw.chunks_exact(2 * C)) {
+            let sample = |i: usize| u16::from_be_bytes([b[2 * i], b[2 * i + 1]]) as f32;
+            let alpha = sample(C - 1);
+            for i in 0..C - 1 {
+                d[i] = sample(i) * alpha;
+            }
+            d[C - 1] = alpha;
+        }
+    }
+
+    #[inline(always)]
+    fn scale_into(dst: &mut [f32], acc: &[u64], scale: f32) {
+        for (d, &a) in dst.iter_mut().zip(acc) {
+            *d = (a as i64) as f32 * scale;
+        }
+    }
+}
+
+/// Top-to-bottom shrink of rows in the decoder's own layout (1-4 channels, no expansion to
+/// RGBA). A cell row is made of whole source rows, which are only summed (plain integer adds
+/// over the whole row, premultiplied by alpha where there is some), and of the two rows cut by
+/// its upper and lower edge, which are kept as they are and weighted when the cell row is
+/// complete. The vertical result is then reduced horizontally once, so the per-pixel work is one
+/// add per sample however large the factor is.
+pub struct RowShrink<T: Raw> {
+    xs: Axis,
+    ys: Axis,
+    channels: usize,
+    has_alpha: bool,
+    /// Cell row being collected.
+    cell: usize,
+    /// Integer sums of the source rows that lie inside it.
+    whole: Vec<T::Acc>,
+    /// The raw rows cut by its upper (`head`) and lower (`tail`) edge, and their weights.
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    head_weight: f32,
+    tail_weight: f32,
+    next_head_weight: f32,
+    /// The edge rows as `f32`, then the vertical result of the cell row.
+    edge: [Vec<f32>; 2],
+    vertical: Vec<f32>,
+    reduced: Vec<f32>,
+    cells: Vec<T>,
+}
+
+impl<T: Raw> RowShrink<T> {
+    pub fn new(src: (usize, usize), out: (usize, usize), channels: usize, has_alpha: bool) -> Self {
+        let row = src.0 * channels;
+        Self {
+            xs: Axis::new(src.0, out.0),
+            ys: Axis::new(src.1, out.1),
+            channels,
+            has_alpha,
+            cell: 0,
+            whole: vec![T::Acc::default(); row],
+            head: vec![0; row * std::mem::size_of::<T>()],
+            tail: vec![0; row * std::mem::size_of::<T>()],
+            head_weight: 0.0,
+            tail_weight: 0.0,
+            next_head_weight: 0.0,
+            edge: [vec![0.0; row], vec![0.0; row]],
+            vertical: vec![0.0; row],
+            reduced: vec![0.0; out.0 * channels],
+            cells: vec![T::default(); out.0 * 4],
+        }
+    }
+
+    /// Adds the raw row to the integer sums (premultiplied by alpha when there is some).
+    #[inline(always)]
+    fn add_whole_impl(&mut self, raw: &[u8]) {
+        let raw = &raw[..self.whole.len() * std::mem::size_of::<T>()];
+        match (self.has_alpha, self.channels) {
+            (false, _) => T::add_plain(&mut self.whole, raw),
+            (true, 2) => T::add_alpha::<2>(&mut self.whole, raw),
+            _ => T::add_alpha::<4>(&mut self.whole, raw),
+        }
+    }
+
+    fn add_whole(&mut self, raw: &[u8]) {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU has AVX2.
+            return unsafe { self.add_whole_avx2(raw) };
+        }
+        self.add_whole_impl(raw);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn add_whole_avx2(&mut self, raw: &[u8]) {
+        self.add_whole_impl(raw);
+    }
+
+    /// Feeds source row `y` in the decoder's layout (rows must come in order). Cell rows that
+    /// are complete are written through `emit(cell_row, rgba_samples)`.
+    pub fn add_row(&mut self, y: usize, raw: &[u8], mut emit: impl FnMut(usize, &[T])) {
+        let (cell, w0, w1) = self.ys.at(y);
         while self.cell < cell {
             self.flush(&mut emit);
         }
-        self.core.reduce(row, 0, 1);
-        let [first, second] = &mut self.rows;
-        self.core.add_to(y, first, Some(second));
+        if w1 == 0.0 {
+            self.add_whole(raw);
+        } else {
+            // Cut by the lower edge of this cell row and the upper edge of the next.
+            let n = self.tail.len();
+            self.tail.copy_from_slice(&raw[..n]);
+            self.tail_weight = w0;
+            self.next_head_weight = w1;
+        }
+    }
+
+    /// The vertical result of the cell row into `self.vertical`.
+    #[inline(always)]
+    fn combine(&mut self) {
+        let scale = self.ys.inner;
+        T::scale_into(&mut self.vertical, &self.whole, scale);
+        let [head, tail] = &mut self.edge;
+        for (edge, raw, weight) in [
+            (head, &self.head, self.head_weight),
+            (tail, &self.tail, self.tail_weight),
+        ] {
+            if weight != 0.0 {
+                match (self.has_alpha, self.channels) {
+                    (false, _) => T::load_plain(edge, raw),
+                    (true, 2) => T::load_alpha::<2>(edge, raw),
+                    _ => T::load_alpha::<4>(edge, raw),
+                }
+                for (v, e) in self.vertical.iter_mut().zip(edge.iter()) {
+                    *v += e * weight;
+                }
+            }
+        }
+    }
+
+    /// Reduces `self.vertical` horizontally into `self.reduced`: every output cell takes its two
+    /// cut edge pixels with their fractional weights and the pixels between with the full weight.
+    #[inline(always)]
+    fn reduce<const C: usize>(&mut self) {
+        let row = &self.vertical;
+        for k in 0..self.xs.out {
+            let (lo, hi) = (self.xs.lo[k] as usize, self.xs.hi[k] as usize);
+            let (wl, wr, wi) = (self.xs.left[k], self.xs.right[k], self.xs.inner);
+            let out = &mut self.reduced[k * C..(k + 1) * C];
+            let first = &row[lo * C..(lo + 1) * C];
+            if hi - lo == 1 {
+                for c in 0..C {
+                    out[c] = wl * first[c];
+                }
+                continue;
+            }
+            let last = &row[(hi - 1) * C..hi * C];
+            if hi - lo <= 66 {
+                let mut sum = [0f32; C];
+                for px in row[(lo + 1) * C..(hi - 1) * C].chunks_exact(C) {
+                    for c in 0..C {
+                        sum[c] += px[c];
+                    }
+                }
+                for c in 0..C {
+                    out[c] = wl * first[c] + wr * last[c] + wi * sum[c];
+                }
+            } else {
+                // Wide cells: keep the sum of many pixels in doubles.
+                let mut sum = [0f64; C];
+                for px in row[(lo + 1) * C..(hi - 1) * C].chunks_exact(C) {
+                    for c in 0..C {
+                        sum[c] += px[c] as f64;
+                    }
+                }
+                for c in 0..C {
+                    out[c] = wl * first[c] + wr * last[c] + wi * sum[c] as f32;
+                }
+            }
+        }
+    }
+
+    /// The cell row from its sums, into `self.cells`.
+    #[inline(always)]
+    fn compute_impl(&mut self) {
+        self.combine();
+        match self.channels {
+            1 => self.reduce::<1>(),
+            2 => self.reduce::<2>(),
+            3 => self.reduce::<3>(),
+            _ => self.reduce::<4>(),
+        }
+        self.finish_cells();
+    }
+
+    fn compute(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU has AVX2.
+            return unsafe { self.compute_avx2() };
+        }
+        self.compute_impl();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn compute_avx2(&mut self) {
+        self.compute_impl();
     }
 
     /// Writes cell row `self.cell` and slides the window down by one.
-    fn flush<T: Sample>(&mut self, emit: &mut impl FnMut(usize, &[T])) {
-        let mut out = vec![T::default(); self.rows[0].len()];
-        self.core.finish(&self.rows[0], &mut out);
-        emit(self.cell, &out);
-        self.rows.swap(0, 1);
-        self.rows[1].fill(0.0);
+    fn flush(&mut self, emit: &mut impl FnMut(usize, &[T])) {
+        self.compute();
+        emit(self.cell, &self.cells);
+        self.whole.fill(T::Acc::default());
+        std::mem::swap(&mut self.head, &mut self.tail);
+        self.head_weight = self.next_head_weight;
+        self.tail_weight = 0.0;
+        self.next_head_weight = 0.0;
         self.cell += 1;
     }
 
+    /// `self.reduced` (sums in the decoder's layout) as RGBA samples in `self.cells`.
+    #[inline(always)]
+    fn finish_cells(&mut self) {
+        let c = self.channels;
+        let max = T::from_f32(T::MAX);
+        for (a, px) in self
+            .reduced
+            .chunks_exact(c)
+            .zip(self.cells.chunks_exact_mut(4))
+        {
+            if self.has_alpha {
+                let alpha = a[c - 1];
+                let colour = |v: f32| {
+                    if alpha > 0.0 {
+                        T::from_f32(v / alpha)
+                    } else {
+                        T::default()
+                    }
+                };
+                if c == 2 {
+                    let v = colour(a[0]);
+                    px.copy_from_slice(&[v, v, v, T::from_f32(alpha)]);
+                } else {
+                    px.copy_from_slice(&[
+                        colour(a[0]),
+                        colour(a[1]),
+                        colour(a[2]),
+                        T::from_f32(alpha),
+                    ]);
+                }
+            } else if c == 1 {
+                let v = T::from_f32(a[0]);
+                px.copy_from_slice(&[v, v, v, max]);
+            } else {
+                px.copy_from_slice(&[T::from_f32(a[0]), T::from_f32(a[1]), T::from_f32(a[2]), max]);
+            }
+        }
+    }
+
     /// Emits the remaining cell rows once the last source row has been added.
-    pub fn finish<T: Sample>(&mut self, mut emit: impl FnMut(usize, &[T])) {
-        while self.cell < self.core.ys.out {
+    pub fn finish(&mut self, mut emit: impl FnMut(usize, &[T])) {
+        while self.cell < self.ys.out {
             self.flush(&mut emit);
         }
     }
@@ -459,7 +773,7 @@ mod tests {
         let (ow, oh) = (11, 9);
         let px = picture(w, h);
         for alpha in [false, true] {
-            let mut rows = RowShrink::new((w, h), (ow, oh), alpha);
+            let mut rows = RowShrink::<u8>::new((w, h), (ow, oh), 4, alpha);
             let mut a = vec![0u8; ow * oh * 4];
             for y in 0..h {
                 rows.add_row(y, &px[y * w * 4..(y + 1) * w * 4], |cy, out: &[u8]| {
@@ -492,6 +806,157 @@ mod tests {
         }
     }
 
+    /// The shrink of a picture in its raw layout against a brute-force weighted sum.
+    fn reference<T: Raw>(
+        raw: &[u8],
+        (w, h): (usize, usize),
+        (ow, oh): (usize, usize),
+        channels: usize,
+        alpha: bool,
+    ) -> Vec<f64> {
+        let (xs, ys) = (Axis::new(w, ow), Axis::new(h, oh));
+        let sample = |x: usize, y: usize, c: usize| -> f64 {
+            let bytes = std::mem::size_of::<T>();
+            let at = ((y * w + x) * channels + c) * bytes;
+            if bytes == 1 {
+                raw[at] as f64
+            } else {
+                u16::from_be_bytes([raw[at], raw[at + 1]]) as f64
+            }
+        };
+        let mut acc = vec![0f64; ow * oh * channels];
+        for y in 0..h {
+            let (cy, wy0, wy1) = ys.at(y);
+            for x in 0..w {
+                let (cx, wx0, wx1) = xs.at(x);
+                let a = if alpha {
+                    sample(x, y, channels - 1)
+                } else {
+                    1.0
+                };
+                for c in 0..channels {
+                    let v = if alpha && c < channels - 1 {
+                        sample(x, y, c) * a
+                    } else if alpha {
+                        a
+                    } else {
+                        sample(x, y, c)
+                    };
+                    for (dy, wy) in [(0, wy0), (1, wy1)] {
+                        for (dx, wx) in [(0, wx0), (1, wx1)] {
+                            if wy != 0.0 && wx != 0.0 {
+                                acc[((cy + dy) * ow + cx + dx) * channels + c] +=
+                                    v * wy as f64 * wx as f64;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn raw_rows_match_the_reference() {
+        let (w, h) = (61, 53);
+        for (ow, oh) in [(11, 9), (30, 29), (7, 53), (61, 5)] {
+            for channels in 1..=4usize {
+                for alpha in [false, true] {
+                    if (alpha && channels % 2 == 1) || (channels == 2 && !alpha) {
+                        continue;
+                    }
+                    for wide in [false, true] {
+                        let bytes = if wide { 2 } else { 1 };
+                        let raw: Vec<u8> = (0..w * h * channels * bytes)
+                            .map(|i| ((i * 2654435761usize) >> 9) as u8)
+                            .collect();
+                        let run = |wide: bool| -> (Vec<f64>, Vec<f64>) {
+                            if wide {
+                                let mut rows =
+                                    RowShrink::<u16>::new((w, h), (ow, oh), channels, alpha);
+                                let mut out = vec![0f64; ow * oh * 4];
+                                for y in 0..h {
+                                    rows.add_row(
+                                        y,
+                                        &raw[y * w * channels * 2..][..w * channels * 2],
+                                        |cy, c: &[u16]| {
+                                            for (d, s) in
+                                                out[cy * ow * 4..][..ow * 4].iter_mut().zip(c)
+                                            {
+                                                *d = *s as f64;
+                                            }
+                                        },
+                                    );
+                                }
+                                rows.finish(|cy, c: &[u16]| {
+                                    for (d, s) in out[cy * ow * 4..][..ow * 4].iter_mut().zip(c) {
+                                        *d = *s as f64;
+                                    }
+                                });
+                                (
+                                    out,
+                                    reference::<u16>(&raw, (w, h), (ow, oh), channels, alpha),
+                                )
+                            } else {
+                                let mut rows =
+                                    RowShrink::<u8>::new((w, h), (ow, oh), channels, alpha);
+                                let mut out = vec![0f64; ow * oh * 4];
+                                for y in 0..h {
+                                    rows.add_row(
+                                        y,
+                                        &raw[y * w * channels..][..w * channels],
+                                        |cy, c: &[u8]| {
+                                            for (d, s) in
+                                                out[cy * ow * 4..][..ow * 4].iter_mut().zip(c)
+                                            {
+                                                *d = *s as f64;
+                                            }
+                                        },
+                                    );
+                                }
+                                rows.finish(|cy, c: &[u8]| {
+                                    for (d, s) in out[cy * ow * 4..][..ow * 4].iter_mut().zip(c) {
+                                        *d = *s as f64;
+                                    }
+                                });
+                                (
+                                    out,
+                                    reference::<u8>(&raw, (w, h), (ow, oh), channels, alpha),
+                                )
+                            }
+                        };
+                        let (got, sums) = run(wide);
+                        let max = if wide { 65_535.0 } else { 255.0 };
+                        for p in 0..ow * oh {
+                            let s = &sums[p * channels..(p + 1) * channels];
+                            let expect: [f64; 4] = if alpha {
+                                let a = s[channels - 1];
+                                let colour = |v: f64| if a > 0.0 { v / a } else { 0.0 };
+                                if channels == 2 {
+                                    [colour(s[0]), colour(s[0]), colour(s[0]), a]
+                                } else {
+                                    [colour(s[0]), colour(s[1]), colour(s[2]), a]
+                                }
+                            } else if channels == 1 {
+                                [s[0], s[0], s[0], max]
+                            } else {
+                                [s[0], s[1], s[2], max]
+                            };
+                            for c in 0..4 {
+                                assert!(
+                                    (got[p * 4 + c] - expect[c]).abs() <= if wide { 3.0 } else { 1.0 },
+                                    "{ow}x{oh} ch{channels} alpha {alpha} wide {wide} px {p} c{c}: {} vs {}",
+                                    got[p * 4 + c],
+                                    expect[c]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn dense_reduction_matches_scattering() {
         for (w, out) in [(97, 10), (100, 10), (64, 63), (53, 11), (40, 40)] {
@@ -514,13 +979,14 @@ mod tests {
     #[test]
     fn flat_colour_stays_flat() {
         let (w, h) = (97, 61);
-        let px: Vec<u16> = std::iter::repeat_n([40_000u16, 1, 65_535, 65_535], w * h)
+        let px: Vec<u8> = std::iter::repeat_n([40_000u16, 1, 65_535, 65_535], w * h)
+            .flat_map(|p| p.map(u16::to_be_bytes))
             .flatten()
             .collect();
-        let mut rows = RowShrink::new((w, h), (10, 6), false);
+        let mut rows = RowShrink::<u16>::new((w, h), (10, 6), 4, false);
         let mut out = vec![0u16; 10 * 6 * 4];
         for y in 0..h {
-            rows.add_row(y, &px[y * w * 4..(y + 1) * w * 4], |cy, o: &[u16]| {
+            rows.add_row(y, &px[y * w * 8..(y + 1) * w * 8], |cy, o: &[u16]| {
                 out[cy * 40..(cy + 1) * 40].copy_from_slice(o)
             });
         }

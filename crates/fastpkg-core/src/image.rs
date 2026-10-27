@@ -64,6 +64,9 @@ pub struct Image {
     /// Full-resolution size of the source when the decoder already shrank it
     /// (JPEG DCT scaling). Resize targets are computed from this, not from `width`/`height`.
     pub pre_shrink: Option<(u32, u32)>,
+    /// A decoder fed by a row sink already resampled this image for the first resize operation,
+    /// which then only has the canvas step (cover crop / contain padding) left to do.
+    pub presized: bool,
     pub format: Format,
     pub space: String,
     pub depth: String,
@@ -94,6 +97,7 @@ impl Image {
             has_alpha: true,
             gray: false,
             pre_shrink: None,
+            presized: false,
             format: Format::Raw,
             space: "srgb".into(),
             depth: "uchar".into(),
@@ -364,6 +368,7 @@ impl Image {
             has_alpha: false,
             gray: self.gray,
             pre_shrink: self.pre_shrink,
+            presized: self.presized,
             format: self.format,
             space: self.space.clone(),
             depth: self.depth.clone(),
@@ -639,10 +644,16 @@ impl Image {
     }
 }
 
-fn wide_to_rgba8(wide: &[u16]) -> Vec<u8> {
+/// The 8-bit sample a 16-bit one narrows to.
+#[inline(always)]
+pub fn narrow_sample(value: u16) -> u8 {
+    ((value as u32 * 255 + 32_767) / 65_535) as u8
+}
+
+pub fn wide_to_rgba8(wide: &[u16]) -> Vec<u8> {
     pack(wide, 4, |src, dst| {
         for (d, value) in dst.iter_mut().zip(src) {
-            *d = ((*value as u32 * 255 + 32_767) / 65_535) as u8;
+            *d = narrow_sample(*value);
         }
     })
 }

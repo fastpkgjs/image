@@ -46,6 +46,16 @@ const SCENARIOS = {
   'png16-40mp-rotate-1200-jpeg': { file: 'rgb16-40mp.png', parallel: 1, iters: 6, every: 1 },
   'png16-31mp-rotate-1200-jpeg': { file: 'rgb16-31mp.png', parallel: 1, iters: 6, every: 1 },
   'png16-40mp-rotate-3000-jpeg': { file: 'rgb16-40mp.png', parallel: 1, iters: 6, every: 1 },
+  // Exact-resize cases: a 256 MP file to 1200 px (time, not only memory), an 8192x8192 file to
+  // 1024 px, a 4096x4096 one to 1024 px (CPU), and mild downscales that cannot shrink while
+  // decoding: 16-bit 31/40 MP to 3000 px and an 8192x8192 RGBA file to 4096 px.
+  'huge-png-1200-jpeg': { file: 'huge-256mp.png', parallel: 1, iters: 6, every: 1 },
+  'png8192-resize-1024-png': { file: 'rgb-8192.png', parallel: 1, iters: 6, every: 1 },
+  'png4096-resize-1024-png': { file: 'rgb-4096.png', parallel: 1, iters: 10, every: 1 },
+  'png16-31mp-resize-3000-jpeg': { file: 'rgb16-31mp.png', parallel: 1, iters: 6, every: 1 },
+  'png16-40mp-resize-3000-jpeg': { file: 'rgb16-40mp.png', parallel: 1, iters: 6, every: 1 },
+  'rgba8192-resize-4096-jpeg': { file: 'rgba-8192.png', parallel: 1, iters: 6, every: 1 },
+  'rgba8192-resize-4096-png': { file: 'rgba-8192.png', parallel: 1, iters: 6, every: 1 },
   // 16384x16384 Adam7 (interlaced) 8-bit RGB.
   'huge-adam7-800-jpeg': { file: 'huge-256mp-adam7.png', parallel: 1, iters: 6, every: 1 },
 };
@@ -56,6 +66,9 @@ const FIXTURES = {
   'rgb16-40mp.png': ['--size', '6325', '--depth', '16'],
   'rgb16-31mp.png': ['--size', '5568', '--depth', '16'],
   'huge-256mp-adam7.png': ['--interlace'],
+  'rgb-8192.png': ['--size', '8192'],
+  'rgb-4096.png': ['--size', '4096', '--content', 'noise'],
+  'rgba-8192.png': ['--size', '8192', '--color', 'rgba'],
 };
 
 function run(engine, input, name, overlay) {
@@ -82,6 +95,19 @@ function run(engine, input, name, overlay) {
       return sharpLike(input, { limitInputPixels: false }).rotate().resize({ width: 1200 }).jpeg({ quality: 80 }).toBuffer();
     case 'png16-40mp-rotate-3000-jpeg':
       return sharpLike(input, { limitInputPixels: false }).rotate().resize({ width: 3000 }).jpeg({ quality: 80 }).toBuffer();
+    case 'huge-png-1200-jpeg':
+      return sharpLike(input, { limitInputPixels: false }).resize({ width: 1200 }).jpeg({ quality: 80 }).toBuffer();
+    case 'png8192-resize-1024-png':
+      return sharpLike(input, { limitInputPixels: false }).resize({ width: 1024 }).png().toBuffer();
+    case 'png4096-resize-1024-png':
+      return sharpLike(input, { limitInputPixels: false }).resize({ width: 1024 }).png().toBuffer();
+    case 'png16-31mp-resize-3000-jpeg':
+    case 'png16-40mp-resize-3000-jpeg':
+      return sharpLike(input, { limitInputPixels: false }).resize({ width: 3000 }).jpeg({ quality: 80 }).toBuffer();
+    case 'rgba8192-resize-4096-jpeg':
+      return sharpLike(input, { limitInputPixels: false }).resize({ width: 4096 }).jpeg({ quality: 80 }).toBuffer();
+    case 'rgba8192-resize-4096-png':
+      return sharpLike(input, { limitInputPixels: false }).resize({ width: 4096 }).png().toBuffer();
     case 'huge-adam7-800-jpeg':
       return sharpLike(input, { limitInputPixels: false }).resize({ width: 800 }).jpeg({ quality: 80 }).toBuffer();
     case 'big-jpeg-1200':

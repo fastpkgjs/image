@@ -40,6 +40,7 @@ node bench/gen-huge-png.mjs out.png --size 6325 --depth 16 --content noise   # i
 node bench/peak-rss.mjs out.png --pipeline rotate-1200-jpeg          # peak RSS (VmHWM) of one run, fastpkg and sharp, fresh process each
 node bench/mem.mjs --scenarios png16-40mp-rotate-1200-jpeg,huge-adam7-800-jpeg --conc 1
 node bench/png-shrink-psnr.mjs --old /path/to/0.5.0/package-dir      # PSNR against a float Lanczos3 reference
+node bench/png-ab.mjs out.png --pipeline resize-1200-jpeg --base /path/to/other/package-dir --runs 5 [--threads 1]   # wall, CPU and peak RSS: this build, another build, sharp (alternating fresh processes)
 ```
 
 `peak-rss.mjs` honours `FASTPKG_PKG=<package dir>` to A/B another build. `png-shrink-psnr.mjs` runs the decode-time shrink forced on and off (`FASTPKG_PNG_SHRINK_MIN_BYTES`) next to sharp, on photo-like, textured and hard-edge (thin lines, text-like strokes) pictures.
